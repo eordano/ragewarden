@@ -1,0 +1,86 @@
+[package]
+name = "rageterm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Ragewarden terminal client (CLI + TUI)"
+build = "build.rs"
+
+[[bin]]
+name = "rageterm"
+path = "src/main.rs"
+
+[features]
+default = []
+
+# Compiles the software stand-ins for YubiKey PIV and FIDO2 hmac-secret.
+# `build.rs` sets `cfg(release_build)` when PROFILE=release and `hw.rs` turns
+# that into a `compile_error!`, so a release binary that accepts
+# RAGEWARDEN_MOCK_HARDWARE=1 cannot be produced. The stand-ins are also
+# compiled under `cfg(test)` so `cargo test` needs no extra flag.
+mock-hardware = []
+
+[dependencies]
+ragewarden-core = { workspace = true, features = ["reqwest-client"] }
+clap = { workspace = true }
+zeroize = { workspace = true }
+secrecy = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+age = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+arboard = "3"
+
+dirs = "6"
+
+notify-rust = "4"
+
+directories = "6"
+
+walkdir = "2"
+
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+crossterm = "0.29"
+
+tokio = { version = "1", features = ["rt", "macros"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+
+rpassword = "7"
+
+pcsc = { workspace = true }
+
+ctap-hid-fido2 = { workspace = true }
+
+keyring = { workspace = true }
+
+bip39 = { workspace = true }
+
+fs2 = { workspace = true }
+
+ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ecdsa", "ed25519", "p256", "p384", "p521", "rsa"] }
+
+chacha20poly1305 = { workspace = true }
+x25519-dalek = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+
+[dev-dependencies]
+tempfile = "3"
+testcontainers = "0.28"
+ragemanifest = { path = "../ragemanifest" }

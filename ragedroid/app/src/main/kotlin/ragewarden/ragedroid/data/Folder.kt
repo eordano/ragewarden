@@ -1,0 +1,3 @@
+package ragewarden.ragedroid.data
+
+data class Folder(val id: String, val name: String)

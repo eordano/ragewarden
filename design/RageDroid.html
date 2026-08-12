@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>RageDroid -- Phishing-resistant Bitwarden</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="colors_and_type.css">
+<style>
+  html, body { background: var(--color-background); height: 100%; margin: 0; }
+  body {
+    height: 100vh; height: 100svh; height: 100dvh;
+    overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--font-sans);
+    color: var(--color-fg-primary);
+  }
+
+  .phone {
+    width: min(100vw, 412px);
+    height: min(100dvh, 880px);
+    background: var(--color-background);
+    border-radius: 24px;
+    box-shadow: 0 24px 80px rgba(20,16,12,0.18), 0 1px 0 rgba(255,255,255,0.04) inset;
+    overflow: hidden;
+    position: relative;
+    display: flex; flex-direction: column;
+  }
+  @media (max-height: 900px) { .phone { border-radius: 0; box-shadow: none; height: 100dvh; width: 100vw; max-width: 480px; } }
+
+  .iconbtn:hover { background: var(--color-tile) !important; }
+  .iconbtn:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+
+  @keyframes ripple {
+    0% { transform: scale(1); opacity: 0.45; }
+    100% { transform: scale(1.9); opacity: 0; }
+  }
+  @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes sheet-in { from { transform: translateY(100%); } to { transform: translateY(0); } }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes progress-fill { from { width: 0%; } to { width: 100%; } }
+  @keyframes screen-in { from { opacity: 0; transform: translateX(8px); } to { opacity: 1; transform: translateX(0); } }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes prewarm-pulse {
+    0%, 100% { opacity: 0.35; transform: scale(0.85); }
+    50%      { opacity: 1;    transform: scale(1.15); }
+  }
+
+  .screen { animation: screen-in 220ms cubic-bezier(0.2, 0.8, 0.2, 1); }
+
+  [data-density="compact"] .screen { font-size: 13.5px; }
+
+  *::-webkit-scrollbar { width: 6px; height: 6px; }
+  *::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<div style="position:fixed;top:0;left:0;right:0;z-index:9999;background:#A8201A;color:#FAF6EE;
+            font:600 11px/1.4 system-ui,sans-serif;letter-spacing:.06em;text-transform:uppercase;
+            padding:5px 10px;text-align:center;pointer-events:none">
+  Visual prototype · sample data · not the extension
+</div>
+
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<script type="text/babel" src="tweaks-panel.jsx"></script>
+<script type="text/babel" src="data.jsx"></script>
+<script type="text/babel" src="wordlist.jsx"></script>
+<script type="text/babel" src="icons.jsx"></script>
+<script type="text/babel" src="components.jsx"></script>
+<script type="text/babel" src="screens-vault.jsx"></script>
+<script type="text/babel" src="screens-misc.jsx"></script>
+<script type="text/babel" src="screens-extras.jsx"></script>
+<script type="text/babel" src="screens-pro.jsx"></script>
+<script type="text/babel" src="screens-enhance.jsx"></script>
+
+<script type="text/babel">
+const { useState, useEffect } = React;
+
+const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+  "theme": "light",
+  "density": "comfortable",
+  "chipStyle": "pill",
+  "monoSecrets": true,
+  "startScreen": "none",
+  "connectivity": "online",
+  "reduceMotion": false,
+  "hardwareAvailable": true,
+  "showDataScreenLabels": false,
+  "requireMasterPassword": true
+}/*EDITMODE-END*/;
+
+function App() {
+  const [tweaks, setTweak] = useTweaks(TWEAK_DEFAULTS);
+  const initialScreen = (tweaks.startScreen && tweaks.startScreen !== 'none') ? tweaks.startScreen : 'lock';
+  const [route, setRoute] = useState({ name: initialScreen });
+  const { toasts, show, dismiss } = useToasts();
+
+  const [vaultRevision, setVaultRevision] = useState(0);
+  useEffect(() => {
+    const bump = () => setVaultRevision(n => n + 1);
+    const root = document.getElementById('root');
+    if (root) root._ragewardenRefresh = bump;
+    window.addEventListener('ragewarden:vault-updated', bump);
+    return () => {
+      window.removeEventListener('ragewarden:vault-updated', bump);
+      if (root && root._ragewardenRefresh === bump) {
+        delete root._ragewardenRefresh;
+      }
+    };
+  }, []);
+
+  const [defaultRecipientIds, setDefaultRecipientIds] = useState(['yk-primary', 'yk-backup', 'recovery']);
+  const [autofillOn, setAutofillOn] = useState(true);
+  const [imeOn, setImeOn] = useState(false);
+  const [pullToRefresh, setPullToRefresh] = useState(true);
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', tweaks.theme);
+    document.documentElement.setAttribute('data-density', tweaks.density);
+    document.documentElement.setAttribute('data-reduce-motion', tweaks.reduceMotion ? 'on' : 'off');
+    document.documentElement.setAttribute('data-hardware', tweaks.hardwareAvailable ? 'available' : 'unavailable');
+  }, [tweaks.theme, tweaks.density, tweaks.reduceMotion, tweaks.hardwareAvailable]);
+
+  useEffect(() => {
+    if (tweaks.startScreen && tweaks.startScreen !== 'none') {
+      setRoute({ name: tweaks.startScreen });
+    }
+  }, [tweaks.startScreen]);
+
+  const goto = (name, payload) => setRoute({ name, payload });
+
+  const bridge = (typeof window !== 'undefined') ? window.RagewardenVault : null;
+  const safe = (label, p) => Promise.resolve(p)
+    .catch(err => { show(`${label}: ${(err && err.message) || err}`); throw err; });
+
+  const handleAddItem = async (item) => {
+    if (!bridge?.setCipher) { show('vault not ready'); return; }
+    try {
+      await safe('Add', bridge.setCipher(item.name, item.password || ''));
+      show('Saved');
+      goto('vault');
+    } catch {}
+  };
+
+  const handleEditItem = async (item) => {
+    if (!bridge?.editCipher) { show('vault not ready'); return; }
+    try {
+      await safe('Save', bridge.editCipher(item.id, item.name, item.password || ''));
+      show('Saved');
+      goto('detail', item);
+    } catch {}
+  };
+
+  const handleDeleteItem = async (item) => {
+    if (!bridge?.deleteCipher) { show('vault not ready'); return; }
+    try {
+      await safe('Delete', bridge.deleteCipher(item.id));
+      show('Deleted ' + (item.name || 'item'));
+      goto('vault');
+    } catch {}
+  };
+
+  const handleSaveFolder = async (existing, payload) => {
+    if (!bridge) { show('vault not ready'); return; }
+    try {
+      if (existing && existing.id) {
+        await safe('Rename folder', bridge.renameFolder(existing.id, payload.name));
+      } else {
+        await safe('Create folder', bridge.createFolder(payload.name));
+      }
+      goto('folders');
+    } catch {}
+  };
+
+  const handleDeleteFolder = async (folder) => {
+    if (!bridge?.deleteFolder) { show('vault not ready'); return; }
+    try {
+      await safe('Delete folder', bridge.deleteFolder(folder.id));
+      show('Folder deleted');
+      goto('folders');
+    } catch {}
+  };
+
+  const handleSignOut = async () => {
+    if (bridge?.logout) { try { await bridge.logout(); } catch {} }
+    goto('lock');
+  };
+
+  // The phrase renders on RecoveryPhraseScreen and nowhere else. This used to
+  // console.warn it, which put the vault's last-resort key in front of anything
+  // that reads the console.
+  const handlePaperRecovery = async () => {
+    if (!bridge?.enrollRecovery) { show('vault not ready'); goto('settings'); return; }
+    try {
+      const res = await safe('Enroll recovery', bridge.enrollRecovery());
+      goto('recovery-phrase', res);
+    } catch {}
+  };
+
+  const handleRemoveRecipient = async (r) => {
+    if (!bridge?.removeRecipient || !r?.id) { show('cannot remove'); return; }
+    try {
+      await safe('Remove recipient', bridge.removeRecipient(r.id));
+      show('Removed');
+      goto('settings');
+    } catch {}
+  };
+
+  const openItem = (item) => {
+    // No identity on this device matches the item's header: the only screen a
+    // click can reach is the explanation. Detail (and its Reveal/Copy/Autofill)
+    // is unreachable for these items.
+    if (item && item.rage === true && item.decryptable === false) goto('not-on-device', item);
+    else if (item && item.kind && item.kind !== 'login') goto('kind-detail', item);
+    else goto('detail', item);
+  };
+
+  let screen;
+  if (route.name === 'lock') {
+    screen = <LockScreen onUnlock={() => goto('vault')} toast={show}/>;
+  } else if (route.name === 'first-run') {
+    screen = <FirstRun toast={show} onDone={() => goto('vault')}/>;
+  } else if (route.name === 'empty-vault') {
+    screen = <EmptyVaultHero onAdd={() => goto('add-type')} onAutofill={() => goto('autofill-picker')}/>;
+  } else if (route.name === 'vault') {
+    screen = <VaultWithBanners
+      connectivity={tweaks.connectivity}
+      onRetry={() => { setTweak('connectivity', 'online'); show('Synced.'); }}
+      onOpen={openItem}
+      onAdd={() => goto('add-type')}
+      onSettings={() => goto('settings')}
+      onSearch={() => goto('search')}
+      onBulkProtect={() => goto('bulk-protect')}
+      chipStyle={tweaks.chipStyle}
+      density={tweaks.density}
+    />;
+  } else if (route.name === 'search') {
+    screen = <SearchScreenPlus
+      onBack={() => goto('vault')}
+      onOpen={(item) => { openItem(item); }}
+      chipStyle={tweaks.chipStyle}
+    />;
+  } else if (route.name === 'detail') {
+    screen = <ItemDetailScreen
+      item={route.payload}
+      onBack={() => goto('vault')}
+      onEdit={() => goto('edit', route.payload)}
+      onProtect={() => goto('backfill', route.payload)}
+      onHistory={() => goto('history', route.payload)}
+      onDelete={() => handleDeleteItem(route.payload)}
+      onTapFail={(kind) => goto('tap-fail', { kind, item: route.payload })}
+      onTotpEnroll={() => goto('totp-enroll', route.payload)}
+      monoSecrets={tweaks.monoSecrets}
+      toast={show}
+    />;
+  } else if (route.name === 'history') {
+    screen = <ItemHistoryScreen item={route.payload} onBack={() => goto('detail', route.payload)} toast={show}/>;
+  } else if (route.name === 'tap-fail') {
+    screen = <TapFailureScreen
+      kind={route.payload?.kind || 'timeout'}
+      item={route.payload?.item}
+      onBack={() => goto('detail', route.payload?.item)}
+      onRetry={() => goto('detail', route.payload?.item)}
+      onPick={(r) => {
+        const kind = (r?.kind || '').toLowerCase();
+        if (kind === 'recovery') goto('paper-reveal', route.payload?.item);
+        else goto('detail', route.payload?.item);
+      }}
+      onPaper={() => goto('paper-reveal', route.payload?.item)}
+    />;
+  } else if (route.name === 'paper-reveal') {
+    screen = <PaperRevealScreen
+      item={route.payload}
+      onBack={() => goto(route.payload ? 'detail' : 'vault', route.payload)}
+      validatePhrase={async (phrase) => {
+        if (bridge?.validateRecoveryPhrase) return bridge.validateRecoveryPhrase(phrase);
+        return { ok: true }; // design mockup: words are checked, checksum is not
+      }}
+      onReveal={async (phrase) => {
+        if (!bridge?.recoverFromPhrase) throw new Error('vault not ready');
+        if (!route.payload?.id) throw new Error('no item selected');
+        return bridge.recoverFromPhrase(route.payload.id, phrase);
+      }}
+      toast={show}
+    />;
+  } else if (route.name === 'not-on-device') {
+    // Fallback payload lets the tweaks Start select land here without a click.
+    screen = <NotOnDeviceScreen
+      item={route.payload || [...VAULT, ...ITEMS_BY_KIND].find(i => i.rage === true && i.decryptable === false)}
+      onBack={() => goto('vault')}
+    />;
+  } else if (route.name === 'kind-detail') {
+    screen = <KindDetailScreen item={route.payload} onBack={() => goto('vault')} toast={show}/>;
+  } else if (route.name === 'backfill') {
+    screen = <BackfillWizard
+      item={route.payload}
+      onBack={() => goto('detail', route.payload)}
+      onDone={() => goto('detail', { ...route.payload, rage: true, recipients: ['yk-primary','yk-backup','recovery'] })}
+      toast={show}
+    />;
+  } else if (route.name === 'bulk-protect') {
+    screen = <BulkProtectWizard
+      onBack={() => goto('vault')}
+      onDone={() => goto('vault')}
+      toast={show}
+    />;
+  } else if (route.name === 'add-type') {
+    screen = <AddItemTypePickerScreen onBack={() => goto('vault')} onPick={(t) => goto('add', { type: t })}/>;
+  } else if (route.name === 'add') {
+    screen = <AddItemScreen
+      itemType={route.payload?.type || 'login'}
+      defaultRecipientIds={defaultRecipientIds}
+      onBack={() => goto('add-type')}
+      onSave={handleAddItem}
+      toast={show}
+    />;
+  } else if (route.name === 'edit') {
+    screen = <AddItemScreen
+      existing={route.payload}
+      onBack={() => goto('detail', route.payload)}
+      onSave={(item) => handleEditItem({ ...route.payload, ...item })}
+      toast={show}
+    />;
+  } else if (route.name === 'totp-enroll') {
+    screen = <TotpEnrollScreen
+      item={route.payload}
+      onBack={() => goto('detail', route.payload)}
+      onSave={(seed) => {
+        const updated = { ...route.payload, totp: seed };
+        show('Authenticator added');
+        goto('detail', updated);
+      }}
+      toast={show}
+    />;
+  } else if (route.name === 'settings') {
+    screen = <SettingsScreenFull
+      onBack={() => goto('vault')}
+      onAccount={() => goto('account')}
+      onAddRecipient={() => goto('add-recipient')}
+      onOpenRecipient={(r) => goto('recipient', r)}
+      onRecovery={() => goto('paper-recovery')}
+      onAutofill={() => goto('autofill-picker')}
+      onIME={() => goto('custom-ime')}
+      autofillOn={autofillOn} onToggleAutofill={setAutofillOn}
+      imeOn={imeOn} onToggleIME={setImeOn}
+      defaultRecipientIds={defaultRecipientIds}
+      onChangeDefaultRecipients={setDefaultRecipientIds}
+      onFolders={() => goto('folders')}
+      onOpenAuditLog={() => goto('audit')}
+      onSignOut={() => goto('lock')}
+      onAbout={() => show('RageDroid 0.4.1 · build 81a3')}
+      toast={show}
+    />;
+  } else if (route.name === 'account') {
+    screen = <AccountScreen onBack={() => goto('settings')} onSignOut={handleSignOut} toast={show}/>;
+  } else if (route.name === 'recipient') {
+    screen = <RecipientDetail recipient={route.payload} onBack={() => goto('settings')} toast={show}/>;
+  } else if (route.name === 'audit') {
+    screen = <AuditLogScreen onBack={() => goto('settings')}/>;
+  } else if (route.name === 'add-recipient') {
+    screen = <AddRecipientScreen
+      onBack={() => goto('settings')}
+      onPaperRecovery={handlePaperRecovery}
+      onAddPasskey={async (opts) => {
+        const v = (typeof window !== 'undefined') ? window.RagewardenVault : null;
+        if (!v || typeof v.enrollPasskey !== 'function') {
+          throw new Error('passkey enrollment unavailable (popup not signed in)');
+        }
+        return v.enrollPasskey(opts);
+      }}
+      toast={show}
+    />;
+  } else if (route.name === 'paper-recovery') {
+    screen = <PaperRecoveryWizard onBack={() => goto('add-recipient')} onDone={handlePaperRecovery} toast={show}/>;
+  } else if (route.name === 'recovery-phrase') {
+    screen = <RecoveryPhraseScreen
+      result={route.payload}
+      onDone={() => { show('Recovery identity published'); goto('settings'); }}
+    />;
+  } else if (route.name === 'folders') {
+    screen = <FoldersScreen
+      onBack={() => goto('settings')}
+      onEdit={(f) => goto('folder-edit', f)}
+      onNew={() => goto('folder-edit', null)}
+      toast={show}
+    />;
+  } else if (route.name === 'folder-edit') {
+    screen = <FolderEditScreen
+      folder={route.payload}
+      onBack={() => goto('folders')}
+      onSave={(payload) => handleSaveFolder(route.payload, payload)}
+      onDelete={() => handleDeleteFolder(route.payload)}
+      toast={show}
+    />;
+  } else if (route.name === 'autofill-picker') {
+    screen = <SystemAutofillPickerScreen
+      onBack={() => goto('vault')}
+      onAutofill={(it) => { show('Filled ' + (it.name || 'login')); goto('vault'); }}
+      onCreate={() => goto('add', { type: 'login' })}
+      toast={show}
+    />;
+  } else if (route.name === 'custom-ime') {
+    screen = <CustomIMEScreen
+      onBack={() => goto('settings')}
+      onAutofill={(it) => { show('Filled ' + it.name); goto('settings'); }}
+      toast={show}
+    />;
+  } else if (route.name === 'token-expired') {
+    screen = <TokenExpiredScreen
+      onSignIn={() => goto('lock')}
+      onLater={() => goto('vault')}
+      toast={show}
+    />;
+  }
+
+  return (
+    <>
+      <div className="phone" data-screen-label={`screen ${route.name}`}>
+        <div key={route.name} className="screen" style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+          {screen}
+        </div>
+        <ToastHost toasts={toasts} dismiss={dismiss}/>
+      </div>
+
+      <TweaksPanel title="Tweaks">
+        <TweakSection label="Appearance"/>
+        <TweakRadio label="Theme" value={tweaks.theme} onChange={v => setTweak('theme', v)}
+          options={['light','dark']}/>
+        <TweakRadio label="Density" value={tweaks.density} onChange={v => setTweak('density', v)}
+          options={['comfortable','compact']}/>
+        <TweakSection label="Vault list"/>
+        <TweakRadio label="Rage marker" value={tweaks.chipStyle} onChange={v => setTweak('chipStyle', v)}
+          options={['pill','icon','rule']}/>
+        <TweakSection label="Item detail"/>
+        <TweakToggle label="Mono secrets" value={tweaks.monoSecrets} onChange={v => setTweak('monoSecrets', v)}/>
+        <TweakSection label="State"/>
+        <TweakRadio label="Connectivity" value={tweaks.connectivity} onChange={v => setTweak('connectivity', v)}
+          options={['online','offline','save-failed']}/>
+        <TweakSection label="Jump to flow"/>
+        <TweakSelect label="Start" value={tweaks.startScreen} onChange={v => setTweak('startScreen', v)}
+          options={[
+            'none',
+            'lock','first-run','empty-vault','vault','search',
+            'add-type','add','settings','account',
+            'audit','add-recipient','paper-recovery','paper-reveal',
+            'folders','folder-edit',
+            'autofill-picker','custom-ime',
+            'totp-enroll','bulk-protect',
+            'token-expired',
+            'tap-fail','not-on-device',
+          ]}/>
+        <TweakSection label="Prototype"/>
+        <TweakToggle label="Reduce motion" value={tweaks.reduceMotion} onChange={v => setTweak('reduceMotion', v)}/>
+        <TweakToggle label="Hardware available" value={tweaks.hardwareAvailable} onChange={v => setTweak('hardwareAvailable', v)}/>
+      </TweaksPanel>
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>

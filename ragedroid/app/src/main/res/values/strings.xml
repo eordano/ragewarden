@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">RageDroid</string>
+    <string name="autofill_service_label">RageDroid Autofill</string>
+    <string name="ime_label">RageDroid Keyboard</string>
+    <string name="ime_subtype_label">RageDroid</string>
+    <string name="ragedroid_paper_recovery_sheet">RageDroid paper recovery sheet</string>
+</resources>

@@ -1,0 +1,441 @@
+/* Layout + components for the real popup. Design tokens come from tokens.css,
+   which the build copies from design/colors_and_type.css. */
+
+html, body {
+  height: 100%;
+  margin: 0;
+  background: var(--color-background);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.45;
+  color: var(--color-fg-primary);
+}
+
+body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.phone {
+  position: relative;
+  width: min(100vw, 400px);
+  height: min(100dvh, 600px);
+  min-height: 380px;
+  background: var(--color-background);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.screen {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.col { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+
+.body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 14px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.footer {
+  padding: 10px 14px calc(10px + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--color-divider);
+  background: var(--color-background);
+}
+
+.pad-x { padding: 0 14px; }
+.spacer { height: 6px; }
+
+.centered {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 12px;
+  padding: 24px 20px;
+  overflow-y: auto;
+}
+
+.brand {
+  font-family: var(--font-serif);
+  font-weight: 700;
+  font-size: 26px;
+  letter-spacing: -0.01em;
+  color: var(--color-fg-emphasis);
+}
+
+/* app bar */
+
+.appbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 10px 8px 12px;
+  border-bottom: 1px solid var(--color-divider);
+}
+.appbar-titles { flex: 1; min-width: 0; }
+.appbar-title {
+  font-family: var(--font-serif);
+  font-weight: 700;
+  font-size: 19px;
+  letter-spacing: -0.01em;
+  color: var(--color-fg-emphasis);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.appbar-sub {
+  font-size: 11.5px;
+  color: var(--color-fg-secondary);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.appbar-actions { display: flex; gap: 2px; flex-shrink: 0; }
+
+/* buttons */
+
+.btn {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 600;
+  border-radius: 8px;
+  padding: 8px 13px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-elevated);
+  color: var(--color-fg-primary);
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-out);
+}
+.btn:hover:not(:disabled) { background: var(--color-tile); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-full { width: 100%; display: block; }
+.btn-primary {
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+  color: var(--color-background);
+}
+.btn-primary:hover:not(:disabled) { background: var(--color-accent-hover); }
+.btn-danger {
+  background: transparent;
+  border-color: var(--color-danger-strong);
+  color: var(--color-danger-strong);
+}
+.btn-danger:hover:not(:disabled) { background: var(--color-danger); color: var(--color-background); }
+.btn-ghost { background: transparent; border-color: transparent; }
+.btn-icon {
+  width: 32px; height: 32px; padding: 0;
+  border-radius: 16px;
+  border-color: transparent;
+  background: transparent;
+  font-size: 16px;
+  line-height: 1;
+}
+.btn-icon:hover:not(:disabled) { background: var(--color-tile); }
+
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+/* inputs */
+
+.field { display: block; }
+.field > .eyebrow { display: block; margin-bottom: 5px; }
+
+.input {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--color-surface-sunken);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 9px 11px;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  color: var(--color-fg-primary);
+  outline: none;
+}
+.input:focus { border-color: var(--color-accent); }
+.input.mono, .mono { font-family: var(--font-mono); font-size: 13px; }
+.textarea { resize: vertical; min-height: 64px; line-height: 1.4; }
+
+.eyebrow {
+  font-family: var(--font-sans);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--color-fg-secondary);
+}
+
+.hint { font-size: 11.5px; color: var(--color-fg-secondary); margin-top: 5px; line-height: 1.4; }
+.hint-danger { color: var(--color-danger-strong); }
+.muted { font-size: 12.5px; color: var(--color-fg-secondary); }
+.dim { color: var(--color-fg-secondary); }
+.danger { color: var(--color-danger-strong); }
+.small { font-size: 12px; }
+.prose {
+  font-family: var(--font-serif);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--color-fg-primary);
+  margin: 0;
+  max-width: none;
+}
+
+/* lists */
+
+.list { display: flex; flex-direction: column; }
+.list-sub { display: flex; flex-direction: column; gap: 6px; }
+
+.vrow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 4px;
+  border: none;
+  border-bottom: 1px solid var(--color-divider);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+.vrow:hover { background: var(--color-tile); }
+.vrow-main { flex: 1; min-width: 0; }
+.vrow-name {
+  font-family: var(--font-serif);
+  font-weight: 700;
+  font-size: 15px;
+  color: var(--color-fg-emphasis);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.vrow-sub {
+  font-size: 11.5px;
+  color: var(--color-fg-secondary);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+.avatar {
+  width: 32px; height: 32px; border-radius: 8px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--color-surface-elevated);
+  border: 1px solid var(--color-border);
+  font-family: var(--font-serif);
+  font-weight: 700;
+  font-size: 12px;
+  color: var(--color-fg-secondary);
+}
+
+/* Only the exception is marked: a row with no tag is hardware-protected, which
+   is the rule. The list used to badge every row RAGE or plain and tint the
+   protected avatars as well, so the one row that needed to stand out did not. */
+.tag {
+  font-size: 9.5px; font-weight: 700; letter-spacing: 0.07em;
+  padding: 2px 6px; border-radius: 999px;
+  background: var(--color-surface-elevated);
+  color: var(--color-fg-secondary);
+  border: 1px solid var(--color-border);
+  flex-shrink: 0;
+}
+
+.srow {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 0;
+  border-bottom: 1px dashed var(--color-divider);
+  font-size: 12.5px;
+}
+.srow-tall { align-items: flex-start; }
+.srow-main { flex: 1; min-width: 0; word-break: break-word; }
+
+.pip { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.pip-on { background: var(--color-success); }
+.pip-off { background: var(--color-danger-strong); }
+
+.navrow {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 11px 4px;
+  border: none; border-bottom: 1px solid var(--color-divider);
+  background: transparent; text-align: left; cursor: pointer;
+  font: inherit; color: inherit;
+}
+.navrow:hover { background: var(--color-tile); }
+.navrow-main { flex: 1; min-width: 0; }
+.navrow-title {
+  font-family: var(--font-serif); font-weight: 700; font-size: 14.5px;
+  color: var(--color-fg-emphasis);
+}
+.navrow-sub { font-size: 11.5px; color: var(--color-fg-secondary); }
+.chev { color: var(--color-fg-secondary); font-size: 18px; }
+
+.chips {
+  display: flex; gap: 6px; padding: 8px 14px 2px;
+  overflow-x: auto; scrollbar-width: none;
+}
+.chip {
+  padding: 5px 11px; border-radius: 999px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-elevated);
+  color: var(--color-fg-primary);
+  font: inherit; font-size: 12px; cursor: pointer; white-space: nowrap;
+}
+.chip-on {
+  background: var(--color-fg-emphasis);
+  color: var(--color-background);
+  border-color: var(--color-fg-emphasis);
+}
+
+.empty {
+  padding: 32px 16px;
+  text-align: center;
+  font-family: var(--font-serif);
+  font-style: italic;
+  color: var(--color-fg-secondary);
+}
+
+/* banners */
+
+.banner {
+  display: flex; align-items: flex-start; gap: 10px;
+  border: 1px solid var(--color-border);
+  border-left: 3px solid var(--color-info);
+  border-radius: 8px;
+  padding: 9px 11px;
+  background: var(--color-surface-sunken);
+}
+.banner-body { flex: 1; min-width: 0; }
+.banner-title {
+  font-family: var(--font-serif); font-weight: 700; font-size: 13px;
+  color: var(--color-fg-emphasis);
+}
+.banner-text { font-size: 11.5px; color: var(--color-fg-secondary); line-height: 1.4; }
+.banner-success { border-left-color: var(--color-success); }
+.banner-warning { border-left-color: var(--color-warning); }
+.banner-danger  { border-left-color: var(--color-danger-strong); }
+.banner-info    { border-left-color: var(--color-info); }
+
+/* secrets */
+
+.readout {
+  display: flex; align-items: center; gap: 8px;
+  background: var(--color-surface-sunken);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 7px 8px 7px 11px;
+}
+.readout > .mono { flex: 1; min-width: 0; word-break: break-all; }
+
+.secret-host { margin-bottom: 8px; }
+.secret-idle {
+  background: var(--color-surface-sunken);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 11px;
+  letter-spacing: 4px;
+}
+.secret-open {
+  background: var(--color-surface-elevated);
+  border: 1px solid var(--color-success);
+  border-radius: 8px;
+  padding: 11px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.secret-value {
+  word-break: break-all;
+  font-size: 14px;
+  color: var(--color-fg-emphasis);
+  user-select: all;
+}
+
+.phrase-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+  background: var(--color-surface-sunken);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 10px;
+}
+.phrase-word { display: flex; align-items: baseline; gap: 5px; min-width: 0; }
+.phrase-idx {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  color: var(--color-fg-secondary);
+  width: 15px; text-align: right; flex-shrink: 0;
+}
+.phrase-word .mono { font-size: 12px; word-break: break-all; }
+
+/* sheet */
+
+.sheet {
+  position: absolute; inset: 0; z-index: 60;
+  display: flex; flex-direction: column; justify-content: flex-end;
+  background: var(--color-backdrop);
+}
+.sheet-card {
+  background: var(--color-surface-elevated);
+  border-top-left-radius: 16px;
+  border-top-right-radius: 16px;
+  padding: 12px 16px 20px;
+  max-height: 90%;
+  overflow-y: auto;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.sheet-grab {
+  width: 34px; height: 4px; border-radius: 2px;
+  background: var(--color-border);
+  margin: 0 auto 6px;
+}
+.sheet-title {
+  font-family: var(--font-serif); font-weight: 700; font-size: 17px;
+  color: var(--color-fg-emphasis);
+}
+.sheet-actions { display: flex; gap: 8px; }
+.sheet-actions .btn:first-child { flex-shrink: 0; }
+
+/* toasts */
+
+/* Toasts sit *in* the column, below the screen -- they never overlay it.
+   As `position: absolute; bottom: 8px; z-index: 80` this host floated over the
+   footer: an error toast covered most of the primary button it was telling the
+   user to press, and outranked .sheet (z-index 60) so it painted over
+   confirmation dialogs. In flow it can do neither, and the empty host is 0px
+   high, so nothing is displaced until something has to be said. */
+.toast-host {
+  flex-shrink: 0;
+  padding: 0 8px 8px;
+  display: flex; flex-direction: column; gap: 5px;
+}
+/* The whole toast is the dismiss button. */
+.toast {
+  display: flex; align-items: flex-start; gap: 8px;
+  width: 100%; box-sizing: border-box;
+  border-radius: 8px;
+  padding: 8px 11px;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.35;
+  text-align: left;
+  cursor: pointer;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-elevated);
+  color: var(--color-fg-primary);
+  box-shadow: var(--shadow-raised);
+}
+.toast-text { flex: 1; min-width: 0; word-break: break-word; }
+.toast-ok    { border-left: 3px solid var(--color-success); }
+.toast-info  { border-left: 3px solid var(--color-info); }
+.toast-warn  { border-left: 3px solid var(--color-warning); }
+.toast-error {
+  border-left: 3px solid var(--color-danger-strong);
+  background: var(--color-danger);
+  color: var(--color-background);
+}
+
+*::-webkit-scrollbar { width: 6px; height: 6px; }
+*::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 3px; }

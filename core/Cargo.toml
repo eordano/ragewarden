@@ -1,0 +1,49 @@
+[package]
+name = "ragewarden-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Shared encryption + Bitwarden client core for the Ragewarden ecosystem"
+
+[lib]
+name = "ragewarden_core"
+crate-type = ["rlib"]
+
+[features]
+default = []
+
+reqwest-client = ["dep:reqwest"]
+
+[dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "rustls-native-certs"], optional = true }
+age = { workspace = true }
+age-core = { workspace = true }
+hkdf = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+pbkdf2 = { workspace = true }
+hmac = { workspace = true }
+aes = { workspace = true }
+cbc = { workspace = true }
+subtle = { workspace = true }
+zeroize = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+rand_core = { workspace = true }
+rand_core06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+rsa = { workspace = true }
+serde_urlencoded = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+chacha20poly1305 = { workspace = true }
+x25519-dalek = { workspace = true }
+p256 = { workspace = true }
+bip39 = { workspace = true }

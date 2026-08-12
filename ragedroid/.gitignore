@@ -1,0 +1,20 @@
+# Gradle build output and caches
+build/
+.gradle/
+.kotlin/
+local.properties
+
+# Native libs are produced by the cargoNdkBuild task; no point committing.
+app/src/main/jniLibs/
+
+# IDE
+*.iml
+.idea/
+.vscode/
+.cxx/
+
+# Gradle wrapper jar/script -- generate with `gradle wrapper` (see README.md "Generate the
+# Gradle wrapper jar"). We don't commit binaries.
+gradle/wrapper/gradle-wrapper.jar
+gradlew
+gradlew.bat

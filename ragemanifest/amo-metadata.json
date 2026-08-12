@@ -1,0 +1,13 @@
+{
+  "categories": {
+    "firefox": ["privacy-security"]
+  },
+  "summary": {
+    "en-US": "A Bitwarden/Vaultwarden-compatible vault where every secret is additionally wrapped to a hardware key -- each use costs a deliberate physical tap."
+  },
+  "description": {
+    "en-US": "Ragewarden stores its vault on any Bitwarden or Vaultwarden server, but adds a second encryption layer on top of the Bitwarden one: every item is wrapped with age to per-recipient stanzas, so a secret can only be opened by a key you hold.\n\nHardware-backed by design -- recipients can be a YubiKey (PIV), a FIDO2 authenticator (hmac-secret), or a platform WebAuthn PRF credential. Opening an item requires a deliberate physical action on the device; the server never sees plaintext.\n\nPaper recovery -- a 24-word phrase can be enrolled as an additional recipient, so a lost device does not mean a lost vault.\n\nThis is the browser client. It talks to the same vault as the ragewarden CLI (rageterm) and Android app (ragedroid), sharing one cross-client recipient registry."
+  },
+  "tags": ["privacy", "security", "yubikey", "passwords"],
+  "requires_payment": false
+}

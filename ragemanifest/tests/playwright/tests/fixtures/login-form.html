@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ragewarden Tier-2 fixture login form</title>
+<style>
+body {
+    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+    background: #f6f3ec; color: #18181b;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh; margin: 0;
+}
+form { width: min(360px, 90vw); display: flex; flex-direction: column; gap: 14px; padding: 24px; background: #fff; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.08); }
+label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+input { padding: 10px 12px; border: 1px solid #ccc; border-radius: 8px; font-size: 14px; }
+button { padding: 10px 14px; border: none; border-radius: 8px; background: #2c4cff; color: #fff; font-weight: 600; cursor: pointer; }
+.events { margin-top: 16px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px; opacity: 0.7; max-height: 120px; overflow: auto; }
+</style>
+</head>
+<body>
+<form id="login" autocomplete="on">
+    <h1>Sign in to github.com</h1>
+    <label>
+        <span>Email or username</span>
+        <input id="login-username" name="username" type="email" autocomplete="username" placeholder="user@example.com">
+    </label>
+    <label>
+        <span>Password</span>
+        <input id="login-password" name="password" type="password" autocomplete="current-password" placeholder="*">
+    </label>
+    <button type="submit">Sign in</button>
+    <div class="events" id="events" data-ragewarden-event-log="1"></div>
+</form>
+<script>
+(() => {
+    const log = document.getElementById('events');
+    const counters = { input: 0, change: 0, beforeinput: 0 };
+    const recorded = [];
+    function bump(name, target) {
+        counters[name] = (counters[name] || 0) + 1;
+        recorded.push({ name, target: target.id, value: target.value });
+        log.textContent = JSON.stringify(counters);
+    }
+    for (const id of ['login-username', 'login-password']) {
+        const el = document.getElementById(id);
+        ['input', 'change', 'beforeinput'].forEach(ev => {
+            el.addEventListener(ev, e => bump(ev, e.target));
+        });
+    }
+    window.__ragewardenFixtureForm = {
+        readUsername: () => document.getElementById('login-username').value,
+        readPassword: () => document.getElementById('login-password').value,
+        counters,
+        recorded,
+    };
+})();
+</script>
+</body>
+</html>
