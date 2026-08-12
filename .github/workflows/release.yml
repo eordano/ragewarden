@@ -339,7 +339,7 @@ jobs:
           fi
       - name: sign the Firefox extension (AMO)
         id: ff-sign
-        uses: kewisch/action-web-ext@fe10addf5d5e5ba6b78ffde720dd488a27d10e8c # v1.3
+        uses: kewisch/action-web-ext@84a13bb9e1b6108c43788ba091c41ca1dba6ad45 # v2.0
         with:
           cmd: sign
           source: ragemanifest/dist/ragemanifest-firefox.zip
