@@ -149,7 +149,7 @@ jobs:
       - name: wasm-pack build
         run: wasm-pack build --target web ragemanifest
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ragemanifest-wasm
           path: ragemanifest/pkg/
@@ -200,7 +200,7 @@ jobs:
 
       - name: upload report on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-report
           path: ragemanifest/tests/playwright/playwright-report/
@@ -262,7 +262,7 @@ jobs:
           ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/26.3.11579264
         run: ./gradlew :app:testStandardDebugUnitTest :app:testFdroidDebugUnitTest
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ragedroid-apks
           path: |
@@ -379,7 +379,7 @@ jobs:
 
       - name: upload androidTest report on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ragedroid-androidtest-report
           path: |
@@ -536,7 +536,7 @@ jobs:
           fi
         shell: bash
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: rageterm-${{ matrix.target }}
           path: |

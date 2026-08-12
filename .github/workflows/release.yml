@@ -225,7 +225,7 @@ jobs:
       # whichever of the two matrices finished second would have killed the
       # release. The two artifacts also hold different things: ci.yml's is the
       # bare binary, this one is the packaged tarball/zip.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-rageterm-${{ matrix.target }}
           path: dist/*
@@ -431,7 +431,7 @@ jobs:
       - name: shred release keystore
         if: always()
         run: rm -f "$RUNNER_TEMP/ragedroid-release.jks"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ragedroid-release-apks
           path: ragedroid/app/build/outputs/apk/**/*.apk
@@ -510,7 +510,7 @@ jobs:
           RAGEDROID_VERSION_NAME: ${{ needs.version.outputs.name }}
         run: bash scripts/repro/verify-ragedroid.sh
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: reproducible-build-hashes
           path: scripts/repro/EXPECTED_HASHES.txt
