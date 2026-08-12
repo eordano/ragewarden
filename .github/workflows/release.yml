@@ -236,7 +236,7 @@ jobs:
       # exists to close -- and would do it silently, because a published release
       # missing four of its five jobs' assets looks like a release, not like a
       # failure. `publish` is the only job allowed to make it visible.
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           draft: true
           files: dist/*
@@ -265,7 +265,7 @@ jobs:
           tar -xzf artifacts/release-rageterm-aarch64-apple-darwin/rageterm-aarch64-apple-darwin.tar.gz -C universal/arm
           lipo -create -output universal/rageterm universal/x86/rageterm universal/arm/rageterm
           tar -czf rageterm-universal-apple-darwin.tar.gz -C universal rageterm
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           draft: true
           files: rageterm-universal-apple-darwin.tar.gz
@@ -352,7 +352,7 @@ jobs:
           test -n "${{ steps.ff-sign.outputs.target }}" || {
             echo "::error::web-ext sign produced no signed artifact"; exit 1; }
           cp "${{ steps.ff-sign.outputs.target }}" ragemanifest/dist/
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           draft: true
           files: |
@@ -435,7 +435,7 @@ jobs:
         with:
           name: ragedroid-release-apks
           path: ragedroid/app/build/outputs/apk/**/*.apk
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           draft: true
           files: ragedroid/app/build/outputs/apk/**/*.apk
@@ -515,7 +515,7 @@ jobs:
           name: reproducible-build-hashes
           path: scripts/repro/EXPECTED_HASHES.txt
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           draft: true
           files: scripts/repro/EXPECTED_HASHES.txt
