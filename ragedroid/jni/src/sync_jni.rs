@@ -20,6 +20,9 @@ pub struct SessionDto {
     pub user_mac_key_b64: String,
     pub kdf_iterations: u32,
 
+    #[serde(default)]
+    pub device_id: String,
+
     pub api_url: String,
     pub identity_url: String,
 }

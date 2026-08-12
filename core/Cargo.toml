@@ -17,7 +17,7 @@ default = []
 reqwest-client = ["dep:reqwest"]
 
 [dependencies]
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "rustls-native-certs"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
 age = { workspace = true }
 age-core = { workspace = true }
 hkdf = { workspace = true }

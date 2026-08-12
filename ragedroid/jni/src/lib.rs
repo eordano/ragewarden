@@ -591,6 +591,7 @@ pub extern "system" fn Java_ragewarden_ragedroid_jni_RageNative_login<'local>(
         user_enc_key_b64: B64.encode(&session.user_enc_key),
         user_mac_key_b64: B64.encode(&session.user_mac_key),
         kdf_iterations: session.kdf_iterations,
+        device_id: session.device_id,
         api_url: server.api_url.clone(),
         identity_url: server.identity_url.clone(),
     };
@@ -633,6 +634,7 @@ fn session_from_dto_or_throw(env: &mut Env<'_>, dto: &SessionDto) -> Option<(Ser
         user_enc_key: user_enc_key.into(),
         user_mac_key: user_mac_key.into(),
         kdf_iterations: dto.kdf_iterations,
+        device_id: dto.device_id.clone(),
     };
     Some((server, session))
 }
