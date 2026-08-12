@@ -1,0 +1,14 @@
+target/
+*.iml
+.idea/
+.vscode/
+**/Cargo.lock.bak
+**/*.swp
+**/*.swo
+**/.DS_Store
+ragedroid/app/build/
+ragedroid/.gradle/
+ragemanifest/pkg/
+ragemanifest/dist/
+ragemanifest/node_modules/
+ragemanifest/ext/wasm/

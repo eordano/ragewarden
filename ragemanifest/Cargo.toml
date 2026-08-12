@@ -1,0 +1,58 @@
+[package]
+name = "ragemanifest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Ragewarden browser extension WASM core"
+
+[lib]
+name = "ragemanifest"
+crate-type = ["cdylib", "rlib"]
+
+[dev-dependencies]
+age = { workspace = true }
+
+[dependencies]
+ragewarden-core = { workspace = true }
+zeroize = { workspace = true }
+secrecy = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+async-trait = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+age-core = { workspace = true }
+web-sys = { version = "0.3", features = [
+    "Headers",
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "Response",
+    "Window",
+    "WorkerGlobalScope",
+] }
+
+send_wrapper = { version = "0.6", features = ["futures"] }
+age = { workspace = true }
+
+getrandom = { version = "0.4", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+
+uuid = { workspace = true, features = ["js"] }
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = [
+    "-O",
+    "--enable-bulk-memory",
+    "--enable-nontrapping-float-to-int",
+    "--enable-sign-ext",
+    "--enable-mutable-globals",
+    "--enable-reference-types",
+]

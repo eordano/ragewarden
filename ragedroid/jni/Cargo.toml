@@ -1,0 +1,36 @@
+[package]
+name = "ragedroid-jni"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "JNI bridge between ragedroid (Android Kotlin) and ragewarden-core"
+
+[lib]
+name = "ragedroid_jni"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ragewarden-core = { workspace = true, features = ["reqwest-client"] }
+zeroize = { workspace = true }
+secrecy = { workspace = true }
+thiserror = { workspace = true }
+age = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+jni = { version = "0.22", default-features = false }
+rustls-platform-verifier = "0.7"
+
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+
+rayon = "1"
+
+hmac = { workspace = true }
+sha2 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+x25519-dalek = { workspace = true }
+hkdf = { workspace = true }
+rand = { workspace = true }

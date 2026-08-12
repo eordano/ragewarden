@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ragewarden -- authorize</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 18px 20px 16px;
+    background: #121212; color: #faf6ee;
+    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+    font-size: 13px; line-height: 1.45;
+  }
+  #mock-banner {
+    display: none;
+    background: #b03a2e; color: #fff;
+    border: 2px solid #ff6b5a;
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin: 0 0 14px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    font-size: 12px;
+  }
+  #mock-banner.on { display: block; }
+  h1 { font-size: 15px; margin: 0 0 6px; font-weight: 600; }
+  /* Muted via color, not opacity: opacity composites the whole subtree, so it
+     would dim the hostname too -- and the hostname is the point of this line. */
+  #target { margin: 0 0 16px; font-size: 12px; color: rgba(250, 246, 238, 0.72); }
+  #destination {
+    display: block;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 22px; line-height: 1.2; font-weight: 600;
+    color: #6a8fff;
+    word-break: break-all;
+    margin-bottom: 2px;
+  }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 0 0 14px; }
+  dt { opacity: 0.6; }
+  dd { margin: 0; font-family: ui-monospace, "SF Mono", Menlo, monospace; word-break: break-all; }
+  #protection { font-weight: 600; }
+  #protection.soft { color: #e0a33e; }
+  #protection.hard { color: #6ad48f; }
+  .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 6px; }
+  button {
+    border-radius: 8px; border: 1px solid #2c2c2c; background: #1d1d1d;
+    color: #faf6ee; padding: 8px 14px; font-size: 13px; cursor: pointer;
+    font-family: inherit;
+  }
+  #authorize { background: #6a8fff; color: #0e0e16; border-color: #6a8fff; font-weight: 600; }
+  button:disabled { opacity: 0.55; cursor: default; }
+  #status { margin-top: 12px; min-height: 18px; opacity: 0.85; }
+  #status.err { color: #ff8a7a; opacity: 1; }
+</style>
+</head>
+<body>
+  <div id="mock-banner"></div>
+  <h1 id="headline">Authorize this use</h1>
+  <!--
+    "Destination" and "Requested by" used to be two rows here, holding
+    "example.com" and "https://example.com". The only path that opens this
+    window is content.js -> vault.unlock, where the page that asked IS the page
+    that gets filled (content.js re-checks location.origin before typing), so
+    they were one fact printed twice, in mono, at the same size and weight as
+    every other row. One sentence now, with the hostname as the largest text in
+    the window: it is the only thing here that decides whether to tap at all.
+  -->
+  <p id="target">
+    <span id="destination">--</span>
+    asked for this, and is the only page it can be released to.
+  </p>
+  <dl>
+    <dt>Action</dt><dd id="action">--</dd>
+    <dt>Item</dt><dd id="item">--</dd>
+    <dt>Protection</dt><dd id="protection">--</dd>
+  </dl>
+  <div class="actions">
+    <button id="cancel" type="button">Cancel</button>
+    <button id="authorize" type="button" disabled>Tap your key</button>
+  </div>
+  <div id="status"></div>
+  <script type="module" src="tap.js"></script>
+</body>
+</html>

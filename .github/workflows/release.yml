@@ -1,0 +1,653 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+# Two runs for the same tag -- a force-repushed tag, or a manual re-run started
+# while the first is still going -- would otherwise race each other uploading
+# assets onto the same draft and racing to publish it. Serialise per ref.
+# Deliberately not cancel-in-progress: cancelling mid-run leaves the draft in
+# whatever half-uploaded state its last job reached, and the publish gate below
+# would then be judging a corpse.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Must equal the WASM_PACK_VERSION in ci.yml; the rationale for pinning at all
+  # is in that file's env block. Two different wasm-pack versions inside one
+  # release produce two different ragemanifest_bg.wasm hashes, which is exactly
+  # what the repro-build job at the bottom of this file is supposed to detect.
+  WASM_PACK_VERSION: "0.13.1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gates. Nothing below publishes a byte until `tests` is green and the release
+  # exists as a *draft*; nothing becomes visible to users until `publish` at the
+  # very bottom flips that draft, and it only runs if every other job succeeded.
+  # ---------------------------------------------------------------------------
+
+  version:
+    name: derive version from tag
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.derive.outputs.name }}
+      code: ${{ steps.derive.outputs.code }}
+    steps:
+      # RAGEDROID_VERSION_CODE / RAGEDROID_VERSION_NAME are a contract with
+      # ragedroid/app/build.gradle.kts, which reads both out of the environment.
+      # They are derived here, in a job with no dependencies, so a malformed tag
+      # fails in seconds rather than after the full test sweep has run.
+      #
+      # versionCode is derived from the tag's own semver -- not from
+      # github.run_number, and not from the date:
+      #
+      #     code = major*1000000 + minor*1000 + patch     (v1.4.2 -> 1004002)
+      #
+      #   * Deterministic. Re-running this workflow on the same tag produces a
+      #     byte-identical APK, which is the whole premise of the repro-build job
+      #     below: verify-ragedroid.sh hashes the APK it builds, so a versionCode
+      #     that moved with the clock (a date-derived code) or with the runner
+      #     (run_number) would change the manifest, change the hash, and turn the
+      #     reproducibility gate red with no source change behind it. That is
+      #     what rules out both of the obvious alternatives.
+      #   * Monotonic for tags cut in ascending semver order, which is the only
+      #     order Android accepts anyway: the package manager refuses an upgrade
+      #     whose versionCode is not strictly greater than the installed one.
+      #   * Readable. 1004002 decodes by eye to 1.4.2, so a bug report quoting a
+      #     versionCode names a tag.
+      #
+      # Failure modes. Every one of them is unfixable for anyone who has already
+      # installed the affected build -- a versionCode cannot be taken back -- which
+      # is why the first three are refused here instead of being papered over:
+      #   * minor or patch >= 1000 carries into the next field: v1.0.1000 and
+      #     v1.1.0 would both be 1001000. Refused below.
+      #   * major >= 2100 exceeds Play's hard 2100000000 versionCode ceiling
+      #     (2099.999.999 is the largest expressible release). Refused below.
+      #   * Pre-release tags (v1.0.0-rc1) have no non-colliding code under this
+      #     scheme -- an rc would share 1000000 with the final v1.0.0, and
+      #     whichever reached a device first would block the other as a
+      #     non-upgrade. Refused below; cut rcs as their own patch version.
+      #   * Cutting an *older* semver after a newer one (a v1.4.3 hotfix after
+      #     v2.0.0 shipped) yields a code lower than what users already have.
+      #     Nothing here can detect that -- this job sees one tag, not the
+      #     history -- and no later CI change can rescue it: Play rejects the
+      #     upload and devices reject the sideload. Hotfixes must be cut as a
+      #     higher version.
+      - name: derive
+        id: derive
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::tag '$TAG' is not vMAJOR.MINOR.PATCH. This workflow triggers on 'v*', but"
+            echo "::error::the Android versionCode is derived from the three numbers, so a tag it"
+            echo "::error::cannot parse (or a pre-release suffix, which would collide with the"
+            echo "::error::release it precedes) has no safe code. Retag as e.g. v1.4.2."
+            exit 1
+          fi
+          # 10# forces base 10: a zero-padded field like 08 is an invalid octal
+          # literal and would abort the arithmetic below.
+          major=$((10#${BASH_REMATCH[1]}))
+          minor=$((10#${BASH_REMATCH[2]}))
+          patch=$((10#${BASH_REMATCH[3]}))
+          if (( minor > 999 || patch > 999 )); then
+            echo "::error::minor/patch must each be <= 999 in '$TAG'; above that the fields carry"
+            echo "::error::into each other and versionCode stops tracking the tag's ordering."
+            exit 1
+          fi
+          if (( major > 2099 )); then
+            echo "::error::major must be <= 2099 in '$TAG'; Play's versionCode ceiling is 2100000000."
+            exit 1
+          fi
+          code=$(( major * 1000000 + minor * 1000 + patch ))
+          name="${TAG#v}"
+          echo "versionName=$name versionCode=$code"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
+  tests:
+    # The whole of ci.yml, run against the tag. Called rather than copied: a
+    # duplicated suite drifts from the one it was copied from, and the copy is
+    # always the one that rots. Every publishing job below needs this, so a red
+    # suite means no upload happens at all.
+    name: test suites
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  create-draft:
+    name: create draft release
+    runs-on: ubuntu-latest
+    needs: [version, tests]
+    steps:
+      # The release is created exactly once, here, before any job uploads to it.
+      # Two reasons:
+      #   * Draft-ness has to be established before the first asset lands.
+      #     Otherwise the first job to finish creates a *public* release and
+      #     users can download a release that is missing every artifact from
+      #     every job that has not finished yet -- including the reproducibility
+      #     manifest from repro-build, which by construction finishes last.
+      #   * The five upload sites below would otherwise each be capable of
+      #     creating the release, and GitHub permits multiple drafts sharing one
+      #     tag name (unlike published releases, which collide with a 422). Five
+      #     matrix legs finishing at once could each look, miss, and create -- and
+      #     the assets would scatter across duplicate drafts. `publish` asserts
+      #     there is exactly one release for the tag before it promotes anything.
+      - name: create or reuse the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if state="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [ "$state" != "true" ]; then
+              echo "::error::a PUBLISHED release already exists for $TAG. Re-running would append"
+              echo "::error::assets to something users can already see, which is the failure mode"
+              echo "::error::this draft flow exists to prevent. Delete that release (or cut a new"
+              echo "::error::tag) and run again."
+              exit 1
+            fi
+            echo "reusing the existing draft for $TAG"
+            exit 0
+          fi
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --title "$TAG" \
+            --generate-notes
+
+  rageterm:
+    name: rageterm ${{ matrix.target }}
+    needs: [tests, create-draft]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: install pcsc-lite (linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev
+      - name: install cross
+        if: matrix.cross
+        run: cargo install --locked cross
+      - name: build
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release -p rageterm --target ${{ matrix.target }}
+          else
+            cargo build --release -p rageterm --target ${{ matrix.target }}
+          fi
+        shell: bash
+      - name: package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cd target/${{ matrix.target }}/release
+          if [ -f rageterm.exe ]; then
+            7z a "../../../dist/rageterm-${{ matrix.target }}.zip" rageterm.exe
+          else
+            tar -czf "../../../dist/rageterm-${{ matrix.target }}.tar.gz" rageterm
+          fi
+      # The universal job below `lipo`s the two darwin builds together, and it
+      # runs on a fresh runner with nothing but what download-artifact hands it.
+      # Without this upload its `tar -xzf artifacts/...` opens nothing and the
+      # job dies before it ever calls lipo.
+      #
+      # The `release-` prefix is load-bearing. Artifacts are namespaced per
+      # workflow *run*, and the `tests` job runs ci.yml inside this run -- where
+      # ci.yml's own rageterm-cross matrix uploads `rageterm-<target>` for the
+      # same five targets. upload-artifact@v4 does not merge same-named
+      # artifacts, it fails the step with a 409 Conflict, so without the prefix
+      # whichever of the two matrices finished second would have killed the
+      # release. The two artifacts also hold different things: ci.yml's is the
+      # bare binary, this one is the packaged tarball/zip.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-rageterm-${{ matrix.target }}
+          path: dist/*
+      # draft: true on every upload site in this file, without exception. The
+      # release these assets land on was created as a draft by create-draft;
+      # this keeps it one. An upload that omitted the flag would publish the
+      # release the moment that one job finished -- the exact bug this flow
+      # exists to close -- and would do it silently, because a published release
+      # missing four of its five jobs' assets looks like a release, not like a
+      # failure. `publish` is the only job allowed to make it visible.
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: dist/*
+
+  rageterm-macos-universal:
+    name: rageterm macos universal
+    needs: [rageterm, create-draft]
+    runs-on: macos-latest
+    steps:
+      # Only the two darwin tarballs from this workflow's own rageterm matrix.
+      # An unfiltered download now pulls in everything ci.yml uploaded in this
+      # run too -- bare binaries under confusingly similar names, APKs, a
+      # Playwright report -- none of which this job wants and one of which
+      # (ci.yml's `rageterm-<target>`) differs from what is unpacked below only
+      # by the missing prefix.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-rageterm-*-apple-darwin
+          path: artifacts
+      - name: lipo
+        run: |
+          # -C needs the directory to already exist; `mkdir -p universal` alone
+          # left tar extracting into a path that was never created.
+          mkdir -p universal/x86 universal/arm
+          tar -xzf artifacts/release-rageterm-x86_64-apple-darwin/rageterm-x86_64-apple-darwin.tar.gz -C universal/x86
+          tar -xzf artifacts/release-rageterm-aarch64-apple-darwin/rageterm-aarch64-apple-darwin.tar.gz -C universal/arm
+          lipo -create -output universal/rageterm universal/x86/rageterm universal/arm/rageterm
+          tar -czf rageterm-universal-apple-darwin.tar.gz -C universal rageterm
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: rageterm-universal-apple-darwin.tar.gz
+
+  ragemanifest:
+    name: ragemanifest extension zips
+    needs: [tests, create-draft]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      # Pinned via WASM_PACK_VERSION (see the env block at the top of this file).
+      # The repro-build job installs the same version from the same variable;
+      # if these two ever diverge, the wasm it verifies is not the wasm it ships.
+      - name: install wasm-pack (pinned)
+        run: cargo install --locked wasm-pack --version "$WASM_PACK_VERSION"
+      - name: wasm-pack build
+        run: wasm-pack build --target web ragemanifest
+      # ragemanifest/build.mjs is the only supported way to produce a loadable
+      # extension; staging it by hand (cp -r ext/*) shipped a broken zip:
+      #   - ext/manifests/<target>.json is a *fragment* that build.mjs merges over the
+      #     base manifest. Copying it over manifest.json is what the firefox zip did,
+      #     so the published Firefox extension declared no content_scripts, no
+      #     host_permissions, no action and no CSP -- it did nothing at all once loaded.
+      #   - the chromium zip never got the sidePanel permission / side_panel entry that
+      #     emitManifest() injects, and neither zip got popup/tokens.css, so the popup
+      #     rendered unstyled.
+      #   - none of the release fences ran: stripDevOnlyGlue (the mock hardware-tap
+      #     backend shipped inside the zip), assertDistIsSane (pins
+      #     allowMockTap/vmMode/testHooks false, rejects web_accessible_resources) and
+      #     assertPopupIsNotThePrototype (rejects design/, whose recovery screen shows a
+      #     constant phrase while the real one goes to console.warn).
+      # build.mjs also refuses --zip together with --allow-mock-tap/--test-hooks, so a
+      # release job cannot emit a mock-capable artifact even by accident.
+      - name: build extension zips
+        working-directory: ragemanifest
+        run: |
+          for browser in chromium firefox; do
+            node build.mjs "$browser" --zip
+            # maybeZipDist() only warns if the `zip` binary fails, and an empty upload
+            # glob would publish a release with no extension at all. Fail here instead.
+            if [ ! -f "dist/ragemanifest-$browser.zip" ]; then
+              echo "::error::build.mjs did not emit dist/ragemanifest-$browser.zip"
+              exit 1
+            fi
+          done
+      # Firefox signing, ported from the bookmarks extension's proven AMO flow
+      # (kewisch/action-web-ext). It reuses the same repository/organization
+      # secrets, so no new credential is minted here:
+      #   - FIREFOX_API_KEY / FIREFOX_API_SECRET are the addons.mozilla.org API
+      #     JWT issuer/secret (Add-on Developer Hub -> Manage API Keys). Add them
+      #     as repo or org secrets, exactly as bookmarks does.
+      # channel: unlisted produces a signed .xpi for direct/self-distribution
+      # without AMO public review -- the right first step for a security tool not
+      # yet on the public store. Switch to `listed` (and fill amo-metadata.json's
+      # public fields) to submit to the AMO catalogue instead.
+      # Fail loudly if the secret is absent on a release tag, matching the APK
+      # job's RAGEDROID_KEYSTORE_BASE64 guard: a tagged release must not silently
+      # publish an unsigned extension.
+      - name: assert AMO credentials are present
+        run: |
+          if [ -z "${{ secrets.FIREFOX_API_KEY }}" ] || [ -z "${{ secrets.FIREFOX_API_SECRET }}" ]; then
+            echo "::error::FIREFOX_API_KEY / FIREFOX_API_SECRET are not set; a release tag cannot produce a signed Firefox extension. Add them as bookmarks does."
+            exit 1
+          fi
+      - name: sign the Firefox extension (AMO)
+        id: ff-sign
+        uses: kewisch/action-web-ext@fe10addf5d5e5ba6b78ffde720dd488a27d10e8c # v1.3
+        with:
+          cmd: sign
+          source: ragemanifest/dist/ragemanifest-firefox.zip
+          channel: unlisted
+          apiKey: ${{ secrets.FIREFOX_API_KEY }}
+          apiSecret: ${{ secrets.FIREFOX_API_SECRET }}
+          metaDataFile: ragemanifest/amo-metadata.json
+      - name: stage the signed .xpi next to the zips
+        run: |
+          test -n "${{ steps.ff-sign.outputs.target }}" || {
+            echo "::error::web-ext sign produced no signed artifact"; exit 1; }
+          cp "${{ steps.ff-sign.outputs.target }}" ragemanifest/dist/
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            ragemanifest/dist/*.zip
+            ragemanifest/dist/*.xpi
+
+  ragedroid:
+    name: ragedroid signed APK
+    needs: [tests, create-draft, version]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 17
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-ndk
+        run: cargo install --locked cargo-ndk
+      - uses: android-actions/setup-android@v3
+      - name: install ndk
+        run: sdkmanager "ndk;26.3.11579264"
+      - name: gradle wrapper
+        working-directory: ragedroid
+        # The version comes out of the committed gradle-wrapper.properties, never
+        # a literal in this file. ragedroid/gradle/libs.versions.toml pins
+        # agp = 8.13.2, and AGP's own version-check plugin refuses anything below
+        # 8.13 ("Minimum supported Gradle version is 8.13"), so the 8.10.2 that
+        # used to be hardcoded here rewrote the properties file down to a Gradle
+        # that could not even configure the project -- every job died at
+        # `apply plugin: com.android.application`, before compiling a line.
+        run: |
+          version="$(sed -n 's|.*/gradle-\(.*\)-bin\.zip|\1|p' gradle/wrapper/gradle-wrapper.properties)"
+          if [ -z "$version" ]; then
+            echo "::error::no distributionUrl version in ragedroid/gradle/wrapper/gradle-wrapper.properties"
+            exit 1
+          fi
+          echo "gradle wrapper version (from gradle-wrapper.properties): $version"
+          gradle wrapper --gradle-version "$version"
+      # The gradle side reads RAGEDROID_KEYSTORE as a *path*, and a GitHub secret cannot
+      # hold binary, so the .jks travels base64-encoded and is materialised here. It is
+      # written to RUNNER_TEMP rather than the workspace so no artifact/release glob can
+      # ever sweep the signing key into a published file.
+      - name: materialise release keystore
+        env:
+          RAGEDROID_KEYSTORE_BASE64: ${{ secrets.RAGEDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$RAGEDROID_KEYSTORE_BASE64" ]; then
+            echo "::error::RAGEDROID_KEYSTORE_BASE64 is not set; a release tag cannot produce a signed APK."
+            exit 1
+          fi
+          printf '%s' "$RAGEDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/ragedroid-release.jks"
+      - name: assemble release
+        working-directory: ragedroid
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/26.3.11579264
+          # All four are mandatory: :app:requireReleaseSigning fails the packaging task if
+          # any is blank, so a missing secret is a red build, not an APK signed with the
+          # public debug key and published as "signed".
+          RAGEDROID_KEYSTORE: ${{ runner.temp }}/ragedroid-release.jks
+          RAGEDROID_KEYSTORE_PASSWORD: ${{ secrets.RAGEDROID_KEYSTORE_PASSWORD }}
+          RAGEDROID_KEY_ALIAS: ${{ secrets.RAGEDROID_KEY_ALIAS }}
+          RAGEDROID_KEY_PASSWORD: ${{ secrets.RAGEDROID_KEY_PASSWORD }}
+          # The other half of the contract described in the `version` job:
+          # build.gradle.kts reads exactly these two names for versionCode and
+          # versionName. The repro-build job sets the same two to the same
+          # values, because a differing versionCode would change the APK's
+          # manifest and therefore its hash, and the reproducibility check would
+          # be comparing two different builds.
+          RAGEDROID_VERSION_CODE: ${{ needs.version.outputs.code }}
+          RAGEDROID_VERSION_NAME: ${{ needs.version.outputs.name }}
+        run: ./gradlew :app:assembleStandardRelease :app:assembleFdroidRelease
+      - name: shred release keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/ragedroid-release.jks"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ragedroid-release-apks
+          path: ragedroid/app/build/outputs/apk/**/*.apk
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: ragedroid/app/build/outputs/apk/**/*.apk
+
+  repro-build:
+    name: reproducible-build verification
+    runs-on: ubuntu-latest
+    needs: [rageterm, ragemanifest, ragedroid, version]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 17
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown,aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install b3sum
+        run: cargo install --locked b3sum
+
+      - name: install pcsc-lite
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev
+
+      # Same pin as the ragemanifest job above: this job re-runs wasm-pack and
+      # compares the result against the recorded hash, so it has to be the same
+      # wasm-pack that produced the artifact being shipped.
+      - name: install wasm-pack (pinned)
+        run: cargo install --locked wasm-pack --version "$WASM_PACK_VERSION"
+
+      - name: install cargo-ndk
+        run: cargo install --locked cargo-ndk
+
+      - uses: android-actions/setup-android@v3
+      - name: install ndk
+        run: sdkmanager "ndk;26.3.11579264"
+
+      # ragedroid/.gitignore excludes gradlew, gradlew.bat and
+      # gradle/wrapper/gradle-wrapper.jar, so a fresh checkout has no wrapper at
+      # all -- only gradle-wrapper.properties is committed. The ragedroid job
+      # generates one; this job runs on its own runner and did not, so
+      # verify-ragedroid.sh's `./gradlew` was a guaranteed exit 127.
+      - name: gradle wrapper
+        working-directory: ragedroid
+        run: |
+          version="$(sed -n 's|.*/gradle-\(.*\)-bin\.zip|\1|p' gradle/wrapper/gradle-wrapper.properties)"
+          if [ -z "$version" ]; then
+            echo "::error::no distributionUrl version in ragedroid/gradle/wrapper/gradle-wrapper.properties"
+            exit 1
+          fi
+          echo "gradle wrapper version (from gradle-wrapper.properties): $version"
+          gradle wrapper --gradle-version "$version"
+
+      # rageterm is verified per-triple by the repro-rageterm matrix job below --
+      # one runner can only rebuild its own host triple, which left four of the
+      # five published triples unattested.
+      - name: verify ragemanifest wasm
+        run: bash scripts/repro/verify-ragemanifest-wasm.sh
+
+      # verify-ragedroid.sh rebuilds :app:assembleStandardRelease itself
+      # (-PunsignedBuild=true) on this fresh runner and hashes the result, so it
+      # only means anything if it builds the *same* version the ragedroid job
+      # published. build.gradle.kts takes versionCode/versionName from these two
+      # variables; leaving them unset here would bake whatever the defaults are
+      # into the APK, and the hash recorded as "the release" would belong to a
+      # build nobody can download.
+      - name: verify ragedroid
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/26.3.11579264
+          RAGEDROID_VERSION_CODE: ${{ needs.version.outputs.code }}
+          RAGEDROID_VERSION_NAME: ${{ needs.version.outputs.name }}
+        run: bash scripts/repro/verify-ragedroid.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reproducible-build-hashes
+          path: scripts/repro/EXPECTED_HASHES.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: scripts/repro/EXPECTED_HASHES.txt
+
+  # Per-triple reproducible-build verification for rageterm. The single-runner
+  # repro-build job could only rebuild its own host triple (x86_64-linux),
+  # leaving the other four published triples unattested. This mirrors the
+  # rageterm build matrix above exactly -- same os/target/cross -- so each leg
+  # rebuilds its triple the same way the release did and compares the b3sum.
+  # The aarch64-darwin + x86_64-darwin legs also transitively attest the
+  # macos-universal binary, which is lipo'd deterministically from those two.
+  repro-rageterm:
+    name: reproducible rageterm ${{ matrix.target }}
+    needs: [rageterm]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: install pcsc-lite (linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev
+      - name: install cross
+        if: matrix.cross
+        run: cargo install --locked cross
+      - name: install b3sum
+        run: cargo install --locked b3sum
+      - name: verify rageterm ${{ matrix.target }}
+        shell: bash
+        run: |
+          args=(--target="${{ matrix.target }}")
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            args+=(--cross)
+          fi
+          bash scripts/repro/verify-rageterm.sh "${args[@]}"
+
+  publish:
+    name: publish the release
+    runs-on: ubuntu-latest
+    # Every other job, listed exhaustively rather than relying on the transitive
+    # edges: a job absent from this list can fail while the release still goes
+    # out. GitHub skips a job whose `needs` did not all succeed, so a red or
+    # skipped anything anywhere above leaves the release a draft -- visible to
+    # maintainers, invisible to users, and obviously unfinished -- which is the
+    # entire point of the draft flow.
+    needs:
+      - version
+      - tests
+      - create-draft
+      - rageterm
+      - rageterm-macos-universal
+      - ragemanifest
+      - ragedroid
+      - repro-build
+      - repro-rageterm
+    steps:
+      # `needs` proves every job reported success; it does not prove their
+      # uploads landed. A glob that matched nothing, or an upload that went to a
+      # second draft sharing the tag, both look like success from here. So the
+      # asset list is checked against what the jobs above are supposed to have
+      # produced before anything becomes public. Adding or renaming a published
+      # artifact means adding or renaming it here too -- a missing name fails the
+      # release rather than shipping a hole.
+      - name: assert the draft is complete, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          releases="$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq "[.[] | select(.tag_name == \"$TAG\")] | length")"
+          if [ "$releases" != "1" ]; then
+            echo "::error::expected exactly one release for $TAG, found $releases. More than one"
+            echo "::error::means the assets are split across duplicate drafts and no single one of"
+            echo "::error::them is the release; zero means create-draft's draft was deleted mid-run."
+            exit 1
+          fi
+
+          assets="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          echo "assets attached to the $TAG draft:"
+          echo "$assets"
+
+          missing=0
+          for want in \
+            rageterm-x86_64-unknown-linux-gnu.tar.gz \
+            rageterm-aarch64-unknown-linux-gnu.tar.gz \
+            rageterm-x86_64-apple-darwin.tar.gz \
+            rageterm-aarch64-apple-darwin.tar.gz \
+            rageterm-x86_64-pc-windows-msvc.zip \
+            rageterm-universal-apple-darwin.tar.gz \
+            ragemanifest-chromium.zip \
+            ragemanifest-firefox.zip \
+            EXPECTED_HASHES.txt
+          do
+            if ! grep -qxF "$want" <<<"$assets"; then
+              echo "::error::the $TAG draft has no asset named $want"
+              missing=1
+            fi
+          done
+
+          # The APK filenames come from AGP (flavor + build type), so they are
+          # matched by extension rather than spelled out: two release flavors,
+          # standard and fdroid, are assembled and both are published.
+          apks="$(grep -c '\.apk$' <<<"$assets" || true)"
+          if [ "$apks" -lt 2 ]; then
+            echo "::error::expected 2 APKs (standard + fdroid release) on the $TAG draft, found $apks"
+            missing=1
+          fi
+
+          if [ "$missing" != 0 ]; then
+            echo "::error::refusing to publish an incomplete release; the draft is left in place"
+            echo "::error::so you can inspect it, and deleting it is enough to allow a re-run."
+            exit 1
+          fi
+
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          echo "published $TAG"

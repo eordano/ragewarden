@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Ragewarden",
+  "version": "0.0.1",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "ragewarden@ragewarden",
+      "strict_min_version": "132.0"
+    }
+  },
+  "permissions": [
+    "storage",
+    "activeTab",
+    "clipboardWrite",
+    // Firefox has supported nativeMessaging since 50, and rageterm serves this
+    // browser specifically: install_native_host.rs has a Browser::Firefox arm
+    // whose DEFAULT_FIREFOX_EXTENSION_ID is the same "ragewarden@ragewarden"
+    // declared above. Without this the extension cannot open the port at all,
+    // so wiring ext/glue/native-host.js would fix Chromium and silently do
+    // nothing here -- and a PIV or FIDO2 stanza stays unopenable in Firefox no
+    // matter what key is plugged in.
+    //
+    // This list REPLACES the base manifest's permissions wholesale via
+    // Object.assign in build.mjs, so an entry omitted here is omitted from the
+    // build even though ext/manifest.json declares it.
+    "nativeMessaging"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  }
+}

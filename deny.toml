@@ -1,0 +1,53 @@
+# cargo-deny configuration -- https://embarkstudios.github.io/cargo-deny/
+#
+# Introduced report-first. The CI job (.github/workflows/ci.yml `supply-chain`)
+# hard-gates only the deterministic `sources` check -- verified safe today
+# because Cargo.lock resolves every dependency from crates.io with no git or
+# alternative-registry source -- and runs advisories + licenses as REPORTED
+# signals that do not fail the build. That split is deliberate: ci.yml runs on
+# release tags via `workflow_call`, and a hard-failing advisory check would
+# wedge an unrelated release the day a new upstream CVE lands (the file's own
+# header forbids jobs that are "too flaky for a tag"). Once a clean run confirms
+# the license allowlist, move `cargo deny check licenses` into the gating step.
+
+[advisories]
+version = 2
+yanked = "warn"
+
+[licenses]
+version = 2
+# The four ragewarden workspace crates are AGPL-3.0-only; the rest is the
+# permissive set the dependency tree actually uses. An unlisted license is
+# reported by the (currently non-gating) licenses step until it is enforced.
+allow = [
+  "AGPL-3.0-only",
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "MPL-2.0",
+  "CC0-1.0",
+  "BSL-1.0",
+  "OpenSSL",
+]
+confidence-threshold = 0.8
+private = { ignore = true }
+
+[bans]
+# Warn-only so the gating `sources + bans` step cannot fail on a duplicate
+# version or a wildcard requirement that has nothing to do with supply-chain
+# trust. Tighten to "deny" deliberately if either becomes a policy.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+# The hard gate. Verified: Cargo.lock resolves everything from crates.io, no git
+# or alternative registry. This blocks a dependency later arriving from an
+# arbitrary git repo or a private registry.
+unknown-registry = "deny"
+unknown-git = "deny"

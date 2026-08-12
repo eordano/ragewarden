@@ -1,0 +1,17 @@
+{
+  "name": "ragemanifest-playwright",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Tier 2 end-to-end harness: Playwright + headless Chromium with the Ragewarden extension loaded, virtual WebAuthn authenticator with PRF, real Vaultwarden in Docker.",
+  "type": "module",
+  "scripts": {
+    "test": "playwright test",
+    "report": "playwright show-report",
+    "screenshots": "node capture-screenshots.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.1",
+    "@types/node": "^22.19.18",
+    "typescript": "^5.9.3"
+  }
+}

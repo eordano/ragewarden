@@ -1,0 +1,18 @@
+# wasm-pack output
+pkg/
+
+# Bundler output (Layout A: copy-at-build -> dist/<browser>/)
+dist/
+
+# Staged WASM (regenerated from pkg/)
+ext/wasm/
+
+# npm
+node_modules/
+package-lock.json
+# Playwright test harness pins its lockfile.
+!tests/playwright/package-lock.json
+
+# IDE
+.vscode/
+*.iml

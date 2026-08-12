@@ -1,0 +1,9 @@
+node_modules/
+dist/
+test-results/
+playwright-report/
+.playwright-state.json
+screenshots/
+# Local cargo-built Vaultwarden binary + per-run sqlite data + log file.
+# Populated only when RAGEWARDEN_USE_CARGO_VAULTWARDEN=1.
+.vaultwarden-cache/
