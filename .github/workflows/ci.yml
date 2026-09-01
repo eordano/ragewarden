@@ -227,7 +227,7 @@ jobs:
         run: cargo install --locked cargo-ndk
 
       - name: setup android sdk
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: install ndk
         run: sdkmanager "ndk;26.3.11579264"
@@ -346,7 +346,7 @@ jobs:
           sudo udevadm trigger --name-match=kvm
 
       - name: setup android sdk
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: install ndk + system image
         run: |

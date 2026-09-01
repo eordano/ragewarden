@@ -375,7 +375,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-ndk
         run: cargo install --locked cargo-ndk
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
       - name: install ndk
         run: sdkmanager "ndk;26.3.11579264"
       - name: gradle wrapper
@@ -470,7 +470,7 @@ jobs:
       - name: install cargo-ndk
         run: cargo install --locked cargo-ndk
 
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
       - name: install ndk
         run: sdkmanager "ndk;26.3.11579264"
 
