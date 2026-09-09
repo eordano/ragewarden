@@ -40,7 +40,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 
 arboard = "3"
 
-dirs = "6"
+dirs = "7"
 
 notify-rust = "4"
 
