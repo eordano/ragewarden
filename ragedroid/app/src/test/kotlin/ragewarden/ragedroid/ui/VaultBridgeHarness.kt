@@ -25,8 +25,8 @@ import ragewarden.ragedroid.model.VaultItem
  * descriptor comparisons could be reverted with every suite staying green:
  *
  *  1. `context.appEntryPoint().recipientStore()` -- a Hilt entry point. This
- *     module's `robolectric.properties` pins `application=android.app.Application`,
- *     which is not a Hilt component holder, so the lookup throws outright.
+ *     module's `robolectric.properties` pins `TestApplication`, a plain
+ *     Application that is not a Hilt component holder, so the lookup throws outright.
  *  2. `VaultBridge.ensureBackend(context).snapshot()` -- the vault contents.
  *
  * [EntryPointApplication] answers (1) without a Dagger graph. `EntryPoints.get`
@@ -49,6 +49,11 @@ import ragewarden.ragedroid.model.VaultItem
  * throws rather than falling back to anything.
  */
 class EntryPointApplication : Application(), GeneratedComponent, AppEntryPoint {
+    override fun onCreate() {
+        super.onCreate()
+        ragewarden.ragedroid.ui.UiStrings.install(this)
+    }
+
 
     /**
      * `RecipientDetailScreen` only holds this, using it in the revoke flow --
@@ -65,6 +70,7 @@ class EntryPointApplication : Application(), GeneratedComponent, AppEntryPoint {
     override fun auditFeed(): AuditFeed = notWired("auditFeed")
     override fun rotationTracker(): RotationTracker = notWired("rotationTracker")
     override fun historyStore(): HistoryStore = notWired("historyStore")
+    override fun sessionKeyWrap(): ragewarden.ragedroid.data.SessionKeyWrap = notWired("sessionKeyWrap")
 
     private fun notWired(name: String): Nothing = throw UnsupportedOperationException(
         "$name is not wired in EntryPointApplication. A screen reaching for it during " +
@@ -81,13 +87,13 @@ class FakeVaultBackend(items: List<VaultItem>) : VaultBackend {
 
     override fun get(id: String): VaultItem? = items.firstOrNull { it.id == id }
 
-    override suspend fun decrypt(itemId: String, identities: List<KotlinIdentity>): ByteArray =
+    override suspend fun decrypt(itemId: String, identities: List<KotlinIdentity>, use: ragewarden.ragedroid.data.audit.AuditAction?): ByteArray =
         unreachable("decrypt")
 
     override suspend fun update(item: VaultItem, plaintext: ByteArray?): VaultItem =
         unreachable("update")
 
-    override suspend fun create(item: VaultItem, plaintext: ByteArray): VaultItem =
+    override suspend fun create(item: VaultItem, plaintext: ByteArray?): VaultItem =
         unreachable("create")
 
     override suspend fun delete(itemId: String) = unreachable("delete")

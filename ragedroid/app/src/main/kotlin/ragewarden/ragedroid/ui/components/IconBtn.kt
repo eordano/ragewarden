@@ -28,7 +28,7 @@ fun IconBtn(
     val c = rageColors
     IconButton(
         onClick = onClick,
-        modifier = modifier.size(36.dp),
+        modifier = modifier.size(48.dp),
     ) {
         Icon(
             imageVector = icon,

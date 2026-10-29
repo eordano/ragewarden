@@ -1,0 +1,47 @@
+{
+  "comment": "Frozen ciphertexts written by ragewarden-core at commit 54be5ec60 (before the v2 stanza formats and per-secret PRF salts). Every reader must keep opening them. Never regenerate.",
+  "fido2_hmac_legacy_3arg": {
+    "blob": "-----BEGIN AGE ENCRYPTED FILE-----\nYWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IGZpZG8yLWhtYWMgWm5KdmVtVnVMV055\nWldSbGJuUnBZV3cgUER3OFBEdzhQRHc4UER3OFBEdzhQRHc4UER3OFBEdzhQRHc4\nUER3OFBEdyByYWdld2FyZGVuLmV4YW1wbGUKaGlwd3VXV21nc3JRalZ5RTBaaEE0\nL21zTDZuK2dKMGc5b3BHbVNveDdOVQotPiAzI3JXYXN2bS1ncmVhc2UKaUVRcFI2\nUkZVWFJEbmUwcXNPV0VGTENTdDZxQUJnCi0tLSB3Y2hLcDk0UktxTmJQQUlZRjFs\nWEFOd2JpYmlIMlZQbFpMdzdsL2toM0ZBCq4kZRxgddN0IBNjCBng2tkzdVaRCDPg\nFIiE/4wRGq71eilVsF0fSm2A2FIv2ytnUt/iNLNnLaeN5B81OApRmXWp3Q==\n-----END AGE ENCRYPTED FILE-----\n",
+    "plaintext": "frozen v1: fido2-hmac legacy 3-arg"
+  },
+  "fido2_hmac_wrap_salt": {
+    "blob": "-----BEGIN AGE ENCRYPTED FILE-----\nYWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IGZpZG8yLWhtYWMgWm5KdmVtVnVMV055\nWldSbGJuUnBZV3cgUER3OFBEdzhQRHc4UER3OFBEdzhQRHc4UER3OFBEdzhQRHc4\nUER3OFBEdyByYWdld2FyZGVuLmV4YW1wbGUgbFpjQVJQYnVOdVpVcTZEbDVueVBN\nSGZIOWliREMybUJ5THBBeXlYRWlXNApPQ1JZandFMTdWR3YzV2IydFIxREd3TmYz\nWEJyWnFsVm5GMWJuODNPaXFrCi0+IGF7LWdyZWFzZSB3KmM7Q2kgc34xOyA3PFxY\ncCQlagpFT0FuZFRkK3E0UkxRYjYwbHZuOEVpR2FJcWVZZXBoTkdQWDNoRFBtYmFt\ndzRzMnJ0V0N6R0d0RHlzWmFhYkdrCjFTaEtoeGdSZEQwWmo4amdhMy9HTGZ0cTli\nUytkVmt0dE5MUEdRCi0tLSBmUXdSa1ZGdEZKTTJCb0ZHcDQzVyt3S3ZKZzh5eEN0\ncmVSVGt1cjVXTTdzCkBnO28BkBcrXl5ci8J59ggwvcV70tdRj2Ian3AnklI3FKml\nsVNFp68HXXoGCaAukeMWFNtZaR06prQUo09mPscObGRLzPILWBOcBA==\n-----END AGE ENCRYPTED FILE-----\n",
+    "plaintext": "frozen v1: fido2-hmac 4-arg, recipient salt"
+  },
+  "piv_x25519_v1": {
+    "blob": "-----BEGIN AGE ENCRYPTED FILE-----\nYWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IHBpdi1wMjU2IFIvSVI1R1d3WmplNzgv\nVElqMk9Oc2poMVVXSXhnam5ZYjRVMHMzUUVjaEkgbXhiVkFRCnptR0Jnck5iYzFB\ndldodjFrdUxWNEJjSitPQm1ZSXZ2SGNQcVY1ZW9MbUEKLT4gRkwtZ3JlYXNlCjh0\ncld3K3laVmEyZFcveCtzYlVLSjk3SDdKME5nYUM3S0EKLS0tIEtQaDBqbU9OeTlk\nNlprL3hmWVdYNjBjUFhJa1FqL1BNZlhPaVBzRW05MG8K+d0sXfnQcYavYOaqcrfn\nhPzh6chdqaSaC+kokns3K5tI+WM6Cu45t+xdTarsX2x3MBlPHVXMNLzHF8Z7hiPN\n1G341P3MNmZH/GId\n-----END AGE ENCRYPTED FILE-----\n",
+    "plaintext": "frozen v1: piv-p256 (x25519, eph-only salt)",
+    "recipient_pub_hex": "b0d08f35b4683381489afb32825e59152d47d19bc9e050d6d5a954984c9d1e2c",
+    "recipient_secret_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+  },
+  "piv_x25519_v1_plus_software": {
+    "blob": "-----BEGIN AGE ENCRYPTED FILE-----\nYWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBSMGRpRWpvQVp4Q1VlK2Ru\nTDBFZUVYMDZaQUJzZnRiVUk3SmVVZkxma3gwCisvRk4zOFg3N3BFT2w0WkFMeS9J\nWTJKTEZoUjFOS0JMeGV1K1YzNHV2cm8KLT4gcGl2LXAyNTYga2RLcTFNaCsvWlhx\nQXNDVmNKNWNBTm5mbjhiRHRlYWFuMDg5OGFTSFhDZyBteGJWQVEKdHZUY3laZW0x\nbnNnUVJQZld5clZ5OUc2ZlJCK3ZFOFBjTkJuUmJOVjBQdwotPiBIODQtZ3JlYXNl\nCnltemxBTUNpSzVVUGtyQ1pwYWtBN2NaZXVyU1R2VXZialBiY2NrelhKK1Vydmll\ncVphODltNFRvbWx6N0dYTU4KNHdxZXVaU0RHb0hEbS9XNi9VMlh3WTQyYzFiN3Bl\nZUg4dVNUZmtFZWdrWHpSUUEKLS0tIHlVMG4vbVBRMlVIKzZ6aFQ3M1dXRFExRER4\nMmk0ZFp2MEl3N2ErenRRZ2sKALiq8nya2YSdAYor40PD1nCWvpLQdAT45fk6mosh\nKXwcFX2h4+iIcRqCOPIlz7o41ITpq9yGrcTdhtdx+Lw=\n-----END AGE ENCRYPTED FILE-----\n",
+    "plaintext": "frozen v1: piv-p256 + software"
+  },
+  "prf": {
+    "credential_id_hex": "66726f7a656e2d63726564656e7469616c",
+    "prf_output_hex": "7777777777777777777777777777777777777777777777777777777777777777",
+    "rp_id": "ragewarden.example",
+    "salt_hex": "3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c"
+  },
+  "ragedroid_keystore_v1": {
+    "blob": "-----BEGIN AGE ENCRYPTED FILE-----\nYWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IHJhZ2Vkcm9pZC1rZXlzdG9yZS12MSBP\nSlFXT1pMRU9KWFdTWkJOTVpaRzY2VEZOWVdXQzNESk1GWlEgQXFTeEVRMFJRaHFJ\nUUNWN2g3ZHFnaXpBUWlOK0lFek5VV09xRVpaTHpoTlUKUzY2SDRwRlBBd01NK2tO\nRTkzUlJsUVhWN3hhUTYyQUYrZk50Z3dQK2xHUQotPiAjUTxmOy1ncmVhc2Uge1k0\nUSh4NHwgJU8wIFNdCkhpQ3NXT1BldThDYWpzNm9YaFRuQ0dlRXV3TFo1Q09aYkla\nZEtGbHorZytQVWpFYUpSTDhEMGxvdkU5ZjVEaisKazNmdUQ2TlJPcFQzc2NaTlNF\nTTJIcllwTEhEZXErT1ZXa0oyVlRMemcyelRUL1g4WFNRCi0tLSBxQjQwa0hoamRQ\nV0RFbmZVcFBYTm1VVUFXS2MyUkkwSHJoTjBoV0JwbXl3Cthh+PN0NsV6JSthqaCm\nzdKP4/xsgAMlHDMM7TAKhNdwe0FcrkTVnJKmMkFKIfGP81GlAQ2a/oOluXxHM0nR\nOK1egvVmOlyJ43tAxxK+r0Rb\n-----END AGE ENCRYPTED FILE-----\n",
+    "key_handle": "ragedroid-frozen-alias",
+    "plaintext": "frozen v1: ragedroid-keystore-v1 (eph-only salt)",
+    "recipient_pub_hex": "03462dba1ae4fc1a968b4dacf20cdd6dbe1fae34aa971514a63d3405c3d1cfd383",
+    "recipient_secret_hex": "2121212121212121212121212121212121212121212121212121212121212121"
+  },
+  "software_x25519": {
+    "identity_scalar_hex": "717cf645e296925391786a1575eb5749d9cb4d8f20c747266c4103e1802b9153",
+    "blob": "-----BEGIN AGE ENCRYPTED FILE-----\nYWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBhaVZqM2hoV3pRVGhCenlt\nNEtMRjVCZ2wxTzZBa051REpXRkREdnJncmxNCmg4eTZTa09aNWUwRG5nNS9GVkIr\nSUVETUFTSkhFQWxpN2Q2clZidG1paVUKLT4gQFVDOW4tLU8tZ3JlYXNlClQzZUpy\nRFlOZldGNndZMkpmQzV3M3N1WjhWRGtWc0QydklmL3IzRWlkcG5RT3pKWVR6VnBj\nT1dDazRyRy9SbmUKTmcKLS0tIGR4M2NWZnF0OTJ3dVJlRmVvemRzZFUyeVdkckpo\nRW4xenl2UTRQVFFCRVEKY8k5yEXuJvywH3GbJ3FNPE3L1IBaxpsAplNHF8p+9rHE\n1sppI77Gh5IB+WL+S9skVPk9S18OtTKaiA==\n-----END AGE ENCRYPTED FILE-----\n",
+    "plaintext": "frozen v1: software x25519"
+  },
+  "webauthn_prf_v1_legacy_3arg": {
+    "blob": "-----BEGIN AGE ENCRYPTED FILE-----\nYWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IHdlYmF1dGhuLXByZi12MSBabkp2ZW1W\ndUxXTnlaV1JsYm5ScFlXdyByYWdld2FyZGVuLmV4YW1wbGUgUER3OFBEdzhQRHc4\nUER3OFBEdzhQRHc4UER3OFBEdzhQRHc4UER3OFBEdwpqVVZkWXRXUDZwTjNTUWJ0\nVHFSYzE5N1JmYkUrUjJ4eVBGN1dUaE04UnFRCi0+ICR8LWdyZWFzZSA6NXFoIFBf\nCkhJNAotLS0gemVpYnVaN1ZzZEZpanBvSytTcGxYY05yR1NFY0pjQUdRUUNzMEVI\nOElaUQo7kl0gXX821Hm0SoiQWcM+N9arTYBjGfvonlB+xbkuRMMs9AjtYIJ5Jx9y\nhhCCeEq/kVa/B3M4TVKMe0FLsLYr5KxIS4BKAw==\n-----END AGE ENCRYPTED FILE-----\n",
+    "plaintext": "frozen v1: webauthn-prf-v1 legacy 3-arg"
+  },
+  "webauthn_prf_v1_wrap_salt": {
+    "blob": "-----BEGIN AGE ENCRYPTED FILE-----\nYWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IHdlYmF1dGhuLXByZi12MSBabkp2ZW1W\ndUxXTnlaV1JsYm5ScFlXdyByYWdld2FyZGVuLmV4YW1wbGUgUER3OFBEdzhQRHc4\nUER3OFBEdzhQRHc4UER3OFBEdzhQRHc4UER3OFBEdyBraDV6a2FDVUwyYUl6dDI4\nMXQxdzJyNG5pUE9nZGhVSXBadmZTZ1VDWHlRCnhLNWRSMm9tc243cTU2RG5ycms2\nUXNmQThXTzVXMnkyTjZKcFBsZmVQaWsKLT4gZkoicS1ncmVhc2UgUSF8NG1obWUK\nYXZJUm41ejZaUFZOCi0tLSBUYmw5N2dSZG9HZSt6Wml6NmcyVVJUODNsMkV5VlBk\naHhZTFNvSGxPMmdRCsCSLbRIuRzuIGIf2lrKLKYGKj8AosjGC2eAUkrK8Mj5FuWc\noU2c863F2OPT/IDCU/nbAwoEES2gJPH62nXJoUMmqW2hz/84FOdONYEcnAwv\n-----END AGE ENCRYPTED FILE-----\n",
+    "plaintext": "frozen v1: webauthn-prf-v1 4-arg, recipient salt"
+  }
+}

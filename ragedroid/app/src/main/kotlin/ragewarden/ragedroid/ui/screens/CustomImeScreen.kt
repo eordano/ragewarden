@@ -1,5 +1,7 @@
 package ragewarden.ragedroid.ui.screens
 
+import ragewarden.ragedroid.R
+import androidx.compose.ui.res.stringResource
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -30,7 +32,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -38,10 +39,9 @@ import ragewarden.ragedroid.autofill.HostMatcher
 import ragewarden.ragedroid.data.VaultBridge
 import ragewarden.ragedroid.model.VaultItem
 import ragewarden.ragedroid.ui.components.AppBar
+import ragewarden.ragedroid.ui.components.BackButton
 import ragewarden.ragedroid.ui.components.Field
-import ragewarden.ragedroid.ui.components.IconBtn
 import ragewarden.ragedroid.ui.components.TextInput
-import ragewarden.ragedroid.ui.theme.RageTheme
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
 
@@ -68,7 +68,7 @@ fun CustomImeScreen(
             packageName = packageName,
         ).take(3)
     }
-    val title = "Sign in to ${(domain ?: "the app").substringBefore('.').replaceFirstChar { it.uppercase() }}"
+    val title = stringResource(R.string.preview_nothing_here_is_live)
     val subtitle = domain ?: packageName
 
     Column(modifier = Modifier.fillMaxSize().background(c.background)) {
@@ -81,19 +81,13 @@ fun CustomImeScreen(
             AppBar(
                 title = title,
                 subtitle = subtitle,
-                leading = {
-                    IconBtn(
-                        icon = Icons.AutoMirrored.Outlined.ArrowBack,
-                        contentDescription = "Back",
-                        onClick = onBack,
-                    )
-                },
+                leading = { BackButton(onBack) },
             )
             Spacer(modifier = Modifier.height(16.dp))
-            Field(label = "Email") {
-                TextInput(value = "", onValueChange = {}, placeholder = "you@example.com")
+            Field(label = stringResource(R.string.email)) {
+                TextInput(value = "", onValueChange = {}, placeholder = stringResource(R.string.you_example_com))
             }
-            Field(label = "Password") {
+            Field(label = stringResource(R.string.password)) {
                 TextInput(value = "", onValueChange = {}, placeholder = "••••••••", mono = true, password = true)
             }
         }
@@ -174,7 +168,7 @@ fun CustomImeScreen(
                 }
                 KeyCap(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "space",
+                        text = stringResource(R.string.space),
                         style = RageType.sansBody.copy(fontSize = 15.sp, fontWeight = FontWeight.Medium),
                         color = c.fgEmphasis,
                     )

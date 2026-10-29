@@ -7,24 +7,13 @@ for threat model, crypto layering, and shared decisions. This file is Android-sp
 
 ## 1. Modules
 
-```
-ragedroid/
-+-- settings.gradle.kts
-+-- build.gradle.kts
-+-- gradle/libs.versions.toml
-+-- jni/                    # Cargo crate; cargo-ndk builds libragedroid_jni.so for arm64/x86_64
-|   +-- Cargo.toml
-|   +-- src/lib.rs          # JNI surface over ragewarden-core
-+-- app/                    # main Android app (Compose, Hilt, autofill service)
-+-- core/                   # ScreenState, DataState mirror, util -- small
-+-- data/                   # repositories, sync layer, Room cache
-+-- recipients/             # Kotlin Identity impls for YubiKey, FIDO2, Keystore
-+-- ui/                     # theme, BaseViewModel, shared Compose components
-+-- network/                # Retrofit talking to the Bitwarden API
-```
-
-Reuses the Bitwarden SDK (`com.bitwarden:sdk-android`) for its outer-layer crypto. Reuses
-`ragewarden-core` (this project's Rust crate) via the `jni/` bridge for the inner layer.
+Two Gradle modules plus a Cargo crate: `app/` (the Compose app -- data repositories,
+identity impls, autofill/IME services, and UI all live under
+`app/src/main/kotlin/ragewarden/ragedroid/`), `baselineprofile/` (see §7), and `jni/` (a
+Cargo crate whose `src/lib.rs` is the JNI surface over ragewarden-core; cargo-ndk builds
+`libragedroid_jni.so`). Reuses `ragewarden-core` (this project's Rust crate) via the
+`jni/` bridge for the inner layer; the outer Bitwarden layer also comes from the core's
+`bitwarden`/`sync` modules over JNI (no `com.bitwarden:sdk-android` dependency -- see §8).
 
 ---
 
@@ -32,47 +21,35 @@ Reuses the Bitwarden SDK (`com.bitwarden:sdk-android`) for its outer-layer crypt
 
 Hand-written `extern "system"` JNI exports in `jni/src/lib.rs`, paired with `external fun`
 declarations on the Kotlin side (`app/.../jni/RageNative.kt`). We considered UniFFI early on
-but kept it hand-written because the surface is small (5 functions in phase 1, ~10 in
-phase 3) and the JNI byte-array lifetime semantics matter enough that we'd rather audit
-them ourselves than read generated code.
+but kept it hand-written (about 30 exports, `jni/src/lib.rs` and `jni/src/lock_jni.rs`)
+because the JNI byte-array lifetime semantics matter enough that we'd rather audit them
+ourselves than read generated code.
 
-The Kotlin surface looks like:
+`RageNative.kt` declares them as `external fun`s on one object that loads
+`libragedroid_jni.so`. Hardware identities are Kotlin objects implementing `KotlinIdentity`;
+the bridge calls back into them while core decrypts, and Kotlin blocks that JNI thread on
+the device ceremony via a dedicated dispatcher, never the main thread. Every export runs
+inside `catch_unwind`, so a Rust panic surfaces as `RageNativeException.Internal`.
 
-```kotlin
-package ragewarden.ragedroid.jni
-
-object RageNative {
-    init { System.loadLibrary("ragedroid_jni") }
-    external fun encrypt(plaintext: ByteArray, recipientPubkey: ByteArray): ByteArray
-    external fun decryptWithSoftwareSecret(blob: ByteArray, armoredSecret: String): ByteArray
-    external fun generateSoftwareIdentity(): String
-    external fun pubkeyFromArmoredSecret(armoredSecret: String): ByteArray
-    external fun smoke(): String
-}
-```
-
-Phase 3 widens this to take a `List<KotlinIdentity>` callback so hardware operations call
-back into Kotlin (which calls yubikit-android). Kotlin blocks the JNI thread on the
-YubiKey ceremony coroutine via a dedicated dispatcher; never the main thread.
-
-Build: `./gradlew :app:assembleStandardRelease` triggers a `cargo-ndk` task that compiles
-`jni/` for `arm64-v8a`, `armeabi-v7a`, `x86_64`, deposits `libragedroid_jni.so` into
+Build: `gradle :app:assembleStandardRelease` triggers a `cargo-ndk` task that compiles
+`jni/` for `arm64-v8a` and `x86_64` (API 31), deposits `libragedroid_jni.so` into
 `app/src/main/jniLibs/<abi>/`. Standard NDK pipeline.
 
 ---
 
 ## 3. Identity implementations
 
-Phase-3 status (this pass):
+| identity | Kotlin class | stanzas |
+|---|---|---|
+| YubiKey PIV | `YubiKeyPivIdentity` | `piv-p256` (P-256 slots, age-plugin-yubikey's format), `piv-x25519-v2` and v1 |
+| FIDO2 hmac-secret | `Fido2HmacIdentity` | `fido2-hmac` |
+| Passkey (Credential Manager) | `PasskeyIdentity` | `webauthn-prf-v1` |
+| Android Keystore | `AndroidKeystoreIdentity` | `ragedroid-keystore-v2` and v1 |
+| Recovery (BIP39) | not a `KotlinIdentity`: Settings -> Recover from phrase calls `BitwardenVaultRepository.decryptWithRecoveryPhrase` | age X25519 |
 
-| identity | Kotlin class | mock-mode | live hardware |
-|---|---|---|---|
-| YubiKey PIV | `YubiKeyPivIdentity` | ✅ | 🟡 stubbed (yubikit-android NFC/USB plumbing pending hardware test) |
-| FIDO2 hmac-secret | `Fido2HmacIdentity` | ✅ | 🟡 stubbed (yubikit-fido pending hardware test) |
-| Passkey (Credential Manager) | `PasskeyIdentity` (standard flavor) | ✅ | 🟡 stubbed (Credential Manager wiring needs activity-bound context) |
-| F-Droid passkey stub | `PasskeyIdentity` (fdroid flavor) | n/a | n/a -- errors with a clear message |
-| Android Keystore | `AndroidKeystoreIdentity` | ✅ | 🟡 stubbed (StrongBox / TEE keypair gen pending hardware test) |
-| Recovery (BIP39 -> X25519) | `RecoveryIdentity` | ✅ | ✅ -- software path is the live path |
+Each runs against mocks in CI (`RAGEWARDEN_MOCK_HARDWARE=1`) and the Keystore identity also
+against a real Keystore key on the emulator; physical YubiKeys and passkeys are on the
+release checklist in `../SECURITY.md`.
 
 The `KotlinIdentity` interface (`app/.../identities/KotlinIdentity.kt`) declares
 `tryUnwrap(stanzaTag, stanzaArgs, stanzaBody)`, which the JNI bridge invokes through
@@ -86,59 +63,46 @@ software stand-in so CI exercises every callback path without real hardware.
 
 ### 3a. YubiKeyPivIdentity
 
-```
-yubikit-android NfcYubiKeyManager / UsbYubiKeyManager
-     |
-     ▼
-YubiKitConnection
-     |
-     |  open PivSession; verify PIN if needed; calculate_secret(slot, public_key)
-     ▼
-32-byte ECDH shared secret -> HKDF -> file key
-```
+yubikit-android's NFC and USB managers yield a connection (a key already plugged in when
+the prompt opens is used at once); the identity opens a `PivSession`, checks the card's
+serial against the enrolled one -- a different YubiKey is named before its PIN is used --
+verifies the PIN if the slot needs it, and runs ECDH for the slot (P-256 for new
+enrolments, X25519 for older slots). The shared secret goes to the JNI unwrap helper. The
+PIN is entered once per tap and never cached across sessions.
 
-Uses `com.yubico.yubikit:piv` and `com.yubico.yubikit:android`. Discovery via NFC
-(foreground dispatch in the activity) and USB-OTG (intent filter on `USB_DEVICE_ATTACHED`).
-A `YubiKeyPivIdentity` is parameterized by `(serial, slot, expected_public_key)`; matches
-an age stanza when the stanza's pubkey equals the expected key.
+### 3b. Fido2HmacIdentity
 
-PIN handling: yubikit-android caches PIN within a YubiKey session. We do not cache PIN
-across sessions. PIN is entered once per tap if the slot requires it.
+Credential Manager assertions with the hmac-secret / PRF extension unlock `fido2-hmac`
+stanzas, the format rageterm writes for security keys it talks to directly. The stanza
+carries the credential id and the evaluated salt.
 
-### 3b. Fido2HmacIdentity (raw CTAP2 path; works back to API 19)
+### 3c. PasskeyIdentity (Credential Manager)
 
-`com.yubico.yubikit:fido` for direct CTAP2 over NFC + USB. Used to unlock `fido2-hmac`
-stanzas -- the format produced by frontends that talk to authenticators directly.
+Unlocks `webauthn-prf-v1` stanzas. New passkeys are created for the relying party
+`ragewarden.decent.foundation` (`PasskeyRp`), discoverable and ES256; the domain serves
+`/.well-known/assetlinks.json` naming this app and its signing certificate, which Credential
+Manager requires. The registry entry is a `PasskeyPrf` recipient carrying the RP id, the
+credential id and the credential's public key (`attestationPublicKey`, SPKI), which is what
+lets the browser use the same passkey through its relay page. Entries stored before the RP
+id was recorded keep asserting with `ragewarden.local`, and older Fido2-kind passkey entries
+move to `PasskeyPrf` on request. Every write evaluates a fresh salt per passkey.
 
-The age stanza stores `(credential_id, salt)`. Identity calls `getAssertion` with
-`hmac-secret` extension and the salt; the assertion's HMAC output is HKDF-expanded to a
-file key.
-
-### 3c. PasskeyIdentity (Credential Manager API, API 34+)
-
-`androidx.credentials:credentials` -- the modern path. Unlocks `webauthn-prf-v1` stanzas, the
-format produced by ragemanifest. This is what makes a passkey enrolled in the browser
-roundtrip cleanly to the Android app: same RP ID, same credential ID, same PRF salt -> same
-file key.
-
-The user-visible flow on Android 14+: system Credential Manager picker shows whatever
-passkeys the user has (Google Password Manager, third-party PMs that vend passkeys, security
-keys via NFC/USB, paired devices via cross-device flow). User picks one, performs biometric
-or tap, PRF result derives file key. Same UX shape as the browser.
-
-Below API 34: this identity is unavailable. The user falls back to direct YubiKey paths
-(3a/3b) or the AndroidKeystoreIdentity (3d).
+Availability: the standard flavour uses Play services' Credential Manager on any supported
+Android; the F-Droid flavour uses Android 14's built-in one.
 
 ### 3d. AndroidKeystoreIdentity
 
 Local-only convenience identity. P-256 EC keypair generated in StrongBox-backed Keystore
-(falls back to TEE if StrongBox unavailable). Stanza stores the X25519-converted public key
-+ ephemeral ECDH share encrypted with the Keystore key.
+(falls back to TEE if StrongBox unavailable). The recipient is the 33-byte SEC1-compressed
+P-256 public key; the stanza carries the key handle and an ephemeral P-256 public key whose
+ECDH share with the Keystore key wraps the file key.
 
-User authentication: tied to BiometricPrompt -- Keystore `setUserAuthenticationRequired(true)`.
-The "tap" for this identity is a biometric prompt or device PIN fallback.
+User authentication: the key requires a biometric or the device credential. On API 35+ every
+key agreement is its own prompt (the `KeyAgreement` is the `CryptoObject`); below 35 the
+key stays usable for 30 seconds after a prompt run just before the decrypt. A key without
+user authentication (no screen lock set) is generated only after the user agrees to it.
 
-Wire format: defined in `../core/DESIGN.md` under the `ragedroid-keystore-v1` stanza header.
+Wire format: `ragedroid-keystore-v2` (recipient-bound) and `-v1` in `../core/DESIGN.md`.
 
 ---
 
@@ -190,46 +154,42 @@ The plaintext never lives in a "decrypted but undelivered" state. Bait-and-switc
 hostile screen overlay would have to convince the user to tap with the *correct destination
 already named in the prompt*; the prompt cannot be tampered with post-tap.
 
-Two caveats this section did not previously state. **Tapjacking is defended against at the
-window level, not the composable level:** `MainActivity.onCreate` and
+**Tapjacking is refused at two levels.** `MainActivity.onCreate` and
 `AutofillAuthActivity.onCreate` set `window.decorView.filterTouchesWhenObscured = true`, and
 the IME sets it on its input view, so Android discards touches delivered while the window is
-obscured by an overlay. That covers the "Authorize" affordance without any per-composable
-work. It does **not** cover a partially-obscuring overlay on API levels where the flag is
-window-scoped only, and it is not verified here -- there is no instrumented test for it. And
-for the `AndroidKeystore` recipient kind the gate is a
-30-second `setUserAuthenticationParameters` window rather than a per-operation
-authentication, because `KeyAgreement` is not a supported `BiometricPrompt.CryptoObject` --
-the UI re-prompts per reveal so the observable behaviour is one prompt per use, but an
-attacker holding the unlocked device inside that window does not have to re-authenticate.
-See `docs/THREAT-MODEL.md` §3 footnote.
+obscured by an overlay. On top of that, every control that releases a secret or destroys a
+key -- Authorize, Type it, Unlock, the PIV PIN pad, Revoke and its master-password confirm --
+rejects any touch carrying `FLAG_WINDOW_IS_OBSCURED` or `FLAG_WINDOW_IS_PARTIALLY_OBSCURED`
+(`rejectObscuredTouches`), which also catches a partially-covering overlay the window flag
+lets through. `ObscuredClickTest` dispatches flagged presses and checks they are dropped. And
+for the `AndroidKeystore` recipient kind the gate is per operation on API 35+ (the
+`KeyAgreement` is the `BiometricPrompt.CryptoObject`); below API 35, where it cannot be, the
+key falls back to a 30-second `setUserAuthenticationParameters` window and the UI prompts
+before each reveal. See `docs/THREAT-MODEL.md` §3.
 
-### 4d. IME injection (`Send to keyboard`) -- implemented, **unprotected items only**
+### 4d. IME injection (`Send to keyboard`)
 
 Ragedroid ships an `InputMethodService` (`ragewarden.ragedroid.ime.RagewardenInputMethodService`)
 that the user can switch to per-text-field via the system input picker. When invoked,
 `onCreateInputView()` returns a `ComposeView` rendering a vault list scoped to the keyboard
-area. On success the IME calls `currentInputConnection.commitText(plaintext, 1)` then
-`switchToPreviousInputMethod()` to hand control back to the user's previous IME. Plaintext is
-held in a `ByteArray`, copied into one `String` for the input-connection call, and the byte
-buffer is zeroized on the same line as the deliver call.
+area, and nothing at all while the vault is locked. Every listing and delivery goes through
+`ImeDelivery`, which reads `LockState` before the decrypt and again before the commit. On
+success the IME calls `currentInputConnection.commitText(plaintext, 1)` then
+`switchToPreviousInputMethod()`; the byte buffer is zeroized in the same `finally`.
 
-**Correction -- this section previously described the IME as delivering rage-protected
-plaintext behind an `InlineTapReveal` ceremony. It does the opposite, deliberately.** An
-`InputMethodService` cannot host a `BiometricPrompt` and cannot flag the host application's
-window, so there is no surface on which to run a real hardware ceremony. Accordingly:
-
-- the picker lists only `filterNot { it.rage }` -- Ragewarden-protected items are excluded,
-  and the count of excluded items is shown so the omission is not silent;
-- `deliverPlaintext` refuses outright, with a log line, if the id is unknown or the item is
-  `rage`, so a stale composition cannot commit a protected secret;
-- the confirmation is a plain "Type it", not a tap ceremony. Running a hardware-tap animation
-  over an item that needs no hardware would be a consent dialog for a decision already made.
-
-**NOT YET IMPLEMENTED, and a real gap:** the IME does not consult the app lock. It shares the
-process and the `VaultBridge` singleton with `MainActivity`, and reads no lock state, so an
-*unprotected* Bitwarden password can be typed into a host field while the vault is locked.
-See `docs/THREAT-MODEL.md` §5.3 and §10.
+- An unprotected item gets a plain "Type it" confirmation: no hardware authorizes it, and the
+  copy says so.
+- A protected item gets "Unlock and type". An `InputMethodService` cannot host
+  `BiometricPrompt`, Credential Manager or NFC reader mode, so the IME opens
+  `ImeAuthActivity` (secure window, obscured touches rejected), which runs the same
+  `InlineTapReveal` + `HardwareTapCoordinator` ceremony as autofill with the purpose
+  "Type into <app>". The plaintext comes back through `ImeAuthChannel`, a one-shot slot keyed
+  by a fresh nonce, so a sheet left over from an earlier request cannot answer a later one.
+  The IME commits only when the same field (package + field id) is focused again after the
+  sheet closes and the vault is still unlocked; any other outcome zeroes the buffer and
+  commits nothing.
+- A PIV PIN asked for inside `ImeAuthActivity` is typed on a digit pad the IME shows for
+  Ragewarden's own numeric fields, so the delivery does not need a keyboard switch.
 
 The IME hosts its own `LifecycleOwner` + `SavedStateRegistryOwner` and wires both onto the
 ComposeView via `setViewTreeLifecycleOwner` / `setViewTreeSavedStateRegistryOwner` -- required
@@ -237,10 +197,9 @@ for Compose to run inside an `InputMethodService`. Works in apps that don't supp
 (legacy apps, terminal emulators).
 
 It goes through the shared `VaultBridge` singleton, so it sees the same
-`BitwardenVaultRepository` the main activity does. (The `DemoVaultStore` this paragraph used
-to describe no longer exists anywhere in the tree.)
+`BitwardenVaultRepository` the main activity does.
 
-### 4e. Autofill API integration -- implemented (phase 4, cold-dataset ceremony)
+### 4e. Autofill API integration (cold-dataset ceremony)
 
 `ragewarden.ragedroid.autofill.RagewardenAutofillService` subclasses
 `android.service.autofill.AutofillService`. The flow:
@@ -253,8 +212,9 @@ to describe no longer exists anywhere in the tree.)
    WEB_PASSWORD, EMAIL_ADDRESS}`, then view-id / hint substrings (`user`, `email`, `pass`,
    etc.). The walker also extracts the requesting web domain (when present) and the
    activity's package name.
-2. `HostMatcher.matchVaultItems` filters the vault snapshot by hostname (exact, subdomain
-   match) or package-name token, falling back to nothing if neither signal matches.
+2. `HostMatcher.matchVaultItems` compares registrable domains (public-suffix aware, so
+   `alice.github.io` never sees `bob.github.io`), maps a package to the registrable domain of
+   its reversed name, and honours explicit `androidapp://<package>` sites; no signal, no match.
 3. Each match is rendered as a **cold dataset**: the dataset's autofill values are placeholder
    empty strings, and `setAuthentication(intentSender)` points the system at
    `AutofillAuthActivity`. The remote view names the action explicitly
@@ -263,87 +223,87 @@ to describe no longer exists anywhere in the tree.)
    renders the same `InlineTapReveal` ceremony used in `ItemDetailScreen` with
    `TapAction.Autofill` pre-bound and the destination domain visible. **No plaintext exists
    anywhere yet.**
-5. Only after the user confirms the tap does the activity call `DemoVaultStore.decryptPassword`,
-   build a fresh `FillResponse` whose dataset carries the real `AutofillValue.forText(...)`
+5. Only after the user confirms the tap does the activity decrypt through
+   `BitwardenVaultRepository`, build a fresh `Dataset` carrying the real `AutofillValue.forText(...)`
    for username + password, attach it via `Intent.putExtra(EXTRA_AUTHENTICATION_RESULT, ...)`,
-   `setResult(RESULT_OK)`, and finish. Android delivers the values to the form. The activity
-   zeroizes the `ByteArray` plaintext in the same `try/finally` that built the response.
+   `setResult(RESULT_OK)`, and finish. The dataset is what authenticated, so Android fills it
+   at once (a `FillResponse` would be offered in the dropdown again). The activity runs in the
+   caller's task -- standard launch mode, no `NEW_TASK` -- because a result cannot cross tasks:
+   launched `singleInstance`, the caller got `RESULT_CANCELED` the moment the sheet opened. The
+   activity zeroizes the `ByteArray` plaintext in the same `try/finally` that built the result.
 
 This honors §0a (action chosen before tap -- the Android system credential picker is the
 action choice, the activity confirmation is the tap) and §0c (plaintext lifetime is bounded
 by the activity callback). A hostile autofill prompt cannot release plaintext because the
 dataset itself is empty until the authentication intent succeeds.
 
-Phase 4 talks to the `DemoVaultStore` via `VaultBridge`; phase 2 (already done in core +
-rageterm) replaces the demo store with the real Bitwarden vault repository on the Android
-side.
+When the vault is locked, the autofill dataset offers "Unlock Ragewarden to fill"
+(`AutofillUnlockActivity`), and the fill proceeds after the unlock.
 
-#### Stubbed in phase 4, lands in later phases
+Further details:
 
-- **Hardware identity dispatch.** The tap ceremony today renders the YubiKey-shaped UI but
-  resolves through `RageNative.decryptWithSoftwareSecret` (phase 1 software identity). Phase 3
-  swaps in real `YubiKeyPivIdentity` / `Fido2HmacIdentity` / `PasskeyIdentity` /
-  `AndroidKeystoreIdentity` callbacks so the ceremony can drive the actual hardware token.
-- **Real vault.** `DemoVaultStore` is a fixture-driven, in-memory store. Phase 2 swaps it for
-  a `BitwardenVaultRepository` that streams `DataState<List<DisplayItem>>` via the SDK + rage
-  layer.
-- **Save-on-fill.** `onSaveRequest` accepts a save callback but does nothing useful yet;
-  cipher CRUD lands in phase 2.
-- **Inline suggestions.** Pre-Q `setAuthentication` is supported; phase-5 inline-suggestion
-  presentations (API 30+) and `Presentations` (API 33+) are not yet wired. The deprecated
-  `Dataset.Builder.setValue(AutofillId, AutofillValue, RemoteViews)` overload is used and
-  `@file:Suppress("DEPRECATION")`d.
+- **Inline suggestions.** Datasets are built with `Presentations` and `Field` on API 33+ and
+  the `setValue` overload below that. When the keyboard sends an `InlineSuggestionsRequest`,
+  each matching item (up to the keyboard's slot count) and the locked "Unlock Ragewarden to
+  fill" chip also carry an `InlinePresentation` built with androidx `InlineSuggestionUi`, so
+  they show in the keyboard strip; every dataset still authenticates through
+  `AutofillAuthActivity` before anything is filled (`AutofillDatasetsTest`, API 31/33/34).
 - **Build flavors.** `app/build.gradle.kts` declares two product flavors on the
   `distribution` dimension: `standard` (Play-Store-friendly, pulls in
   `androidx.credentials:credentials` + `credentials-play-services-auth`) and `fdroid`
   (no Play Services dependencies, applicationIdSuffix `.fdroid`). The flavor-specific source
   sets at `app/src/{standard,fdroid}/kotlin/.../distribution/Distribution.kt` expose
-  `LABEL` / `INCLUDES_PLAY_SERVICES` / `CREDENTIAL_MANAGER_AVAILABLE` constants. Phase 4
-  intentionally keeps the differentiation thin -- the structure is in place for phase 3 /
-  phase 5 to fork the Credential-Manager passkey path.
+  `LABEL` / `INCLUDES_PLAY_SERVICES`; passkey availability per flavour goes through
+  `PasskeyAvailability`.
+- **Saving from other apps.** Every fill response with a password field carries a
+  `SaveInfo` (username optional), the locked one and the no-match one included, so Android
+  offers a save when the form is submitted. `onSaveRequest` reads what was typed
+  (`AssistStructureWalker.textValues`), keeps the password in process memory
+  (`PendingSaves`, zeroed if not taken within two minutes) and hands `AutofillSaveActivity`
+  only a token. That activity unlocks a locked vault with the lock screen, then shows what
+  saving will do -- a new protected login for the site (`https://<domain>` or
+  `androidapp://<package>`), or a new password for the login already saved under that site
+  and username -- and writes nothing until the user presses Save: a new login through
+  `VaultBackend.create` (core's `build_cipher`), a new password through `VaultBackend.edit`
+  (core's `update_cipher_preserving`, which keeps the item's other protected fields or
+  refuses with "Open “<item>” first"). A passkey or FIDO2 recipient's PRF tap is asked for
+  by the activity itself while the write runs (`AutofillSaveTest`).
 
-### 4f. Onboarding -- implemented (phase 2, sign-in only)
+### 4f. First run
 
-`app/.../ui/screens/OnboardingScreen.kt` mirrors `design/screens-misc.jsx`'s `FirstRun`
-step 1 with a sign-in / register toggle plus a "Skip -- use demo data" affordance. On
-success the session blob lands in `SessionStore` (AES-256-GCM through `KeystorePrefs`, under a
-non-exportable AndroidKeyStore key -- there is no plain-prefs fallback; an undecryptable blob is
-reported as "no session" and the user signs in again) and `VaultBridge.installRepository(...)`
-swaps the demo backend for the real `BitwardenVaultRepository`. Wizard steps 2 (enroll
-identities) and 3 (bulk-protect) are stubbed pending the per-identity enroll wizards
-(`design/screens-misc.jsx` `AddRecipientScreen`).
+`FirstRunScreen` runs Welcome -> Sign in -> Enroll -> Backup -> Done. Sign-in (or register)
+pins the account's KDF parameters, offers the upgrade of a legacy-KDF account, and installs
+the `BitwardenVaultRepository`. Enroll adds a platform passkey, a security key or a YubiKey
+PIV slot; Backup leads with the paper recovery phrase, which is saved only after the user
+confirms words from it; Done lists anything still unprotected.
 
-### 4g. Edit-cipher screen -- implemented (phase 2)
+### 4g. Add and edit
 
-`app/.../ui/screens/EditItemScreen.kt` mirrors `design/screens-misc.jsx`'s `AddItemScreen`
-with current values pre-filled. Reveal-on-tap on the current password (decrypts via the
-backend), new-password field with a generator, TOTP/notes/recipients editor, save button
-that calls `BitwardenVaultRepository.update(item, plaintext)`. Plaintext is held in a
-`ByteArray` and zeroized on screen dispose. The pencil icon next to `MoreVert` on the
-item-detail app bar opens this screen.
+`AddItemScreen` and `EditItemScreen` cover logins, notes, cards, identities and SSH keys,
+each field with a Protect toggle (a login's password, TOTP seed and notes; a card's number
+and code; and so on). Saves go through `BitwardenVaultRepository.create` / `createTyped` /
+`edit(item, ItemEdit)`, which use core's cipher builders, so every field the server holds
+survives. The TOTP seed field takes a QR scan. Plaintext is held in a `ByteArray` and zeroed
+on dispose.
 
 ---
 
 ## 5. Persistence & state
 
 - The ragewarden-core decrypt path is stateless; outputs zeroized buffers.
-- **There is no Room cache.** This bullet described one, "same as Bitwarden Android"; the
-  app has no Room dependency and no Bitwarden SDK dependency. The vault lives in a
-  `@Volatile` in-memory `CachedState` on `BitwardenVaultRepository`, populated by
-  `ragewarden_core::sync` over the JNI bridge. Nothing cached is plaintext for any
-  rage-protected secret -- that part holds -- but the cache is process memory, not a database,
-  so it does not survive a process death and is not encrypted at rest because it is never at
-  rest. A persistent offline cache is **NOT YET IMPLEMENTED**.
-- Recipient list lives in a single secure note in the vault named
-  `Ragewarden Recipients (do not edit)`. Standard Bitwarden sync. New device first-run: sign
-  in, sees the note, prompts to enroll its own Keystore identity and adds it to recipient
-  list of existing ciphers.
-- ViewModel state holds plaintext only inside the tap sheet's lifecycle. `state.copy(...)`
-  with the plaintext nulled on dismiss / completion.
-- The Bitwarden session blob -- which carries `user_enc_key_b64` **and** `user_mac_key_b64`,
-  not merely tokens -- is stored through `data/KeystorePrefs` (AES-256-GCM under a
-  non-exportable AndroidKeyStore key). It was previously written to plain
-  `MODE_PRIVATE` prefs in base64; see §4f and `docs/THREAT-MODEL.md` §5.1.
+- The vault is held in memory on `BitwardenVaultRepository` and cached on disk encrypted
+  (`VaultCache`, `vaultcache.v1.bin` under an AndroidKeyStore AEAD key, excluded from
+  backup), so an unlock needs no network. Nothing in either is plaintext for a protected
+  secret.
+- The cross-device recipient registry is a cipher named `__ragedroid_recipients_v1__`,
+  merged with the other clients' entries; `RecipientStore` keeps this device's own
+  recipients per account.
+- ViewModel state holds plaintext only inside the tap sheet's lifecycle.
+- The stored session holds tokens only; the user keys are kept as a protected copy that
+  the master password (offline unlock) or an auth-bound biometric key opens, and locking
+  drops them and the decrypted vault from memory. See `docs/THREAT-MODEL.md` §5.1.
+- The KDF pin is stored per (server, email) apart from the session, so it survives
+  sign-out.
 
 ---
 
@@ -352,12 +312,13 @@ item-detail app bar opens this screen.
 - **Unit tests** on ViewModels: action-bound-to-tap correctness (the destination shown to the
   user matches the destination the consumer receives).
 - **JNI tests** on the ragewarden-core bridge with mock `KotlinIdentity` returning a fixed key.
-- **Robolectric tests** on the YubiKey sheet state machine. Phase 4 has Robolectric coverage
-  for the autofill heuristics + host matcher (`app/src/test/kotlin/.../autofill/`).
+- **Robolectric tests** on the YubiKey sheet state machine, the autofill heuristics, host
+  matcher and datasets, the UI's roles, wording and string resources (`app/src/test/kotlin/`).
 - **Instrumentation tests** under `app/src/androidTest/kotlin/ragewarden/ragedroid/`:
   - `jni/RageNativeShapeTest` -- the packaged `libragedroid_jni.so` error surface:
     malformed recipients / PRF-inputs JSON, an unknown recipient kind, and garbage age
-    secrets each throw `RageNativeException.MalformedStanza`.
+    secrets each throw `RageNativeException.MalformedStanza`; a panicking export throws
+    `RageNativeException.Internal` and the process keeps running.
   - `data/RecipientStoreInstrumentedTest` -- `RecipientStore` against real
     SharedPreferences: round-trip fidelity, per-account isolation, removal,
     `defaultEncrypt` persistence, no plaintext in the raw prefs payload.
@@ -368,11 +329,17 @@ item-detail app bar opens this screen.
   - `registry/RegistryPushInstrumentedTest` -- cold-cache `pushRecipientRegistry`
     against a browser-seeded vault: exactly one registry marker afterwards, browser
     entries survive, mocks never published. Also run.sh-driven; self-skips bare.
+  - `journey/DeliveryFlowsTest` -- the three ways a secret leaves the app, against a
+    foreign login form (`journey/LoginFixtureActivity`, which runs in the test APK's own
+    process): autofill through the Authorize sheet, the keyboard typing an unprotected
+    password, the keyboard handing a protected item to `ImeAuthActivity` and typing
+    nothing when the tap is declined, and the detail screen's TOTP code checked against an
+    independent RFC 6238 computation. run.sh-driven; it asserts the run had no skips.
   The first two run via `./gradlew :app:pixel6Api34StandardDebugAndroidTest` on a
   Pixel 6 API 34 [Gradle Managed Device][gmd], wired into the `e2e-android` GitHub
   Actions job. See `../E2E.md` Tier 3.
 - **Real-hardware instrumentation** with a USB-OTG YubiKey -- release-gate, manual.
-- **Manual matrix**: NFC tap on Android 9 / 12 / 14, USB-OTG with USB-A and USB-C YubiKeys,
+- **Manual matrix**: NFC tap on Android 12 / 14 / 15, USB-OTG with USB-A and USB-C YubiKeys,
   Keystore on StrongBox-having and StrongBox-lacking devices.
 
 [gmd]: https://developer.android.com/studio/test/gradle-managed-devices
@@ -384,34 +351,26 @@ item-detail app bar opens this screen.
 - `:app:assembleStandardRelease` -> Play Store APK.
 - `:app:assembleFdroidRelease` -> F-Droid; no Play services.
 - `:app:assembleStandardDebug` -> dev.
-- Native lib via `cargo-ndk`; CI matrix covers all 3 ABIs.
+- Native lib via `cargo-ndk` for `arm64-v8a` and `x86_64`.
 - Reproducible builds: pinned Rust toolchain (`rust-toolchain.toml`),
-  `-C codegen-units=1 -C target-cpu=generic` for the JNI crate. Verify
+  `-C codegen-units=16 -C target-cpu=generic` for the JNI crate. Verify
   byte-for-byte with `scripts/repro/verify-ragedroid.sh` (see `SECURITY.md`).
 - **Baseline profile** at `ragedroid/baselineprofile/` (own gradle module). The producer
-  module exercises the cold-start -> vault list -> reveal flow on a Pixel 6 API 34 Gradle
-  Managed Device using `BaselineProfileRule`; the `androidx.baselineprofile` plugin on
-  `:app` consumes the resulting `baseline-prof.txt` and packages it under
-  `app/src/main/baselineProfiles/`. ProGuard keeps the `profileinstaller` reflection
-  surface so R8 doesn't drop it. (Re)generate with:
-  ```
-  ./gradlew :baselineprofile:pixel6Api34BaselineProfileAndroidTest
-  ```
-  CI runs that target on tagged releases and the resulting APK ships the AOT hints.
+  module exercises the cold-start -> unlock -> vault list -> reveal flow with
+  `BaselineProfileRule` on a connected device, signed in to the journey's account
+  (`BenchVault.kt`); the `androidx.baselineprofile` plugin on `:app` merges the resulting
+  `baseline-prof.txt` into `app/src/main/generated/baselineProfiles/`. ProGuard keeps the
+  `profileinstaller` reflection surface so R8 doesn't drop it. (Re)generate with
+  `JOURNEY_BENCH=1 tests/journey/run.sh`, which also runs the macrobenchmark. The committed
+  `baseline-prof.txt` and `startup-prof.txt` (20,544 rules each) come from that run on a build host's
+  API 37 emulator, 2026-10-03; every release build merges them (`merge*ReleaseArtProfile`).
 
 ---
 
-## 8. Open Android-specific questions
+## 8. Platform decisions
 
-1. **Min SDK.** Bitwarden Android targets API 28 (Android 9). Platform Credential Manager
-   FIDO2 hmac-secret is API 34 (Android 14). yubikit-direct path works back to API 19.
-   **Default min SDK 28**, platform Credential Manager available only on 34+.
-
-2. **TOTP integration.** v2; ragedroid handles passwords + TOTP, no separate Authenticator
-   app.
-
-3. **Bitwarden SDK reuse vs Rust port.** ragewarden-core does not currently include Bitwarden's
-   Rust SDK functionality (KDF, sync). Two options: (a) depend on the official
-   `com.bitwarden:sdk-android` artifact alongside our `libragedroid_jni.so`, two native libs; (b)
-   port the bits we need into ragewarden-core. **Default (a)**: smaller surface, lets Bitwarden
-   own their crypto. Revisit if APK size matters.
+1. **Min SDK 31** (hardware-backed Keystore ECDH). Passkeys need Play services' Credential
+   Manager on the standard build, or Android 14's built-in one on the F-Droid build.
+2. **TOTP** lives in RageDroid; no separate authenticator app.
+3. **No Bitwarden SDK.** KDF, Type-2 and sync come from ragewarden-core over JNI, one native
+   library.

@@ -23,6 +23,11 @@ const TARGET = args[0] ?? 'chromium';
 const WATCH = args.includes('--watch');
 const ZIP = args.includes('--zip');
 const RUN_WASM_PACK = args.includes('--with-wasm');
+const EXT_VERSION = process.env.RAGEWARDEN_EXT_VERSION || null;
+if (EXT_VERSION && !/^\d+(\.\d+){0,3}$/.test(EXT_VERSION)) {
+    console.error(`RAGEWARDEN_EXT_VERSION=${EXT_VERSION} is not 1-4 dot-separated integers (store rule)`);
+    process.exit(1);
+}
 
 /*
  * VM mode: one flag for "run the whole product in a box with no hardware".
@@ -183,17 +188,17 @@ function copyPopup() {
     mkdirSync(DIST_POPUP, { recursive: true });
     cpSync(POPUP_DIR, DIST_POPUP, { recursive: true });
 
-    const entry = join(DIST_POPUP, 'RageDroid.html');
+    const entry = join(DIST_POPUP, 'index.html');
     if (!existsSync(entry)) {
         throw new Error(
-            'ext/popup/RageDroid.html is missing -- every manifest target points the browser '
-            + 'at popup/RageDroid.html',
+            'ext/popup/index.html is missing -- every manifest target points the browser '
+            + 'at popup/index.html',
         );
     }
     const html = readFileSync(entry, 'utf8');
     if (!html.includes('../glue/init.js')) {
         throw new Error(
-            'popup/RageDroid.html does not load ../glue/init.js -- without it the popup '
+            'popup/index.html does not load ../glue/init.js -- without it the popup '
             + 'renders with no vault bridge at all',
         );
     }
@@ -332,7 +337,7 @@ function emitManifest() {
         readFileSync(join(EXT_DIR, 'manifest.json'), 'utf8'),
     );
     baseManifest.action = baseManifest.action ?? {};
-    baseManifest.action.default_popup = 'popup/RageDroid.html';
+    baseManifest.action.default_popup = 'popup/index.html';
 
     // Chromium uses the normal action popup (default_popup, set above). WebAuthn
     // runs inline in a popup, so hardware taps happen in place with no separate
@@ -372,7 +377,7 @@ function emitManifest() {
          */
         Object.assign(baseManifest, ff);
         baseManifest.action = baseManifest.action ?? {};
-        baseManifest.action.default_popup = 'popup/RageDroid.html';
+        baseManifest.action.default_popup = 'popup/index.html';
         const bg = baseManifest.background || {};
         if (!Array.isArray(bg.scripts) || bg.scripts.length === 0) {
             throw new Error(
@@ -394,16 +399,28 @@ function emitManifest() {
         const sf = JSON.parse(stripJsonComments(
             readFileSync(join(EXT_DIR, 'manifests', 'safari.json'), 'utf8'),
         ));
+        // Safari has no idle API (auto-lock falls back to the alarm deadline), no
+        // offscreen documents, and no module service worker: the background is a
+        // non-persistent page that loads the glue on demand, as on Firefox.
+        // nativeMessaging stays: sendNativeMessage reaches the app's handler,
+        // which relays to rageterm.
         if (Array.isArray(baseManifest.permissions)) {
-            baseManifest.permissions = baseManifest.permissions.filter(p => p !== 'nativeMessaging');
+            baseManifest.permissions = baseManifest.permissions
+                .filter(p => !['offscreen', 'idle'].includes(p));
         }
         delete baseManifest.minimum_chrome_version;
         Object.assign(baseManifest, sf);
+        baseManifest.background = { scripts: ['background.js'] };
         baseManifest.action = baseManifest.action ?? {};
-        baseManifest.action.default_popup = 'popup/RageDroid.html';
-        logWarn(
-            'safari target produces only the manifest + extension shell -- host app lives in safari-host-app/.',
-        );
+        baseManifest.action.default_popup = 'popup/index.html';
+    }
+
+    if (EXT_VERSION) baseManifest.version = EXT_VERSION;
+
+    if (BUILD_FLAGS.testHooks) {
+        // Automation cannot click a permission prompt; a test build is granted
+        // what a user grants at sign-in, for every origin a test serves.
+        baseManifest.host_permissions = ['<all_urls>'];
     }
 
     if (BUILD_FLAGS.allowMockTap) {
@@ -425,13 +442,35 @@ function emitManifest() {
     logStep(`emitted manifest.json (${TARGET})`);
 }
 
+/*
+ * A Chromium service worker may not call import(), so its glue modules are
+ * imported statically here and parked on globalThis for background.js. The
+ * Firefox event page is a classic script and imports them on demand instead.
+ */
+function backgroundModulePrelude() {
+    if (TARGET !== 'chromium') return '';
+    const modules = {
+        storage: './glue/storage.js',
+        match: './glue/origin-match.js',
+        receipts: './glue/receipt-check.js',
+        inventory: './glue/inventory.js',
+        passkeys: './glue/passkey-store.js',
+        relay: './glue/prf-relay.js',
+    };
+    if (existsSync(join(DIST_DIR, 'wasm', 'ragemanifest.js'))) modules.wasm = './wasm/ragemanifest.js';
+    const names = Object.keys(modules);
+    return names.map(n => `import * as __rw_${n} from '${modules[n]}';\n`).join('')
+        + `globalThis.__ragewardenBgModules = { ${names.map(n => `${n}: __rw_${n}`).join(', ')} };\n`;
+}
+
 function copyTopLevelExtFiles() {
     const prelude = FLAG_BANNER
         + `globalThis.__RAGEWARDEN_BUILD_FLAGS = Object.freeze(${JSON.stringify(BUILD_FLAGS)});\n`;
-    for (const f of ['content.js', 'background.js']) {
+    for (const f of ['content.js', 'relay-content.js', 'background.js']) {
         const src = join(EXT_DIR, f);
         if (existsSync(src)) {
-            writeFileSync(join(DIST_DIR, f), prelude + readFileSync(src, 'utf8'));
+            const extra = f === 'background.js' ? backgroundModulePrelude() : '';
+            writeFileSync(join(DIST_DIR, f), extra + prelude + readFileSync(src, 'utf8'));
         } else {
             throw new Error(
                 `missing ext/${f} -- refusing to emit an extension without its `
@@ -450,9 +489,8 @@ function copyTopLevelExtFiles() {
         }
         cpSync(src, join(DIST_DIR, f));
     }
-    const iconsSrc = join(EXT_DIR, 'icons');
-    if (existsSync(iconsSrc)) cpSync(iconsSrc, join(DIST_DIR, 'icons'), { recursive: true });
-    logStep('copied content.js + background.js + tap.{html,js} + icons/ into dist');
+    cpSync(join(EXT_DIR, 'icons'), join(DIST_DIR, 'icons'), { recursive: true });
+    logStep('copied content.js + relay-content.js + background.js + tap.{html,js} + icons/ into dist');
 }
 
 /**
@@ -496,9 +534,50 @@ function assertPopupIsNotThePrototype() {
     logStep('asserted the shipped popup is the real implementation, not design/');
 }
 
+const TEST_HOOK_BLOCK = /[ \t]*\/\/ test-hooks:begin\n[\s\S]*?\/\/ test-hooks:end\n?/g;
+const TEST_HOOK_GLOBAL = /__ragewarden(Session|Content|Background|Harness)\b/;
+
+function distJsFiles(dir = DIST_DIR) {
+    const out = [];
+    for (const name of readdirSync(dir)) {
+        const p = join(dir, name);
+        if (statSync(p).isDirectory()) out.push(...distJsFiles(p));
+        else if (name.endsWith('.js')) out.push(p);
+    }
+    return out;
+}
+
+/**
+ * A build without --test-hooks carries no hook code at all, so the runtime
+ * testHooksEnabled() check is no longer the only thing between a release build
+ * and window.__ragewardenSession.
+ */
+function stripTestHookBlocks() {
+    if (BUILD_FLAGS.testHooks) return;
+    for (const p of distJsFiles()) {
+        const src = readFileSync(p, 'utf8');
+        const out = src.replace(TEST_HOOK_BLOCK, '');
+        if (out !== src) writeFileSync(p, out);
+    }
+    logStep('stripped test-hooks blocks');
+}
+
+function assertNoTestHooks() {
+    for (const p of distJsFiles()) {
+        const src = readFileSync(p, 'utf8');
+        if (/test-hooks:(begin|end)/.test(src) || TEST_HOOK_GLOBAL.test(src)) {
+            throw new Error(
+                `${relative(DIST_DIR, p)} still publishes a test hook in a build without `
+                + '--test-hooks; wrap it in // test-hooks:begin ... // test-hooks:end',
+            );
+        }
+    }
+}
+
 function assertDistIsSane() {
     const mustExist = ['tap.html', 'tap.js', 'glue/build-flags.js', 'glue/hardware-tap.js',
-        'glue/unlock.js'];
+        'glue/unlock.js', 'icons/icon-16.png', 'icons/icon-32.png', 'icons/icon-48.png',
+        'icons/icon-128.png'];
     for (const rel of mustExist) {
         if (!existsSync(join(DIST_DIR, rel))) {
             throw new Error(`dist is missing ${rel}`);
@@ -542,15 +621,27 @@ function assertDistIsSane() {
                 + 'user_enc_key/user_mac_key',
             );
         }
-        for (const f of ['content.js', 'background.js']) {
+        for (const f of ['content.js', 'relay-content.js', 'background.js']) {
             const src = readFileSync(join(DIST_DIR, f), 'utf8');
             if (!/"testHooks":false/.test(src.replace(/\s+/g, ''))) {
                 throw new Error(`${f} build-flag prelude does not pin testHooks:false`);
             }
         }
     }
+    if (!BUILD_FLAGS.testHooks) assertNoTestHooks();
     assertPopupIsNotThePrototype();
     const manifest = JSON.parse(readFileSync(join(DIST_DIR, 'manifest.json'), 'utf8'));
+    if (!BUILD_FLAGS.testHooks) {
+        if ((manifest.host_permissions || []).length > 0) {
+            throw new Error(
+                'a release manifest declares host_permissions; access to the user\'s server is '
+                + 'requested at sign-in (glue/host-permission.js), never granted at install',
+            );
+        }
+        if (!(manifest.optional_host_permissions || []).length) {
+            throw new Error('manifest lost optional_host_permissions; sign-in could not request the server origin');
+        }
+    }
     if ((manifest.permissions || []).includes('scripting')) {
         throw new Error(
             'manifest declares the scripting permission, but nothing in the extension calls '
@@ -563,23 +654,6 @@ function assertDistIsSane() {
             + 'pages and the background worker, which never consult it, so every entry is a '
             + 'fingerprinting surface for any page that probes the resource URL',
         );
-    }
-    if (!BUILD_FLAGS.testHooks) {
-        const flags = readFileSync(join(DIST_GLUE, 'build-flags.js'), 'utf8');
-        if (!/"testHooks":false/.test(flags.replace(/\s+/g, ''))) {
-            throw new Error(
-                'build-flags.js does not pin testHooks:false -- testHooksEnabled() is the only '
-                + 'thing standing between a release build and window.__ragewardenSession, '
-                + 'which carries access_token, refresh_token and the Bitwarden '
-                + 'user_enc_key/user_mac_key',
-            );
-        }
-        for (const f of ['content.js', 'background.js']) {
-            const src = readFileSync(join(DIST_DIR, f), 'utf8');
-            if (!/"testHooks":false/.test(src.replace(/\s+/g, ''))) {
-                throw new Error(`${f} build-flag prelude does not pin testHooks:false`);
-            }
-        }
     }
     logStep(`asserted dist shape (profile=${BUILD_FLAGS.profile})`);
 }
@@ -628,6 +702,7 @@ async function buildOnce() {
     await copyGlue();
     copyWasm();
     copyTopLevelExtFiles();
+    stripTestHookBlocks();
     emitManifest();
     assertDistIsSane();
     maybeZipDist();
@@ -637,7 +712,7 @@ async function buildOnce() {
     console.log(
         `[build] or test in a regular browser:\n` +
         `        cd ${DIST_DIR} && python3 -m http.server\n` +
-        `        then visit http://localhost:8000/popup/RageDroid.html`,
+        `        then visit http://localhost:8000/popup/index.html`,
     );
 }
 

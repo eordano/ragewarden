@@ -1,9 +1,15 @@
 package ragewarden.ragedroid.model
 
+import kotlinx.collections.immutable.persistentListOf
+import kotlinx.collections.immutable.persistentMapOf
+import kotlinx.collections.immutable.ImmutableMap
 import androidx.compose.runtime.Immutable
 import kotlinx.collections.immutable.ImmutableList
 
 enum class VaultItemKind { Login, Card, Note, Identity, SshKey }
+
+/** The folder name of an item in no folder; the vault list's show-everything chip uses it too. */
+const val NO_FOLDER: String = "All"
 
 @Immutable
 data class VaultItem(
@@ -39,4 +45,8 @@ data class VaultItem(
     val privateKey: String? = null,
     val comment: String? = null,
     val passphrase: String? = null,
+    /** Card, identity or SSH key block values by Bitwarden field name, protected ones absent. */
+    val block: ImmutableMap<String, String> = persistentMapOf(),
+    /** What the rage blob holds, by Bitwarden field name; each one needs a tap. */
+    val protectedFields: ImmutableList<String> = persistentListOf(),
 )

@@ -1,5 +1,7 @@
 package ragewarden.ragedroid.ui.screens
 
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -35,14 +37,17 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.VisualTransformation
@@ -50,15 +55,18 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.collections.immutable.ImmutableList
 import kotlinx.collections.immutable.persistentListOf
+import kotlinx.collections.immutable.toImmutableList
 import kotlinx.collections.immutable.toPersistentList
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.rememberCoroutineScope
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.data.RecipientPolicy
 import ragewarden.ragedroid.data.RecipientRegistry
 import ragewarden.ragedroid.data.VaultBackend
 import ragewarden.ragedroid.data.VaultBridge
 import ragewarden.ragedroid.data.toUiRecipient
 import ragewarden.ragedroid.di.appEntryPoint
+import ragewarden.ragedroid.model.NO_FOLDER
 import ragewarden.ragedroid.model.Recipient
 import ragewarden.ragedroid.model.RecipientKind
 import ragewarden.ragedroid.model.VaultItem
@@ -77,6 +85,7 @@ import ragewarden.ragedroid.ui.components.TextInput
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.Sans
 import ragewarden.ragedroid.ui.theme.rageColors
+import ragewarden.ragedroid.ui.uiString
 
 data class AddItemDraft(
     val kind: AddItemKind,
@@ -86,6 +95,7 @@ data class AddItemDraft(
     val recipientIds: ImmutableList<String>,
     val username: String = "",
     val site: String = "",
+    val totp: String = "",
     val notes: String = "",
     val cardholder: String = "",
     val cardNumber: String = "",
@@ -99,15 +109,6 @@ data class AddItemDraft(
     val sshPrivateKey: String = "",
 )
 
-private val DEFAULT_FOLDER_OPTIONS: ImmutableList<FolderOption> = persistentListOf(
-    FolderOption(id = null, name = "Unfiled", color = null),
-    FolderOption(id = "Work", name = "Work", color = Color(0xFFC8552B)),
-    FolderOption(id = "Personal", name = "Personal", color = Color(0xFF6B8E5A)),
-    FolderOption(id = "Infrastructure", name = "Infrastructure", color = Color(0xFF3A6B8E)),
-    FolderOption(id = "Family", name = "Family", color = Color(0xFFB57A2A)),
-    FolderOption(id = "Archive", name = "Archive", color = Color(0xFF8C7B6B)),
-)
-
 private val FolderTextStyle = TextStyle(
     fontFamily = Sans,
     fontWeight = FontWeight.Normal,
@@ -115,12 +116,6 @@ private val FolderTextStyle = TextStyle(
     lineHeight = 18.sp,
 )
 
-private val SshKeyTabStyle = TextStyle(
-    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-    fontWeight = FontWeight.SemiBold,
-    fontSize = 12.sp,
-    lineHeight = 16.sp,
-)
 
 private val NotePlainStyle = RageType.body.copy(fontSize = 14.5.sp, lineHeight = 22.sp)
 
@@ -135,7 +130,7 @@ private val NoteMonoStyle = TextStyle(
 fun AddItemScreen(
     itemKind: AddItemKind,
     existing: VaultItem? = null,
-    folderOptions: ImmutableList<FolderOption> = DEFAULT_FOLDER_OPTIONS,
+    folderOptions: ImmutableList<FolderOption>? = null,
     repo: VaultBackend? = null,
     onBack: () -> Unit,
     onSave: (AddItemDraft, ByteArray?) -> Unit,
@@ -149,24 +144,37 @@ fun AddItemScreen(
     var name by remember(existing?.id) { mutableStateOf(existing?.name ?: "") }
     var username by remember(existing?.id) { mutableStateOf(existing?.username ?: "") }
     var site by remember(existing?.id) { mutableStateOf(existing?.site ?: "") }
+    var totp by remember(existing?.id) { mutableStateOf(existing?.totpSeed ?: "") }
     var password by remember(existing?.id) { mutableStateOf("") }
     var notes by remember(existing?.id) { mutableStateOf(existing?.notes ?: "") }
+    var protectTotp by remember(existing?.id) { mutableStateOf(false) }
+    var protectNotes by remember(existing?.id) { mutableStateOf(false) }
 
     var cardholder by remember(existing?.id) { mutableStateOf("") }
     var cardNumber by remember(existing?.id) { mutableStateOf("") }
     var cardExp by remember(existing?.id) { mutableStateOf("") }
     var cardCvv by remember(existing?.id) { mutableStateOf("") }
 
+    var identitySsn by remember(existing?.id) { mutableStateOf("") }
+    var identityPassport by remember(existing?.id) { mutableStateOf("") }
+    var sshPassphrase by remember(existing?.id) { mutableStateOf("") }
     var firstName by remember(existing?.id) { mutableStateOf("") }
     var lastName by remember(existing?.id) { mutableStateOf("") }
     var email by remember(existing?.id) { mutableStateOf("") }
     var phone by remember(existing?.id) { mutableStateOf("") }
 
-    var sshType by remember(existing?.id) { mutableStateOf("ed25519") }
     var sshPriv by remember(existing?.id) { mutableStateOf("") }
 
-    val initialFolder = existing?.folder?.takeIf { it.isNotBlank() && it != "All" }
-    var folderId by remember(existing?.id) { mutableStateOf<String?>(initialFolder) }
+    var folderId by remember(existing?.id) { mutableStateOf(existing?.folderId) }
+    var loadedFolders by remember { mutableStateOf<ImmutableList<FolderOption>?>(null) }
+    LaunchedEffect(repo, folderOptions) {
+        if (folderOptions == null && repo != null) {
+            loadedFolders = runCatching { repo.listFolders() }.getOrNull()
+                ?.map { FolderOption(it.id, it.name, null) }
+                ?.toImmutableList()
+        }
+    }
+    val folders = folderOptions ?: loadedFolders ?: persistentListOf()
     var protect by remember(existing?.id) { mutableStateOf(existing?.rage ?: true) }
     // Only the local half of the wrap set, and only a fallback now -- see
     // rememberWrapTargets. Reading it as the whole set is what this screen used
@@ -197,28 +205,43 @@ fun AddItemScreen(
     var confirmUnopenable by remember { mutableStateOf(false) }
 
     val titleNew = mapOf(
-        AddItemKind.Login to "New login",
-        AddItemKind.Card to "New card",
-        AddItemKind.Note to "New note",
-        AddItemKind.Identity to "New identity",
-        AddItemKind.Ssh to "New SSH key",
+        AddItemKind.Login to stringResource(R.string.new_login),
+        AddItemKind.Card to stringResource(R.string.new_card),
+        AddItemKind.Note to stringResource(R.string.new_note),
+        AddItemKind.Identity to stringResource(R.string.new_identity),
+        AddItemKind.Ssh to stringResource(R.string.new_ssh_key),
     )
     val titleEdit = mapOf(
-        AddItemKind.Login to "Edit login",
-        AddItemKind.Card to "Edit card",
-        AddItemKind.Note to "Edit note",
-        AddItemKind.Identity to "Edit identity",
-        AddItemKind.Ssh to "Edit SSH key",
+        AddItemKind.Login to stringResource(R.string.edit_login),
+        AddItemKind.Card to stringResource(R.string.edit_card),
+        AddItemKind.Note to stringResource(R.string.edit_note),
+        AddItemKind.Identity to stringResource(R.string.edit_identity),
+        AddItemKind.Ssh to stringResource(R.string.edit_ssh_key),
     )
-    val title = if (isEdit) titleEdit[kind] ?: "Edit item" else titleNew[kind] ?: "New item"
+    val title = if (isEdit) titleEdit[kind] ?: stringResource(R.string.edit_item) else titleNew[kind] ?: stringResource(R.string.new_item)
 
     // Mirrors the `plaintext` computation in `performSave` below: whether this
     // save has a secret to wrap at all.
+    val typed = typedFields(
+        kind = kind,
+        cardholder = cardholder,
+        cardNumber = cardNumber,
+        cardExp = cardExp,
+        cardCvv = cardCvv,
+        firstName = firstName,
+        lastName = lastName,
+        email = email,
+        phone = phone,
+        ssn = identitySsn,
+        passport = identityPassport,
+        sshPrivateKey = sshPriv,
+        sshPassphrase = sshPassphrase,
+        protect = protect,
+    )
     val hasSecret = when (kind) {
         AddItemKind.Login -> password.isNotEmpty()
         AddItemKind.Note -> true
-        AddItemKind.Ssh -> sshPriv.isNotEmpty()
-        else -> false
+        else -> typed?.secrets?.isNotEmpty() == true
     }
     // NOT `protect`. `BitwardenVaultRepository.create` calls
     // `encryptForActiveRecipients` unconditionally -- it never reads
@@ -226,17 +249,18 @@ fun AddItemScreen(
     // the toggle says, and a kind with no secret (card, identity) is wrapped
     // never. Gating on the toggle would be both bypassable and, for those
     // kinds, a refusal to save something that was never going to be encrypted.
-    val willWrap = repo != null && hasSecret
+    val willWrap = repo != null && hasSecret && protect
 
     val performSave: () -> Unit = {
         val draft = AddItemDraft(
             kind = kind,
-            name = name.ifBlank { "Untitled ${kind.label}" },
+            name = name.ifBlank { uiString(R.string.untitled, uiString(kind.label)) },
             folder = folderId,
             rage = protect,
             recipientIds = recipientIds,
             username = username,
             site = site,
+            totp = totp,
             notes = notes,
             cardholder = cardholder,
             cardNumber = cardNumber,
@@ -246,16 +270,75 @@ fun AddItemScreen(
             lastName = lastName,
             email = email,
             phone = phone,
-            sshType = sshType,
+            sshType = typed?.block?.get("publicKey")?.substringBefore(' ') ?: "",
             sshPrivateKey = sshPriv,
         )
         val plaintext = when (kind) {
             AddItemKind.Login -> if (password.isNotEmpty()) password.toByteArray(Charsets.UTF_8) else null
             AddItemKind.Note -> notes.toByteArray(Charsets.UTF_8)
-            AddItemKind.Ssh -> if (sshPriv.isNotEmpty()) sshPriv.toByteArray(Charsets.UTF_8) else null
             else -> null
         }
-        if (repo != null && plaintext != null) {
+        val storable = when (kind) {
+            AddItemKind.Login -> !protect || plaintext != null
+            AddItemKind.Note -> plaintext != null
+            else -> typed != null && typed.problem == null
+        }
+        val loginSecrets = if (kind == AddItemKind.Login && protect) {
+            buildMap {
+                if (password.isNotEmpty()) put("password", password)
+                if (protectTotp && totp.isNotBlank()) put("totp", totp.trim())
+                if (protectNotes && notes.isNotBlank()) put("notes", notes)
+            }
+        } else {
+            emptyMap()
+        }
+        if (repo != null && storable && kind == AddItemKind.Login && loginSecrets.keys.any { it != "password" }) {
+            val loginItem = VaultItem(
+                id = existing?.id ?: UUID.randomUUID().toString(),
+                name = draft.name,
+                username = draft.username,
+                site = draft.site,
+                folder = folders.firstOrNull { it.id == draft.folder }?.name ?: NO_FOLDER,
+                folderId = draft.folder,
+                rage = true,
+                recipients = draft.recipientIds,
+                password = "",
+                totpSeed = totp.trim().ifBlank { null },
+                notes = notes.ifBlank { null },
+                lastUsed = "",
+                history = 0,
+                kind = VaultItemKind.Login,
+            )
+            plaintext?.fill(0)
+            scope.launch {
+                val result = runCatching { repo.createTyped(loginItem, emptyMap(), loginSecrets) }
+                if (result.isSuccess) onSave(draft, null) else onToast(uiString(R.string.save_failed, result.exceptionOrNull()?.message ?: uiString(R.string.unknown_error)))
+            }
+        } else if (repo != null && storable && typed != null) {
+            val typedItem = VaultItem(
+                id = existing?.id ?: UUID.randomUUID().toString(),
+                name = draft.name,
+                username = "",
+                site = "",
+                folder = folders.firstOrNull { it.id == draft.folder }?.name ?: NO_FOLDER,
+                folderId = draft.folder,
+                rage = typed.secrets.isNotEmpty(),
+                recipients = draft.recipientIds,
+                password = "",
+                notes = draft.notes.ifBlank { null },
+                lastUsed = "",
+                history = 0,
+                kind = typed.kind,
+            )
+            scope.launch {
+                val result = runCatching { repo.createTyped(typedItem, typed.block, typed.secrets) }
+                if (result.isSuccess) {
+                    onSave(draft, null)
+                } else {
+                    onToast(uiString(R.string.save_failed, result.exceptionOrNull()?.message ?: uiString(R.string.unknown_error)))
+                }
+            }
+        } else if (repo != null && storable) {
             val newId = existing?.id ?: UUID.randomUUID().toString()
             val itemKindMapped = when (kind) {
                 AddItemKind.Login -> VaultItemKind.Login
@@ -269,7 +352,8 @@ fun AddItemScreen(
                 name = draft.name,
                 username = draft.username,
                 site = draft.site,
-                folder = folderOptions.firstOrNull { it.id == draft.folder }?.name ?: "All",
+                totpSeed = draft.totp.takeIf { kind == AddItemKind.Login && it.isNotBlank() },
+                folder = folders.firstOrNull { it.id == draft.folder }?.name ?: NO_FOLDER,
                 rage = draft.rage,
                 recipients = draft.recipientIds,
                 password = "",
@@ -279,20 +363,22 @@ fun AddItemScreen(
                 kind = itemKindMapped,
             )
             scope.launch {
-                val result = runCatching { repo.create(newItem, plaintext) }
+                val result = runCatching {
+                    repo.create(newItem, plaintext)
+                }
                 if (result.isSuccess) {
                     onSave(draft, plaintext)
                 } else {
                     val msg = result.exceptionOrNull()?.message
                         ?: result.exceptionOrNull()?.javaClass?.simpleName
-                        ?: "save failed"
-                    onToast("Save failed: $msg")
+                        ?: uiString(R.string.save_failed_3)
+                    onToast(uiString(R.string.save_failed, msg))
                 }
-                plaintext.fill(0)
+                plaintext?.fill(0)
             }
         } else {
-            onSave(draft, plaintext)
             plaintext?.fill(0)
+            onToast(typed?.problem ?: unsavableReason(kind, hasRepo = repo != null))
         }
     }
 
@@ -306,8 +392,7 @@ fun AddItemScreen(
         when {
             !willWrap -> performSave()
             wrapTargets.isEmpty() -> onToast(
-                "Not saving: there is no recipient to encrypt to. Enrol a key on this " +
-                    "device first.",
+                uiString(R.string.not_saving_there_is_no_recipient),
             )
             !openableHere -> confirmUnopenable = true
             else -> performSave()
@@ -320,13 +405,13 @@ fun AddItemScreen(
             leading = {
                 IconBtn(
                     icon = Icons.AutoMirrored.Outlined.ArrowBack,
-                    contentDescription = "Cancel",
+                    contentDescription = stringResource(R.string.cancel),
                     onClick = onBack,
                 )
             },
             trailing = {
                 RageButton(
-                    label = "Save",
+                    label = stringResource(R.string.save),
                     onClick = onSaveClick,
                     size = ButtonSize.Sm,
                 )
@@ -340,34 +425,59 @@ fun AddItemScreen(
                 .imePadding()
                 .padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 24.dp),
         ) {
-            Field(label = "Name") {
+            Field(label = stringResource(R.string.name)) {
                 TextInput(
                     value = name,
                     onValueChange = { name = it },
                     placeholder = namePlaceholder(kind),
+                    modifier = Modifier.testTag("add-name"),
                 )
             }
 
             when (kind) {
                 AddItemKind.Login -> {
-                    Field(label = "Website") {
+                    Field(label = stringResource(R.string.website)) {
                         TextInput(
                             value = site,
                             onValueChange = { site = it },
-                            placeholder = "dashboard.stripe.com",
+                            placeholder = stringResource(R.string.dashboard_stripe_com),
                             mono = true,
                         )
                     }
-                    Field(label = "Username") {
+                    Field(label = stringResource(R.string.username)) {
                         TextInput(
                             value = username,
                             onValueChange = { username = it },
-                            placeholder = "you@example.com",
+                            placeholder = stringResource(R.string.you_example_com),
                         )
                     }
                     Field(
-                        label = "Password",
-                        hint = "Generate a strong password -- RageDroid will encrypt it before saving.",
+                        label = stringResource(R.string.totp_seed),
+                        hint = stringResource(R.string.optional_either_an_otpauth_uri_or),
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Box(modifier = Modifier.weight(1f)) {
+                                TextInput(
+                                    value = totp,
+                                    onValueChange = { totp = it },
+                                    modifier = Modifier.testTag("add-totp"),
+                                    mono = true,
+                                    password = protect && protectTotp,
+                                )
+                            }
+                            ragewarden.ragedroid.ui.components.TotpScanButton(onScanned = { totp = it })
+                        }
+                    }
+                    if (protect) {
+                        ProtectFieldRow(label = stringResource(R.string.protect_the_totp_seed), checked = protectTotp, onChange = { protectTotp = it })
+                    }
+                    Field(
+                        label = stringResource(R.string.password),
+                        hint = stringResource(R.string.generate_a_strong_password_ragedroid_will),
                     ) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -379,12 +489,13 @@ fun AddItemScreen(
                                     value = password,
                                     onValueChange = { password = it },
                                     placeholder = "••••••",
+                                    modifier = Modifier.testTag("add-password"),
                                     mono = true,
                                     password = true,
                                 )
                             }
                             RageButton(
-                                label = "Gen",
+                                label = stringResource(R.string.gen),
                                 onClick = { showGeneratorSheet = true },
                                 icon = Icons.Outlined.Refresh,
                                 variant = ButtonVariant.Secondary,
@@ -392,16 +503,22 @@ fun AddItemScreen(
                             )
                         }
                     }
+                    Field(label = stringResource(R.string.notes)) {
+                        MultilineInput(value = notes, onValueChange = { notes = it }, placeholder = "", mono = false, minLines = 3)
+                    }
+                    if (protect) {
+                        ProtectFieldRow(label = stringResource(R.string.protect_the_notes), checked = protectNotes, onChange = { protectNotes = it })
+                    }
                 }
                 AddItemKind.Card -> {
-                    Field(label = "Cardholder") {
+                    Field(label = stringResource(R.string.cardholder)) {
                         TextInput(
                             value = cardholder,
                             onValueChange = { cardholder = it },
-                            placeholder = "Maya Voss",
+                            placeholder = stringResource(R.string.maya_voss),
                         )
                     }
-                    Field(label = "Card number") {
+                    Field(label = stringResource(R.string.card_number)) {
                         TextInput(
                             value = cardNumber,
                             onValueChange = { cardNumber = it },
@@ -414,17 +531,17 @@ fun AddItemScreen(
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
                         Box(modifier = Modifier.weight(1f)) {
-                            Field(label = "Expiry") {
+                            Field(label = stringResource(R.string.expiry)) {
                                 TextInput(
                                     value = cardExp,
                                     onValueChange = { cardExp = it },
-                                    placeholder = "MM / YY",
+                                    placeholder = stringResource(R.string.mm_yy),
                                     mono = true,
                                 )
                             }
                         }
                         Box(modifier = Modifier.weight(1f)) {
-                            Field(label = "CVV") {
+                            Field(label = stringResource(R.string.cvv)) {
                                 TextInput(
                                     value = cardCvv,
                                     onValueChange = { cardCvv = it },
@@ -438,13 +555,13 @@ fun AddItemScreen(
                 }
                 AddItemKind.Note -> {
                     Field(
-                        label = "Note",
-                        hint = "Plaintext encrypted under your recipients. No structure.",
+                        label = stringResource(R.string.note),
+                        hint = stringResource(R.string.plaintext_encrypted_under_your_recipients_no),
                     ) {
                         MultilineInput(
                             value = notes,
                             onValueChange = { notes = it },
-                            placeholder = "Anything that should never be in plaintext.",
+                            placeholder = stringResource(R.string.anything_that_should_never_be_in),
                             mono = false,
                             minLines = 8,
                         )
@@ -456,32 +573,32 @@ fun AddItemScreen(
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
                         Box(modifier = Modifier.weight(1f)) {
-                            Field(label = "First name") {
+                            Field(label = stringResource(R.string.first_name)) {
                                 TextInput(
                                     value = firstName,
                                     onValueChange = { firstName = it },
-                                    placeholder = "Maya",
+                                    placeholder = stringResource(R.string.maya),
                                 )
                             }
                         }
                         Box(modifier = Modifier.weight(1f)) {
-                            Field(label = "Last name") {
+                            Field(label = stringResource(R.string.last_name)) {
                                 TextInput(
                                     value = lastName,
                                     onValueChange = { lastName = it },
-                                    placeholder = "Voss",
+                                    placeholder = stringResource(R.string.voss),
                                 )
                             }
                         }
                     }
-                    Field(label = "Email") {
+                    Field(label = stringResource(R.string.email)) {
                         TextInput(
                             value = email,
                             onValueChange = { email = it },
-                            placeholder = "name@example.com",
+                            placeholder = stringResource(R.string.name_example_com),
                         )
                     }
-                    Field(label = "Phone") {
+                    Field(label = stringResource(R.string.phone)) {
                         TextInput(
                             value = phone,
                             onValueChange = { phone = it },
@@ -489,65 +606,50 @@ fun AddItemScreen(
                             mono = true,
                         )
                     }
+                    Field(label = stringResource(R.string.ssn)) {
+                        TextInput(
+                            value = identitySsn,
+                            onValueChange = { identitySsn = it },
+                            placeholder = stringResource(R.string.protected_when_the_item_is),
+                            mono = true,
+                            password = true,
+                        )
+                    }
+                    Field(label = stringResource(R.string.passport_number)) {
+                        TextInput(
+                            value = identityPassport,
+                            onValueChange = { identityPassport = it },
+                            placeholder = stringResource(R.string.protected_when_the_item_is),
+                            mono = true,
+                            password = true,
+                        )
+                    }
                 }
                 AddItemKind.Ssh -> {
-                    Field(label = "Key type") {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .background(c.tile, RoundedCornerShape(8.dp))
-                                .padding(3.dp),
-                        ) {
-                            listOf("ed25519", "rsa-4096", "ecdsa-p256").forEach { k ->
-                                Box(
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .background(
-                                            if (sshType == k) c.surface else Color.Transparent,
-                                            RoundedCornerShape(6.dp),
-                                        )
-                                        .clickable { sshType = k }
-                                        .padding(horizontal = 8.dp, vertical = 8.dp),
-                                    contentAlignment = Alignment.Center,
-                                ) {
-                                    Text(
-                                        text = k,
-                                        style = SshKeyTabStyle,
-                                        color = if (sshType == k) c.fgEmphasis else c.fgSecondary,
-                                    )
-                                }
-                            }
-                        }
-                    }
                     Field(
-                        label = "Private key",
-                        hint = "Paste an existing key, or tap Generate to create one on this device.",
+                        label = stringResource(R.string.private_key),
+                        hint = stringResource(R.string.paste_an_openssh_private_key_its),
                     ) {
-                        Column {
-                            MultilineInput(
-                                value = sshPriv,
-                                onValueChange = { sshPriv = it },
-                                placeholder = "-----BEGIN OPENSSH PRIVATE KEY-----...",
-                                mono = true,
-                                minLines = 5,
-                            )
-                            Spacer(modifier = Modifier.height(8.dp))
-                            RageButton(
-                                label = "Generate $sshType",
-                                onClick = {
-                                    sshPriv =
-                                        "-----BEGIN OPENSSH PRIVATE KEY-----\n...generated on device...\n-----END OPENSSH PRIVATE KEY-----"
-                                },
-                                icon = Icons.Outlined.Refresh,
-                                variant = ButtonVariant.Secondary,
-                                size = ButtonSize.Sm,
-                            )
-                        }
+                        MultilineInput(
+                            value = sshPriv,
+                            onValueChange = { sshPriv = it },
+                            placeholder = stringResource(R.string.paste_an_openssh_private_key),
+                            mono = true,
+                            minLines = 5,
+                        )
+                    }
+                    Field(label = stringResource(R.string.passphrase), hint = stringResource(R.string.stored_only_when_the_key_is)) {
+                        TextInput(
+                            value = sshPassphrase,
+                            onValueChange = { sshPassphrase = it },
+                            placeholder = stringResource(R.string.optional),
+                            password = true,
+                        )
                     }
                 }
             }
 
-            Field(label = "Folder") {
+            Field(label = stringResource(R.string.folder)) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -558,7 +660,7 @@ fun AddItemScreen(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    val current = folderOptions.firstOrNull { it.id == folderId }
+                    val current = folders.firstOrNull { it.id == folderId }
                     Icon(
                         imageVector = Icons.Outlined.Folder,
                         contentDescription = null,
@@ -566,7 +668,7 @@ fun AddItemScreen(
                         modifier = Modifier.size(16.dp),
                     )
                     Text(
-                        text = current?.name ?: "Unfiled",
+                        text = current?.name ?: stringResource(R.string.unfiled),
                         style = FolderTextStyle,
                         color = if (folderId != null) c.fgEmphasis else c.fgSecondary,
                         modifier = Modifier.weight(1f),
@@ -591,13 +693,12 @@ fun AddItemScreen(
             // when it is off would hide the one list that says who can read it.
             if (protect || willWrap) {
                 Field(
-                    label = "Unlock recipients",
+                    label = stringResource(R.string.unlock_recipients),
                     // The set is not "selected" by anyone here: the shared policy
                     // in core/src/policy.rs picks it, and `create` ignores
                     // whatever this screen puts in `VaultItem.recipients`. Saying
                     // "selected" implied a choice the composer never had.
-                    hint = "Any one of these can decrypt this item. The set comes from " +
-                        "your recipient registry plus the keys enrolled here.",
+                    hint = stringResource(R.string.any_one_of_these_can_decrypt),
                 ) {
                     RecipientSummary(targets = wrapTargets, openableHere = openableHere)
                 }
@@ -619,7 +720,7 @@ fun AddItemScreen(
     MoveToFolderSheet(
         open = showFolderSheet,
         onClose = { showFolderSheet = false },
-        folders = folderOptions,
+        folders = folders,
         currentId = folderId,
         onPick = { folderId = it.id },
     )
@@ -667,13 +768,13 @@ private fun ProtectToggleRow(
         }
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = "Protect with RageDroid",
+                text = stringResource(R.string.protect_with_ragedroid),
                 style = RageType.rowTitle.copy(fontSize = 15.sp, lineHeight = 19.sp),
                 color = c.fgEmphasis,
             )
             Spacer(modifier = Modifier.height(2.dp))
             Text(
-                text = "Each reveal will require a tap on one of the recipients below.",
+                text = stringResource(R.string.each_reveal_will_require_a_tap),
                 style = RageType.caption.copy(fontSize = 12.sp, lineHeight = 17.sp),
                 color = c.fgSecondary,
             )
@@ -685,7 +786,7 @@ private fun ProtectToggleRow(
 @Composable
 private fun ProtectSwitch(on: Boolean) {
     val c = rageColors
-    val knobOffset by animateDpAsState(targetValue = if (on) 18.dp else 2.dp, label = "knob")
+    val knobOffset by animateDpAsState(targetValue = if (on) 18.dp else 2.dp, label = stringResource(R.string.knob))
     Box(
         modifier = Modifier
             .width(40.dp)
@@ -758,7 +859,7 @@ private fun collectWrapTargets(context: android.content.Context): List<WrapTarge
     val registryEntries = registry.readEntries(repo.snapshotWithRegistryMarker())
     // The label lands in a wire display string the policy never reads -- the
     // chips render from `StoredRecipient` -- so it only has to be honest.
-    val label = android.os.Build.MODEL ?: "this device"
+    val label = android.os.Build.MODEL ?: uiString(R.string.this_device_2)
     val localEntries = with(RecipientPolicy) { stored.map { it.toPolicyWire(label) } }
 
     val selection = RecipientPolicy.select(
@@ -812,20 +913,14 @@ private fun UnopenableSaveDialog(
     val names = targets.joinToString(", ") { it.recipient.name }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("This device can't open this item") },
+        title = { Text(stringResource(R.string.this_device_can_t_open_this)) },
         text = {
             Text(
                 // Precise about *why*: a paper identity enrolled here is in the
                 // set and is still not something this screen can promise a
                 // reveal from -- IdentityResolver deliberately refuses it outside
                 // Settings -> Recover from phrase.
-                text = "Nothing in the recipient set is a key this device can unlock with. " +
-                    "Saving encrypts to ${targets.size} " +
-                    "recipient${if (targets.size == 1) "" else "s"} ($names) that either live " +
-                    "on other devices or, like a paper identity, only work through " +
-                    "Settings -> Recover from phrase. The item will be listed here and will " +
-                    "not open here.\n\n" +
-                    "Enrol a key on this device and it is included from the next save on.",
+                text = androidx.compose.ui.res.pluralStringResource(R.plurals.no_recipient_unlocks_here, targets.size, targets.size, names),
                 style = RageType.body.copy(fontSize = 14.sp, lineHeight = 20.sp),
                 color = c.fgPrimary,
             )
@@ -835,10 +930,10 @@ private fun UnopenableSaveDialog(
         // does not write an item the user cannot read back. Dismissing the
         // dialog any other way -- back, tap-outside -- lands on Cancel too.
         confirmButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) }
         },
         dismissButton = {
-            TextButton(onClick = onConfirm) { Text("Save anyway") }
+            TextButton(onClick = onConfirm) { Text(stringResource(R.string.save_anyway)) }
         },
     )
 }
@@ -859,7 +954,7 @@ private fun RecipientSummary(targets: List<WrapTarget>, openableHere: Boolean) {
         Column(modifier = Modifier.weight(1f)) {
             if (targets.isEmpty()) {
                 Text(
-                    text = "No recipients -- nothing can decrypt this item",
+                    text = stringResource(R.string.no_recipients_nothing_can_decrypt_this),
                     style = RageType.sansBody.copy(fontSize = 13.sp, lineHeight = 17.sp),
                     color = c.warning,
                 )
@@ -880,7 +975,7 @@ private fun RecipientSummary(targets: List<WrapTarget>, openableHere: Boolean) {
             if (targets.isNotEmpty() && !openableHere) {
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
-                    text = "None of these are keys this device can unlock with.",
+                    text = stringResource(R.string.none_of_these_are_keys_this),
                     style = RageType.caption.copy(fontSize = 11.5.sp, lineHeight = 16.sp),
                     color = c.warning,
                 )
@@ -922,7 +1017,7 @@ private fun RecipientChip(name: String, kind: RecipientKind, local: Boolean) {
             // A chip for a registry-only key must say so: the user is looking at
             // this list to answer "can I open this again", and a name alone does
             // not distinguish their phone's key from their laptop's.
-            text = if (local) name else "$name · other device",
+            text = if (local) name else stringResource(R.string.other_device, name),
             style = RageType.sansBody.copy(
                 fontSize = 12.sp,
                 lineHeight = 16.sp,
@@ -972,9 +1067,107 @@ private fun MultilineInput(
 }
 
 private fun namePlaceholder(kind: AddItemKind): String = when (kind) {
-    AddItemKind.Login -> "e.g. Stripe -- production"
-    AddItemKind.Card -> "e.g. Amex -- personal"
-    AddItemKind.Note -> "e.g. Apartment alarm code"
-    AddItemKind.Identity -> "e.g. Maya -- primary"
-    AddItemKind.Ssh -> "e.g. ed25519 -- laptop"
+    AddItemKind.Login -> uiString(R.string.e_g_stripe_production)
+    AddItemKind.Card -> uiString(R.string.e_g_amex_personal)
+    AddItemKind.Note -> uiString(R.string.e_g_apartment_alarm_code)
+    AddItemKind.Identity -> uiString(R.string.e_g_maya_primary)
+    AddItemKind.Ssh -> uiString(R.string.e_g_ed25519_laptop)
+}
+
+internal fun unsavableReason(kind: AddItemKind, hasRepo: Boolean): String = when {
+    !hasRepo -> uiString(R.string.not_saved_sign_in_first)
+    kind == AddItemKind.Login -> uiString(R.string.not_saved_enter_a_password_to)
+    else -> uiString(R.string.not_saved_has_nothing_to_save, uiString(kind.label))
+}
+
+/** A card, identity or SSH key split into its Bitwarden block and what the rage blob seals. */
+internal data class TypedFields(
+    val kind: VaultItemKind,
+    val block: Map<String, String>,
+    val secrets: Map<String, String>,
+    val problem: String? = null,
+)
+
+internal fun typedFields(
+    kind: AddItemKind,
+    cardholder: String = "",
+    cardNumber: String = "",
+    cardExp: String = "",
+    cardCvv: String = "",
+    firstName: String = "",
+    lastName: String = "",
+    email: String = "",
+    phone: String = "",
+    ssn: String = "",
+    passport: String = "",
+    sshPrivateKey: String = "",
+    sshPassphrase: String = "",
+    protect: Boolean,
+): TypedFields? {
+    val (itemKind, values) = when (kind) {
+        AddItemKind.Card -> {
+            val (month, year) = cardExp.split('/').map(String::trim).let { it.getOrElse(0) { "" } to it.getOrElse(1) { "" } }
+            VaultItemKind.Card to mapOf(
+                "cardholderName" to cardholder.trim(),
+                "number" to cardNumber.filterNot(Char::isWhitespace),
+                "expMonth" to month,
+                "expYear" to year,
+                "code" to cardCvv.trim(),
+            )
+        }
+        AddItemKind.Identity -> VaultItemKind.Identity to mapOf(
+            "firstName" to firstName.trim(),
+            "lastName" to lastName.trim(),
+            "email" to email.trim(),
+            "phone" to phone.trim(),
+            "ssn" to ssn.trim(),
+            "passportNumber" to passport.trim(),
+        )
+        AddItemKind.Ssh -> {
+            if (sshPrivateKey.isBlank()) {
+                return TypedFields(VaultItemKind.SshKey, emptyMap(), emptyMap(), uiString(R.string.not_saved_paste_the_private_key))
+            }
+            val pub = ragewarden.ragedroid.data.OpenSshKeys.publicOf(sshPrivateKey)
+                ?: return TypedFields(
+                    VaultItemKind.SshKey,
+                    emptyMap(),
+                    emptyMap(),
+                    uiString(R.string.not_saved_paste_an_openssh_private),
+                )
+            if (!protect && sshPassphrase.isNotEmpty()) {
+                return TypedFields(
+                    VaultItemKind.SshKey,
+                    emptyMap(),
+                    emptyMap(),
+                    uiString(R.string.not_saved_a_passphrase_is_only),
+                )
+            }
+            VaultItemKind.SshKey to mapOf(
+                "privateKey" to sshPrivateKey.trim() + "\n",
+                "publicKey" to pub.publicKey,
+                "keyFingerprint" to pub.fingerprint,
+                "passphrase" to sshPassphrase,
+            )
+        }
+        else -> return null
+    }
+    val nonEmpty = values.filterValues { it.isNotEmpty() }
+    if (nonEmpty.isEmpty()) return TypedFields(itemKind, emptyMap(), emptyMap(), uiString(R.string.not_saved_has_nothing_to_save, uiString(kind.label)))
+    val secrets = if (protect) nonEmpty.filterKeys { it in ragewarden.ragedroid.data.ItemFields.defaultProtected(itemKind) } else emptyMap()
+    return TypedFields(itemKind, nonEmpty - secrets.keys - "passphrase", secrets)
+}
+
+/** "Also keep this field behind the tap" for one more field of a protected login. */
+@Composable
+private fun ProtectFieldRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .toggleable(value = checked, role = androidx.compose.ui.semantics.Role.Checkbox, onValueChange = onChange),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        androidx.compose.material3.Checkbox(checked = checked, onCheckedChange = null)
+        Text(text = label, style = RageType.caption, color = rageColors.fgPrimary, modifier = Modifier.padding(start = 12.dp))
+    }
 }

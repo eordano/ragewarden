@@ -65,6 +65,17 @@ object RecipientPolicy {
      * has always wrapped Android passkeys -- as `fido2-hmac` stanzas. Do not
      * "fix" that here: it would change the stanza tag of already-written items.
      */
+    /**
+     * SPKI DER of a P-256 key the recipient's device signs with: a passkey's
+     * credential key, or a P-256 PIV slot's own key (what rageterm publishes).
+     */
+    private fun StoredRecipient.attestationKey(): ByteArray? = when {
+        kind == RecipientKind.PasskeyPrf -> passkeyPublicKeySpki
+        kind == RecipientKind.YubiKey -> pivPubkey?.takeIf { it.size == 33 }
+            ?.let { runCatching { ragewarden.ragedroid.identities.P256.spkiDer(it) }.getOrNull() }
+        else -> null
+    }
+
     fun StoredRecipient.toPolicyWire(deviceLabel: String): RecipientRegistry.WireEntry =
         RecipientRegistry.WireEntry(
             id = id,
@@ -82,6 +93,8 @@ object RecipientPolicy {
             fido2RpId = fido2RpId ?: passkeyRpId,
             fido2Salt = (fido2Salt ?: passkeySalt)?.let(::encodeHexLower),
             recoveryArmoredPubkey = recoveryArmoredPubkey,
+            stanzaVersion = if (kind == RecipientKind.StrongBox) 2 else null,
+            attestationPublicKey = attestationKey()?.let { java.util.Base64.getEncoder().encodeToString(it) },
         )
 
     /**

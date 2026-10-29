@@ -117,6 +117,7 @@ sealed class WireRecipient {
 @Serializable
 data class WirePrfInput(
     val rp_id: String,
+    @Serializable(with = UnsignedByteArraySerializer::class) val credential_id: ByteArray = ByteArray(0),
     @Serializable(with = UnsignedByteArraySerializer::class) val salt: ByteArray,
     @Serializable(with = UnsignedByteArraySerializer::class) val prf_output: ByteArray,
 ) {

@@ -1,5 +1,7 @@
 # design/ -- visual prototype
 
+Run `./fetch-fonts.sh` once to populate `fonts/` (Source Serif 4 from the pinned @fontsource-variable tarball; the files are not tracked).
+
 **This directory is a mockup. It is not the browser extension and it is not
 shipped.** The extension's popup lives in
 `ragemanifest/ext/popup/` and is written against the real
@@ -17,32 +19,22 @@ shipped.** The extension's popup lives in
 Nothing executable from this directory reaches `dist/`.
 `assertPopupIsNotThePrototype()` in `build.mjs` fails the build if a `.jsx`
 file, a CDN `<script>`, an in-browser Babel tag, the sample vault or the
-placeholder recovery word list ever appears in the shipped popup again.
+placeholder recovery word list appears in the shipped popup.
 
 ## Why it is not the product
 
-Until 2026-08 `build.mjs` copied this whole directory into the popup bundle and
-compiled the JSX, so the mockup *was* the shipped UI. It is not functional:
+It is a visual mockup, not working code:
 
-- **`data.jsx`** is sample data -- fake logins with cleartext passwords, a fake
-  recipient registry, a fake activity feed, and `RECOVERY_PHRASE`, a constant
-  word list. `screens-extras.jsx`'s `PaperRecoveryWizard` rendered that
-  constant on the paper-recovery screen while the *real* generated phrase went
-  to `console.warn` (`RageDroid.html`, `handlePaperRecovery`). Anyone who wrote
-  down what the popup showed them was permanently locked out of their vault.
-  The list is now `sample-01 ... sample-24` and the screen carries a mockup
-  warning, because a mockup must not be mistakable for the real screen.
-- **`components.jsx`'s `ToastHost`** was `() => null`. Every screen's error
-  handling calls `toast(...)`; none of it rendered. It now renders.
-- **`LockScreen`** (`screens-misc.jsx`) accepts any input. There is no password
-  to check against in a prototype.
-- Sheets like `RecipientPickerSheet` and `MoveToFolderSheet` call
-  `toast('Recipients updated...')` without writing anything.
-- The folder chip strip is the hardcoded list `['All','Work','Personal','Infrastructure']`.
+- `data.jsx` is sample data -- fake logins with cleartext passwords, a fake recipient
+  registry, a fake activity feed, and a placeholder recovery word list
+  (`sample-01 ... sample-24`); the paper-recovery screen carries a mockup warning so it
+  cannot be mistaken for the real one.
+- `LockScreen` (`screens-extras.jsx`) accepts any input; sheets such as
+  `RecipientPickerSheet` and `MoveToFolderSheet` toast without writing anything; the
+  folder chips are a hardcoded list.
 
-Those are all reasonable things for a mockup to do. They are not reasonable
-things for a password manager to do, which is why the shipped popup is separate
-code.
+The shipped popup is separate code (`ragemanifest/ext/popup/`), and `ragedroid` translates
+the same design to Compose.
 
 ## Running the prototype
 

@@ -2,32 +2,27 @@
   "name": "ragemanifest-ext",
   "private": true,
   "version": "0.0.1",
-  "description": "Build pipeline for the Ragewarden browser extension (Chromium + Firefox).",
+  "description": "Build pipeline for the Ragewarden browser extension (Chromium, Firefox, Safari).",
   "type": "module",
+  "packageManager": "pnpm@12.9.0",
   "scripts": {
     "build": "node build.mjs chromium",
     "build:chromium": "node build.mjs chromium",
     "build:firefox": "node build.mjs firefox",
     "build:safari": "node build.mjs safari",
     "build:wasm": "wasm-pack build --target web --out-dir pkg .",
-    "build:all": "npm run build:wasm && npm run build:chromium && npm run build:firefox",
+    "build:all": "pnpm run build:wasm && pnpm run build:chromium && pnpm run build:firefox",
     "dev:chromium": "node build.mjs chromium --watch",
     "dev:firefox": "node build.mjs firefox --watch",
     "smoke:firefox": "node tests/smoke-firefox.mjs",
     "smoke:firefox:headed": "node tests/smoke-firefox.mjs --firefox",
     "smoke:firefox:ci": "node tests/smoke-firefox.mjs --static-only",
-    "clean": "rm -rf dist pkg ext/wasm"
-  },
-  "dependencies": {
-    "@babel/standalone": "^8.0.4",
-    "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "clean": "rm -rf dist pkg ext/wasm",
+    "test:unit": "node --test 'tests/unit/*.test.mjs'",
+    "test:firefox": "node build.mjs firefox --test-hooks && node tests/firefox-bidi.mjs"
   },
   "devDependencies": {
-    "esbuild": "^0.28.2",
-    "playwright-core": "^1.62.1",
-    "typescript": "^7.0.2",
-    "web-ext": "^10.6.0"
-  },
-  "//": "React 19 pin lifted 2026-08-11 -- ext/ and design/ were grepped clean of defaultProps."
+    "playwright-core": "1.64.1",
+    "web-ext": "^10.7.0"
+  }
 }

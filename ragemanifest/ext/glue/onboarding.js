@@ -1,3 +1,5 @@
+import { defaultRpId } from './passkey.js';
+import { requestServerPermission } from './host-permission.js';
 const STYLE = `
 <style id="ragewarden-onboarding-style">
   .ragewarden-onb-root {
@@ -63,8 +65,17 @@ const STYLE = `
     margin-top: 12px; text-align: center; font-size: 12px; opacity: 0.7;
     font-family: ui-sans-serif, system-ui, sans-serif;
   }
-  .ragewarden-onb-toggle a {
+  .ragewarden-onb-link {
     color: #faf6ee; cursor: pointer; text-decoration: underline;
+    background: none; border: 0; padding: 0; font: inherit;
+  }
+  .ragewarden-onb-step {
+    font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.6;
+    margin-bottom: 4px; font-family: ui-sans-serif, system-ui, sans-serif;
+  }
+  .ragewarden-onb-phrase {
+    columns: 3; margin: 0 0 14px; padding-left: 22px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px;
   }
   .ragewarden-onb-error {
     margin-top: 10px; padding: 8px 10px;
@@ -90,63 +101,198 @@ function el(tag, attrs = {}, children = []) {
     return node;
 }
 
+const PICK_WORDS = 3;
+
+function pickWordIndices(n, k) {
+    const pool = Array.from({ length: n }, (_, i) => i);
+    const out = [];
+    const buf = new Uint32Array(1);
+    while (out.length < k && pool.length > 0) {
+        const m = pool.length;
+        const limit = Math.floor(0x100000000 / m) * m;
+        do { globalThis.crypto.getRandomValues(buf); } while (buf[0] >= limit);
+        out.push(pool.splice(buf[0] % m, 1)[0]);
+    }
+    return out.sort((a, b) => a - b);
+}
+
+function ensureStyle() {
+    if (!document.getElementById('ragewarden-onboarding-style')) {
+        const styleHolder = el('div');
+        styleHolder.innerHTML = STYLE;
+        document.head.appendChild(styleHolder.firstElementChild);
+    }
+}
+
+/**
+ * First-run protection, in three steps: a passkey, a backup passkey, and a
+ * paper recovery phrase. The phrase step cannot be skipped once the backup was
+ * skipped, so a profile that finishes with a passkey always has a second way in.
+ * Skipping the first passkey ends on an explicit "not protected yet" card.
+ *
+ * Resolves { enrolled, backup, recovery, protected }.
+ */
 export function showProtectionWizard(args) {
-    const { passkeyEnroll, savePasskeyRecipient } = args;
-    const rpId = args.defaultRpId || (typeof location !== 'undefined' ? location.hostname : 'ragewarden');
+    const { passkeyEnroll, savePasskeyRecipient, enrollBackupPasskey,
+        generateRecovery, publishRecovery } = args;
+    const rpId = args.defaultRpId || defaultRpId();
     const label = args.defaultLabel || 'Primary passkey';
+    const result = { enrolled: false, backup: false, recovery: false, protected: false };
 
     return new Promise((resolve) => {
-        if (!document.getElementById('ragewarden-onboarding-style')) {
-            const styleHolder = el('div');
-            styleHolder.innerHTML = STYLE;
-            document.head.appendChild(styleHolder.firstElementChild);
-        }
-
+        ensureStyle();
         const root = el('div', { class: 'ragewarden-onb-root' });
-        const card = el('div', { class: 'ragewarden-onb-card' });
-        const title = el('h1', {}, ['Set up Ragewarden protection']);
-        const sub = el('div', { class: 'ragewarden-onb-sub' }, [
-            'Enrol a passkey so each individual credential reveal requires a hardware tap. ',
-            'Your browser will save the passkey wherever it normally does -- Touch ID, Windows Hello, a security key, or your phone.',
-        ]);
-        // No cryptography paragraph here. This card is shown to someone who has
-        // not yet decided to trust the product, and "WebAuthn-PRF derivation
-        // wraps each cipher's file key" asks them to evaluate a claim they have
-        // no way to check. The sentence above already says the thing they can
-        // act on: each reveal costs a tap, and the passkey lives where their
-        // browser keeps passkeys.
-        const errorBox = el('div', { class: 'ragewarden-onb-error' });
-        errorBox.style.display = 'none';
-
-        const enrollBtn = el('button', { class: 'ragewarden-onb-btn ragewarden-onb-primary' }, ['Create passkey']);
-        const skipBtn = el('button', { class: 'ragewarden-onb-btn ragewarden-onb-secondary' }, ['Skip for now']);
-
-        function showError(msg) { errorBox.textContent = msg; errorBox.style.display = 'block'; }
-        function cleanup() { if (root.parentNode) root.parentNode.removeChild(root); }
-
-        skipBtn.addEventListener('click', () => { cleanup(); resolve({ enrolled: false }); });
-        enrollBtn.addEventListener('click', async () => {
-            errorBox.style.display = 'none';
-            enrollBtn.disabled = true;
-            skipBtn.disabled = true;
-            try {
-                const recipient = await passkeyEnroll({ rpId, label });
-                await savePasskeyRecipient(recipient);
-                cleanup();
-                resolve({ enrolled: true, recipient });
-            } catch (err) {
-                showError((err && err.message) || String(err));
-                enrollBtn.disabled = false;
-                skipBtn.disabled = false;
-            }
-        });
-
-        card.appendChild(title);
-        card.appendChild(sub);
-        card.appendChild(errorBox);
-        card.appendChild(el('div', { class: 'ragewarden-onb-row' }, [enrollBtn, skipBtn]));
+        const card = el('div', { class: 'ragewarden-onb-card', role: 'dialog', 'aria-modal': 'true',
+            'aria-labelledby': 'ragewarden-onb-title' });
         root.appendChild(card);
         document.body.appendChild(root);
+
+        const finish = () => {
+            if (root.parentNode) root.parentNode.removeChild(root);
+            result.protected = result.enrolled || result.recovery;
+            resolve(result);
+        };
+
+        function screen(titleText, subText, ...rest) {
+            while (card.firstChild) card.removeChild(card.firstChild);
+            card.appendChild(el('div', { class: 'ragewarden-onb-step' }, [stepLabel()]));
+            card.appendChild(el('h1', { id: 'ragewarden-onb-title' }, [titleText]));
+            card.appendChild(el('div', { class: 'ragewarden-onb-sub' }, [subText]));
+            const errorBox = el('div', { class: 'ragewarden-onb-error' });
+            errorBox.style.display = 'none';
+            card.appendChild(errorBox);
+            for (const r of rest) if (r) card.appendChild(r);
+            const first = card.querySelector('.ragewarden-onb-primary') || card.querySelector('button');
+            if (first) first.focus();
+            return (msg) => { errorBox.textContent = msg; errorBox.style.display = 'block'; };
+        }
+
+        let step = 1;
+        const stepLabel = () => `Step ${step} of 3`;
+
+        function busy(buttons, on) { for (const b of buttons) b.disabled = on; }
+
+        function passkeyStep() {
+            step = 1;
+            const create = el('button', { class: 'ragewarden-onb-btn ragewarden-onb-primary' }, ['Create passkey']);
+            const skip = el('button', { class: 'ragewarden-onb-btn ragewarden-onb-secondary' }, ['Skip for now']);
+            const showError = screen('Set up Ragewarden protection',
+                'Enrol a passkey so each individual credential reveal requires a hardware tap. '
+                + 'Your browser will save the passkey wherever it normally does -- Touch ID, '
+                + 'Windows Hello, a security key, or your phone.',
+                el('div', { class: 'ragewarden-onb-row' }, [create, skip]));
+            skip.addEventListener('click', unprotectedStep);
+            create.addEventListener('click', async () => {
+                busy([create, skip], true);
+                try {
+                    const recipient = await passkeyEnroll({ rpId, label });
+                    await savePasskeyRecipient(recipient);
+                    result.enrolled = true;
+                    result.recipient = recipient;
+                    backupStep();
+                } catch (err) {
+                    showError((err && err.message) || String(err));
+                    busy([create, skip], false);
+                }
+            });
+        }
+
+        function unprotectedStep() {
+            const back = el('button', { class: 'ragewarden-onb-btn ragewarden-onb-primary' }, ['Create a passkey']);
+            const go = el('button', { class: 'ragewarden-onb-btn ragewarden-onb-secondary' }, ['Continue unprotected']);
+            screen('Not protected yet',
+                'Without a passkey or a recovery phrase, items you save are protected only by your '
+                + 'master password. You can set protection up later in Settings -> Recipients.',
+                el('div', { class: 'ragewarden-onb-row' }, [back, go]));
+            back.addEventListener('click', passkeyStep);
+            go.addEventListener('click', finish);
+        }
+
+        function backupStep() {
+            step = 2;
+            const add = el('button', { class: 'ragewarden-onb-btn ragewarden-onb-primary' }, ['Add a backup passkey']);
+            const skip = el('button', { class: 'ragewarden-onb-btn ragewarden-onb-secondary' }, ['Skip']);
+            const showError = screen('Add a backup passkey',
+                'Use a second authenticator -- another security key or your phone. If you skip this, '
+                + 'you will write down a recovery phrase instead, so losing one device never locks you out.',
+                el('div', { class: 'ragewarden-onb-row' }, [add, skip]));
+            skip.addEventListener('click', () => recoveryStep(true));
+            add.addEventListener('click', async () => {
+                busy([add, skip], true);
+                try {
+                    await enrollBackupPasskey({ rpId, label: 'Backup passkey' });
+                    result.backup = true;
+                    recoveryStep(false);
+                } catch (err) {
+                    showError((err && err.message) || String(err));
+                    busy([add, skip], false);
+                }
+            });
+        }
+
+        async function recoveryStep(mandatory) {
+            step = 3;
+            if (!mandatory) {
+                const write = el('button', { class: 'ragewarden-onb-btn ragewarden-onb-primary' }, ['Write down a phrase']);
+                const done = el('button', { class: 'ragewarden-onb-btn ragewarden-onb-secondary' }, ['Finish']);
+                screen('Paper recovery (optional)',
+                    'Two passkeys are enrolled. A recovery phrase on paper also opens your items '
+                    + 'if both devices are lost.',
+                    el('div', { class: 'ragewarden-onb-row' }, [write, done]));
+                write.addEventListener('click', () => phraseStep(false));
+                done.addEventListener('click', finish);
+                return;
+            }
+            phraseStep(true);
+        }
+
+        async function phraseStep(mandatory) {
+            let gen;
+            try {
+                gen = await generateRecovery();
+            } catch (err) {
+                const retry = el('button', { class: 'ragewarden-onb-btn ragewarden-onb-primary' }, ['Try again']);
+                const showError = screen('Paper recovery', 'The recovery phrase could not be generated.',
+                    el('div', { class: 'ragewarden-onb-row' }, [retry]));
+                showError((err && err.message) || String(err));
+                retry.addEventListener('click', () => phraseStep(mandatory));
+                return;
+            }
+            const words = gen.phrase.trim().split(/\s+/);
+            const grid = el('ol', { class: 'ragewarden-onb-phrase' },
+                words.map(w => el('li', {}, [el('span', { class: 'ragewarden-onb-word' }, [w])])));
+            const idx = pickWordIndices(words.length, Math.min(PICK_WORDS, words.length));
+            const inputs = idx.map(() => el('input', { type: 'text', autocomplete: 'off', spellcheck: 'false' }));
+            const fields = idx.map((i, n) => el('label', { class: 'ragewarden-onb-field' }, [
+                el('span', {}, [`Word ${i + 1}`]), inputs[n]]));
+            const confirm = el('button', { class: 'ragewarden-onb-btn ragewarden-onb-primary' }, ['I have written it down']);
+            const back = mandatory
+                ? el('button', { class: 'ragewarden-onb-btn ragewarden-onb-secondary' }, ['Back'])
+                : el('button', { class: 'ragewarden-onb-btn ragewarden-onb-secondary' }, ['Skip']);
+            const showError = screen(mandatory ? 'Write down your recovery phrase' : 'Paper recovery',
+                'Write these words on paper. Do not copy, photograph or type them anywhere else. '
+                + 'They are published only after you confirm three of them.',
+                grid, ...fields, el('div', { class: 'ragewarden-onb-row' }, [confirm, back]));
+            back.addEventListener('click', mandatory ? backupStep : finish);
+            confirm.addEventListener('click', async () => {
+                const wrong = idx.filter((i, n) => inputs[n].value.trim().toLowerCase() !== words[i].toLowerCase());
+                if (wrong.length > 0) {
+                    showError(`Word ${wrong.map(i => i + 1).join(', ')} does not match.`);
+                    return;
+                }
+                busy([confirm, back], true);
+                try {
+                    await publishRecovery(gen.armoredPubkey, 'Paper recovery');
+                    result.recovery = true;
+                    finish();
+                } catch (err) {
+                    showError((err && err.message) || String(err));
+                    busy([confirm, back], false);
+                }
+            });
+        }
+
+        passkeyStep();
     });
 }
 
@@ -195,7 +341,7 @@ export function showOnboarding({ wasmLogin, wasmRegister, defaultServerUrl = 'ht
                 }
             });
         }
-        const toggleLink = el('a', {});
+        const toggleLink = el('button', { type: 'button', class: 'ragewarden-onb-link' });
         const toggleRow = el('div', { class: 'ragewarden-onb-toggle' }, [
             el('span', {}, ['']),
             toggleLink,
@@ -236,16 +382,25 @@ export function showOnboarding({ wasmLogin, wasmRegister, defaultServerUrl = 'ht
                 showError('All fields are required.');
                 return;
             }
+            const permission = requestServerPermission(serverUrl);
             errorBox.style.display = 'none';
             submitBtn.disabled = true;
             try {
+                await permission;
                 if (mode === 'register') {
                     await wasmRegister(serverUrl, email, name || email, password, 600000);
                 }
-                const session = await wasmLogin(
-                    serverUrl, email, password,
-                    'ragemanifest@' + (navigator.userAgent.split(' ')[0] || 'browser'),
-                );
+                const device = 'ragemanifest@' + (navigator.userAgent.split(' ')[0] || 'browser');
+                let session;
+                try {
+                    session = await wasmLogin(serverUrl, email, password, device);
+                } catch (err) {
+                    if (!err || err.code !== 'legacy_kdf_needs_consent') throw err;
+                    if (!await confirmLegacyKdf(err.got, err.min)) {
+                        throw new Error('sign-in cancelled: the account still uses its old key derivation');
+                    }
+                    session = await wasmLogin(serverUrl, email, password, device, { allowLegacyKdf: true });
+                }
                 cleanup();
                 resolve(session);
             } catch (err) {
@@ -257,6 +412,34 @@ export function showOnboarding({ wasmLogin, wasmRegister, defaultServerUrl = 'ht
         function showError(msg) {
             errorBox.textContent = msg;
             errorBox.style.display = 'block';
+        }
+
+        /*
+         * An account created with an old PBKDF2 count. Consent signs in once with
+         * it and immediately re-derives the master key at today's count on the
+         * server; other Bitwarden clients of the account then sign in again.
+         */
+        function confirmLegacyKdf(got, min) {
+            return new Promise((done) => {
+                const box = el('div', { class: 'ragewarden-onb-consent', role: 'alertdialog',
+                    'aria-labelledby': 'ragewarden-kdf-title' }, [
+                    el('h2', { id: 'ragewarden-kdf-title' }, ['Upgrade this account\'s key derivation?']),
+                    el('div', { class: 'ragewarden-onb-sub' }, [
+                        `This account derives its key with ${Number(got).toLocaleString('en')} PBKDF2 `
+                        + `iterations; Ragewarden needs at least ${Number(min).toLocaleString('en')}. `
+                        + 'Signing in now upgrades it on the server. Your other Bitwarden apps will ask '
+                        + 'you to sign in again.',
+                    ]),
+                ]);
+                const yes = el('button', { class: 'ragewarden-onb-btn ragewarden-onb-primary' }, ['Upgrade and sign in']);
+                const no = el('button', { class: 'ragewarden-onb-btn ragewarden-onb-secondary' }, ['Cancel']);
+                box.appendChild(el('div', { class: 'ragewarden-onb-row' }, [yes, no]));
+                card.appendChild(box);
+                yes.focus();
+                const finish = (v) => { box.remove(); done(v); };
+                yes.addEventListener('click', () => finish(true));
+                no.addEventListener('click', () => finish(false));
+            });
         }
 
         card.appendChild(title);

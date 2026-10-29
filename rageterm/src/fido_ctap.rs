@@ -18,7 +18,7 @@ use ctap_hid_fido2::{Cfg, FidoKeyHid, FidoKeyHidFactory};
 use rand::Rng;
 
 use crate::ceremony;
-use crate::fido::{Fido2Device, FidoError};
+use crate::fido::{AssertionSignature, Fido2Device, FidoError, NewCredential};
 
 pub struct CtapDevice {
     key: FidoKeyHid,
@@ -51,15 +51,31 @@ pub struct CtapDevice {
 ///     box; the virtual CanoKey in tests/ragewarden-canokey.nix, which found
 ///     this) -- absence is the only correct encoding.
 ///
-/// Corollary, asserted in the VM test: enabling a PIN on an already-enrolled
-/// authenticator moves later assertions from the second seed to the first,
-/// so items wrapped before the PIN stop opening. Re-enroll and rotate after
-/// changing a key's PIN or biometric configuration.
+/// The seed an item is wrapped to is fixed at enrollment and recorded
+/// (`IdentityKind::Fido2HmacSecret::uv`), so `seed_plan` keeps asking for it
+/// after the authenticator's PIN or biometric configuration changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verification {
     BuiltInUv,
     Pin,
     PossessionOnly,
+}
+
+/// Which verification to request for a credential bound to seed `uv` on an
+/// authenticator currently configured as `current`. A possession-only
+/// credential keeps asking for the possession-only seed after a PIN is set; a
+/// verified one cannot be opened once the authenticator stops verifying.
+pub fn seed_plan(uv: Option<bool>, current: Verification) -> Result<Verification, FidoError> {
+    match (uv, current) {
+        (None, plan) => Ok(plan),
+        (Some(false), _) => Ok(Verification::PossessionOnly),
+        (Some(true), Verification::PossessionOnly) => Err(FidoError::Hardware(
+            "this credential was enrolled with a PIN or biometric, and the authenticator \
+             no longer has one configured; restore it to open these items"
+                .into(),
+        )),
+        (Some(true), plan) => Ok(plan),
+    }
 }
 
 /// Pure so the arm selection is unit-testable without a device.
@@ -97,8 +113,6 @@ impl CtapDevice {
         if let Some(v) = self.verification {
             return Ok(v);
         }
-        // One getInfo, scanned locally: enable_info_option() would issue a
-        // fresh USB round trip per option.
         let info = self.key.get_info().map_err(|e| classify(&e.to_string()))?;
         let opt = |name: &str| {
             info.options
@@ -115,19 +129,22 @@ impl CtapDevice {
         if let Some(pin) = &self.pin {
             return Ok(pin.clone());
         }
-        use std::io::IsTerminal;
-        if !std::io::stdin().is_terminal() {
-            return Err(FidoError::NoPinPrompt);
-        }
-        ceremony::announce_step("this authenticator requires its FIDO2 PIN");
-        let pin = rpassword::prompt_password("FIDO2 PIN: ").map_err(FidoError::Io)?;
-        self.pin = Some(pin.clone());
-        Ok(pin)
+        let description = match ceremony::current() {
+            Some(c) => format!("{c}\nThis authenticator requires its FIDO2 PIN."),
+            None => "This authenticator requires its FIDO2 PIN.".to_string(),
+        };
+        let pin = crate::pin::read_pin("FIDO2 PIN: ", &description).map_err(|e| match e {
+            crate::pin::PinError::NoPinSource => FidoError::NoPinPrompt,
+            crate::pin::PinError::Io(io) => FidoError::Io(io),
+            other => FidoError::Pin(other.to_string()),
+        })?;
+        self.pin = Some(pin.to_string());
+        Ok(pin.to_string())
     }
 }
 
 impl Fido2Device for CtapDevice {
-    fn make_hmac_credential(&mut self, rp_id: &str) -> Result<Vec<u8>, FidoError> {
+    fn make_hmac_credential(&mut self, rp_id: &str) -> Result<NewCredential, FidoError> {
         let mut challenge = [0u8; 32];
         rand::rng().fill_bytes(&mut challenge);
         let extensions = vec![CredentialExtension::HmacSecret(Some(true))];
@@ -137,18 +154,9 @@ impl Fido2Device for CtapDevice {
             "Creating the hmac-secret credential this vault will be wrapped to",
         );
 
-        // Which verification to request -- and so which CredRandom the vault
-        // binds to -- is the `verification_plan` doc comment's subject; the
-        // short version is that both getting it wrong ways are silent
-        // (possession-only secrets, or CTAP2_ERR_INVALID_OPTION on keys with
-        // nothing to verify), so it is decided from getInfo, not defaulted.
         let plan = self.verification()?;
         let mut pin: Option<String> = None;
         loop {
-            // A set client PIN must be collected UP FRONT: only makeCredential
-            // ever demands one on its own, and by the time an assertion is
-            // being requested a PIN-less attempt would not fail -- it would
-            // succeed against the wrong seed.
             if pin.is_none() && plan == Verification::Pin {
                 pin = Some(self.prompt_pin()?);
             }
@@ -157,7 +165,6 @@ impl Fido2Device for CtapDevice {
                     MakeCredentialArgsBuilder::new(rp_id, &challenge).extensions(&extensions);
                 builder = match (pin.as_deref(), plan) {
                     (Some(p), _) => builder.pin(p),
-                    // Builder default is uv: Some(true) -- kept, deliberately.
                     (None, Verification::BuiltInUv) => builder,
                     (None, _) => builder.without_pin_and_uv(),
                 };
@@ -173,7 +180,10 @@ impl Fido2Device for CtapDevice {
                     {
                         return Err(FidoError::NoHmacSecret);
                     }
-                    return Ok(att.credential_descriptor.id);
+                    return Ok(NewCredential {
+                        id: att.credential_descriptor.id,
+                        public_key: es256_point(&att.credential_publickey.der),
+                    });
                 }
                 Err(e) => {
                     let classified = classify(&e.to_string());
@@ -187,30 +197,75 @@ impl Fido2Device for CtapDevice {
         }
     }
 
+    fn sign_assertion(
+        &mut self,
+        rp_id: &str,
+        credential_id: &[u8],
+        client_data: &[u8],
+        user_presence: bool,
+    ) -> Result<AssertionSignature, FidoError> {
+        if user_presence {
+            ceremony::announce_touch(
+                &self.describe(),
+                "Reading this credential's public key from its signature",
+            );
+        }
+        let mut builder = GetAssertionArgsBuilder::new(rp_id, client_data)
+            .credential_id(credential_id)
+            .without_pin_and_uv();
+        if !user_presence {
+            builder = builder.without_up();
+        }
+        let assertions = self
+            .key
+            .get_assertion_with_args(&builder.build())
+            .map_err(|e| classify(&e.to_string()))?;
+        let a = assertions
+            .first()
+            .ok_or_else(|| FidoError::Hardware("empty assertion list".into()))?;
+        Ok(AssertionSignature {
+            authenticator_data: a.auth_data.clone(),
+            signature_der: a.signature.clone(),
+        })
+    }
+
+    fn verifies_users(&mut self) -> Result<bool, FidoError> {
+        Ok(self.verification()? != Verification::PossessionOnly)
+    }
+
     fn hmac_secret(
         &mut self,
         rp_id: &str,
         credential_id: &[u8],
         salt: &[u8; 32],
-    ) -> Result<[u8; 32], FidoError> {
-        let mut challenge = [0u8; 32];
-        rand::rng().fill_bytes(&mut challenge);
+        uv: Option<bool>,
+        client_data: Option<&[u8]>,
+    ) -> Result<crate::fido::HmacAssertion, FidoError> {
+        let mut random = [0u8; 32];
+        rand::rng().fill_bytes(&mut random);
+        let challenge = client_data.unwrap_or(&random[..]);
         let extensions = vec![AssertionExtension::HmacSecret(Some(*salt))];
+
+        let current = self.verification()?;
+        let plan = seed_plan(uv, current)?;
+        if uv == Some(false) && current != Verification::PossessionOnly {
+            ceremony::announce_step(
+                "this credential was enrolled before the authenticator had a PIN or \
+                 biometric, so its items open with a touch alone. Run `rageterm \
+                 enroll-fido2` again and `rageterm reencrypt --all` to put them behind \
+                 the PIN.",
+            );
+        }
 
         ceremony::announce_touch(&self.describe(), "Unwrapping this credential");
 
-        // Same rule as make_hmac_credential, and it matters MORE here: a
-        // PIN-less getAssertion against a PIN-set key succeeds with UV=0 and
-        // hands back the possession-only CredRandom's output -- a wrong-secret
-        // path, not an error path. See `verification_plan`.
-        let plan = self.verification()?;
         let mut pin: Option<String> = None;
         loop {
             if pin.is_none() && plan == Verification::Pin {
                 pin = Some(self.prompt_pin()?);
             }
             let args = {
-                let mut builder = GetAssertionArgsBuilder::new(rp_id, &challenge)
+                let mut builder = GetAssertionArgsBuilder::new(rp_id, challenge)
                     .credential_id(credential_id)
                     .extensions(&extensions);
                 builder = match (pin.as_deref(), plan) {
@@ -223,12 +278,18 @@ impl Fido2Device for CtapDevice {
             let assertion = self.key.get_assertion_with_args(&args);
             match assertion {
                 Ok(assertions) => {
-                    // One credential id was supplied, so the first assertion is
-                    // the only one (allowList form of getAssertion).
                     let a = assertions
                         .first()
                         .ok_or_else(|| FidoError::Hardware("empty assertion list".into()))?;
-                    return extract_hmac_output(&a.extensions);
+                    return Ok(crate::fido::HmacAssertion {
+                        prf: extract_hmac_output(&a.extensions)?,
+                        user_present: a.flags.user_present_result,
+                        user_verified: a.flags.user_verified_result,
+                        signed: AssertionSignature {
+                            authenticator_data: a.auth_data.clone(),
+                            signature_der: a.signature.clone(),
+                        },
+                    });
                 }
                 Err(e) => {
                     let classified = classify(&e.to_string());
@@ -298,6 +359,14 @@ pub fn classify(message: &str) -> FidoError {
     FidoError::Hardware(message.to_string())
 }
 
+/// An ES256 credential key as ctap-hid-fido2 hands it over (`0x04 || X || Y`,
+/// which it calls `der`); any other algorithm's key is `None`.
+fn es256_point(raw: &[u8]) -> Option<[u8; 65]> {
+    let point: [u8; 65] = raw.try_into().ok()?;
+    p256::PublicKey::from_sec1_bytes(&point).ok()?;
+    Some(point)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,28 +397,44 @@ mod tests {
 
     #[test]
     fn classify_falls_through_to_hardware_for_unknown_text() {
-        assert!(matches!(classify("hid write failed"), FidoError::Hardware(_)));
+        assert!(matches!(
+            classify("hid write failed"),
+            FidoError::Hardware(_)
+        ));
+    }
+
+    #[test]
+    fn a_possession_only_credential_keeps_its_seed_after_a_pin_is_set() {
+        assert_eq!(
+            seed_plan(Some(false), Verification::Pin).unwrap(),
+            Verification::PossessionOnly
+        );
+        assert_eq!(
+            seed_plan(Some(true), Verification::Pin).unwrap(),
+            Verification::Pin
+        );
+        assert_eq!(
+            seed_plan(None, Verification::Pin).unwrap(),
+            Verification::Pin
+        );
+        assert!(seed_plan(Some(true), Verification::PossessionOnly).is_err());
     }
 
     #[test]
     fn verification_plan_asks_for_the_strongest_verification_the_device_has() {
-        // Built-in UV wins even when a PIN is also set: the authenticator
-        // verifies the user itself and no PIN needs typing.
         assert_eq!(verification_plan(true, true), Verification::BuiltInUv);
         assert_eq!(verification_plan(false, true), Verification::BuiltInUv);
-        // A set PIN MUST be requested up front -- getAssertion would not ask.
         assert_eq!(verification_plan(true, false), Verification::Pin);
-        // And a device with nothing to verify must be asked for nothing:
-        // uv=true here is CTAP2_ERR_INVALID_OPTION, the bug the virtual
-        // CanoKey found on first contact.
-        assert_eq!(verification_plan(false, false), Verification::PossessionOnly);
+        assert_eq!(
+            verification_plan(false, false),
+            Verification::PossessionOnly
+        );
     }
 
     #[test]
     fn extract_hmac_output_finds_the_extension_and_rejects_its_absence() {
         let out = [7u8; 32];
-        let found =
-            extract_hmac_output(&[AssertionExtension::HmacSecret(Some(out))]).unwrap();
+        let found = extract_hmac_output(&[AssertionExtension::HmacSecret(Some(out))]).unwrap();
         assert_eq!(found, out);
 
         assert!(matches!(

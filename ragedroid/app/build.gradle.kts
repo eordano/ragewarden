@@ -1,8 +1,8 @@
 import org.gradle.api.tasks.Exec
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.ksp)
@@ -109,15 +109,15 @@ val ragedroidVersionName: String = providers.environmentVariable(versionNameEnv)
 
 android {
     namespace = "ragewarden.ragedroid"
-    compileSdk = 36
+    compileSdk = 37
 
-    // Must be stated. Left unset, AGP 8.13 falls back to *its* default (35.0.0) and then
+    // Must be stated. Left unset, AGP falls back to *its* default build-tools and then
     // tries to download it -- which on NixOS means writing into the read-only nix store
     // and a "Failed to install the following SDK components" failure before a single
     // source file compiles. The version has to be one the toolchain actually ships:
     // devshells/android.nix installs exactly this one and points the aapt2 override at
     // the same directory, so changing it here means changing it there too.
-    buildToolsVersion = "36.0.0"
+    buildToolsVersion = "37.0.0"
 
     defaultConfig {
         applicationId = "ragewarden.ragedroid"
@@ -127,22 +127,30 @@ android {
         // `-fdroid` versionNameSuffix to whatever lands here.
         versionCode = ragedroidVersionCode
         versionName = ragedroidVersionName
+        buildConfigField("String", "YUBIKIT_VERSION", "\"${libs.versions.yubikit.get()}\"")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // ragewarden.ragedroid.journey.JourneyTest cannot run on its own: it hard-requires
-        // the journeyServer/journeyEmail/journeyPassword instrumentation arguments, and the
-        // Vaultwarden, the registered account and the `adb reverse` that make them mean
-        // anything are set up by tests/journey/run.sh. Without them the test throws, and a
-        // plain `gradle connectedAndroidTest` -- the documented command -- goes red for a
-        // reason that has nothing to do with the app. Filter the journey package out of
-        // exactly those runs. run.sh passes the arguments, so its run is unfiltered and the
-        // test is neither weakened nor skipped where it can actually execute.
-        val journeyDriven = providers
-            .gradleProperty("android.testInstrumentationRunnerArguments.journeyServer")
+        // The journey package (JourneyTest, DeliveryFlowsTest) and the registry package
+        // (RegistryPushInstrumentedTest) cannot run on their own: they need the
+        // journeyServer/... or registryServer/... instrumentation arguments, and the
+        // Vaultwarden, the accounts and the `adb reverse` that make them mean anything are
+        // set up by tests/journey/run.sh. Without them the journey tests throw and the
+        // registry test trips its assumption, which AGP's result XML records as a failure
+        // under a green build. Filter each package out of exactly the runs that lack its
+        // arguments. run.sh passes them, so its runs are unfiltered and the tests are
+        // neither weakened nor skipped where they can actually execute. One value per
+        // filter key: with the two packages comma-joined into notPackage, the unfiltered
+        // run reached the device as `-e notPackage ragewarden.ragedroid.journey` and still
+        // ran the registry test.
+        fun driven(arg: String) = providers
+            .gradleProperty("android.testInstrumentationRunnerArguments.$arg")
             .isPresent
-        if (!journeyDriven) {
+        if (!driven("journeyServer")) {
             testInstrumentationRunnerArguments["notPackage"] = "ragewarden.ragedroid.journey"
+        }
+        if (!driven("registryServer")) {
+            testInstrumentationRunnerArguments["notClass"] = "ragewarden.ragedroid.registry.RegistryPushInstrumentedTest"
         }
 
         ndk {
@@ -176,7 +184,8 @@ android {
             // folds to `false` and no simulated authenticator can be switched on at
             // runtime in a shipped APK (see identities/MockHardware.kt).
             buildConfigField("boolean", "MOCK_HARDWARE_ALLOWED", "false")
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -189,6 +198,7 @@ android {
         debug {
             buildConfigField("boolean", "MOCK_HARDWARE_ALLOWED", "true")
             isMinifyEnabled = false
+            isPseudoLocalesEnabled = true
         }
         create("benchmark") {
             // initWith copies release's buildConfigFields, so MOCK_HARDWARE_ALLOWED
@@ -218,22 +228,18 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
-
     buildFeatures {
         compose = true
         // Required for MOCK_HARDWARE_ALLOWED above.
         buildConfig = true
     }
 
-    sourceSets["main"].kotlin.srcDirs("src/main/kotlin")
-    sourceSets["test"].kotlin.srcDirs("src/test/kotlin")
-    sourceSets["androidTest"].kotlin.srcDirs("src/androidTest/kotlin")
-    sourceSets["main"].jniLibs.srcDirs("src/main/jniLibs")
-    sourceSets["standard"].kotlin.srcDirs("src/standard/kotlin")
-    sourceSets["fdroid"].kotlin.srcDirs("src/fdroid/kotlin")
+    sourceSets["main"].kotlin.directories += "src/main/kotlin"
+    sourceSets["test"].kotlin.directories += "src/test/kotlin"
+    sourceSets["androidTest"].kotlin.directories += "src/androidTest/kotlin"
+    sourceSets["main"].jniLibs.directories += "src/main/jniLibs"
+    sourceSets["standard"].kotlin.directories += "src/standard/kotlin"
+    sourceSets["fdroid"].kotlin.directories += "src/fdroid/kotlin"
 
     packaging {
         resources {
@@ -245,10 +251,14 @@ android {
         unitTests {
             isIncludeAndroidResources = true
             isReturnDefaultValues = true
+            // Robolectric 4.17's FileDescriptor interceptor reaches into
+            // jdk.internal.access.SharedSecrets; without the export every test that
+            // touches a file fails in setUpApplicationState with IllegalAccessException.
+            all { it.jvmArgs("--add-exports=java.base/jdk.internal.access=ALL-UNNAMED") }
         }
         managedDevices {
-            devices {
-                create<com.android.build.api.dsl.ManagedVirtualDevice>("pixel6Api34") {
+            localDevices {
+                create("pixel6Api34") {
                     device = "Pixel 6"
                     apiLevel = 34
                     systemImageSource = "aosp"
@@ -257,10 +267,21 @@ android {
         }
         animationsDisabled = true
     }
+}
 
-    applicationVariants.all {
-        val variantName = name.replaceFirstChar { it.uppercase() }
-        tasks.named("merge${variantName}JniLibFolders").configure {
+androidComponents {
+    // The baselineprofile plugin adds nonMinifiedRelease and benchmarkRelease as copies of
+    // release, signing config included. They only ever run on a test device, like the
+    // debug-signed benchmark type above; with no release keystore, generateBaselineProfile
+    // stopped in validateSigningFdroidNonMinifiedRelease. Release itself is untouched.
+    finalizeDsl { ext ->
+        ext.buildTypes.matching { it.name == "nonMinifiedRelease" || it.name == "benchmarkRelease" }.configureEach {
+            signingConfig = ext.signingConfigs.getByName("debug")
+        }
+    }
+    onVariants { variant ->
+        val variantName = variant.name.replaceFirstChar { it.uppercase() }
+        tasks.matching { it.name == "merge${variantName}JniLibFolders" }.configureEach {
             dependsOn(tasks.named("cargoNdkBuild"))
         }
         // Packaging a release APK with no signing material must fail rather than silently
@@ -268,11 +289,17 @@ android {
         // signed. The check hangs off the per-variant package task instead of the
         // configuration block above so that `assembleDebug`, the benchmark variant, unit
         // tests and IDE syncs all keep working with an empty environment.
-        if (buildType.name == "release" && !unsignedBuild) {
-            tasks.named("package$variantName").configure {
+        if (variant.buildType == "release" && !unsignedBuild) {
+            tasks.matching { it.name == "package$variantName" }.configureEach {
                 dependsOn(tasks.named("requireReleaseSigning"))
             }
         }
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_17)
     }
 }
 
@@ -284,6 +311,7 @@ baselineProfile {
 
 dependencies {
     implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.autofill)
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.lifecycle.runtime.compose)
@@ -313,6 +341,7 @@ dependencies {
     implementation(libs.yubikit.android)
     implementation(libs.yubikit.piv)
     implementation(libs.zxing.android.embedded)
+    implementation(libs.guava)
     implementation(libs.hilt.android)
     implementation(libs.androidx.hilt.navigation.compose)
     ksp(libs.hilt.compiler)
@@ -373,7 +402,7 @@ tasks.register<Exec>("cargoNdkBuild") {
         "-t", "arm64-v8a",
         "-t", "x86_64",
         "build",
-        "--release",
+        "--profile", "android",
         "-p", "ragedroid-jni"
     )
 

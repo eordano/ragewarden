@@ -90,10 +90,6 @@ export async function savePasskeyRecipient(record) {
     await writeJson(next);
 }
 
-export async function clearPasskeyRecipient() {
-    await clearJson();
-}
-
 export async function loadSoftwareIdentity() {
     return readKey(SOFTWARE_KEY);
 }
@@ -105,8 +101,4 @@ export async function saveSoftwareIdentity(record) {
         throw new Error('software identity record missing fields');
     }
     await writeKey(SOFTWARE_KEY, record);
-}
-
-export async function clearSoftwareIdentity() {
-    await clearKey(SOFTWARE_KEY);
 }

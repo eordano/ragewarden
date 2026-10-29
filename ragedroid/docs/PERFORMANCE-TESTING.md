@@ -17,18 +17,16 @@ they exist because the obvious approach silently produced wrong numbers.
 Always measure before and after. Never claim a perf change without numbers, and
 never claim numbers without acknowledging the noise floor.
 
----
-
 ## Tooling
 
-* **`androidx.benchmark.macro`** -- drives the app via UIAutomator, captures
+* `androidx.benchmark.macro` -- drives the app via UIAutomator, captures
   `FrameTimingMetric` (per-frame durations + over-budget overruns),
   `StartupTimingMetric` (cold/warm start), and `TraceSectionMetric`
   (custom-named sections you instrument with `androidx.tracing`).
-* **`:baselineprofile` Gradle module** -- already configured. Holds
+* `:baselineprofile` Gradle module -- already configured. Holds
   `Macrobenchmark.kt` (bench tests) and `BaselineProfileGenerator.kt`
   (AOT-profile capture, separate concern).
-* **`androidx.tracing-ktx`** -- the in-app side: `trace("section.name") { ... }`
+* `androidx.tracing-ktx` -- the in-app side: `trace("section.name") { ... }`
   emits ATrace markers that perfetto picks up and `TraceSectionMetric` reads.
 
 The bench requires a `benchmark` build type on `:app` with
@@ -36,30 +34,36 @@ The bench requires a `benchmark` build type on `:app` with
 Don't try to bench the regular `release` build -- without `profileable` you'll
 get "ERRORS (not suppressed): PROFILEABLE".
 
----
-
 ## Step 1 -- get a baseline
 
+The bench needs a signed-in vault with an unprotected login in it, so it runs
+against the journey's throwaway Vaultwarden account. The journey seeds that
+item ("Flow login", from `DeliveryFlowsTest`) and, with `JOURNEY_BENCH=1`,
+runs the macrobenchmark and the baseline-profile generator against it:
+
 ```bash
-export ANDROID_HOME=/opt/homebrew/share/android-commandlinetools
-export ANDROID_SDK_ROOT=$ANDROID_HOME
-export ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865
-export ANDROID_NDK_ROOT=$ANDROID_NDK_HOME
-export PATH=$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:~/.cargo/bin:$PATH
+nix develop <nixos-config>#android             # SDK, NDK 26.3.11579264, gradle 9.7.1, adb, emulator
+ragedroid-avd && (ragedroid-emulator &) && ragedroid-wait-boot
 export ANDROID_SERIAL=emulator-5554
 export ADB_MDNS=0          # see "emulator gotchas" below
 
-cd ragedroid
-./gradlew :baselineprofile:connectedStandardBenchmarkBenchmarkAndroidTest \
-  -Pandroid.testInstrumentationRunnerArguments.class=ragewarden.ragedroid.baselineprofile.Macrobenchmark \
-  -Pandroid.testInstrumentationRunnerArguments.androidx.benchmark.suppressErrors=EMULATOR \
-  > /tmp/bench-before.log 2>&1
+JOURNEY_BENCH=1 tests/journey/run.sh
 ```
+
+It fails if any of the four benches recorded no samples, and copies
+`benchmarkData.json` and `bench-summary.txt` into the journey's output
+directory. The bench reads its account from the `benchServer`, `benchEmail`,
+`benchPassword` and `benchItem` instrumentation arguments (`BenchVault.kt`);
+each flavour of `:baselineprofile` names its target app as `benchPackage`.
+The benches are `:baselineprofile:connectedFdroidBenchmarkBenchmarkAndroidTest`
+and the profile is `:app:generateBaselineProfile` (merged into
+`app/src/main/generated/baselineProfiles/`); the full invocations are in
+`run.sh`.
 
 Result lands at:
 
 ```
-ragedroid/baselineprofile/build/outputs/connected_android_test_additional_output/standardBenchmarkBenchmark/connected/<device>/ragewarden.ragedroid.baselineprofile-benchmarkData.json
+ragedroid/baselineprofile/build/outputs/connected_android_test_additional_output/<variant>/connected/<device>/ragewarden.ragedroid.baselineprofile-benchmarkData.json
 ```
 
 Save that JSON aside (`cp .../*-benchmarkData.json /tmp/bench-before.json`)
@@ -77,22 +81,20 @@ before iterating -- gradle overwrites it on the next run.
 To compute percentiles cleanly, flatten `sampledMetrics`'s nested arrays into
 one big list before taking p50/p75/p90/p95.
 
----
-
 ## Step 2 -- apply ONE change at a time
 
 Multiple changes in flight = you can't tell which one moved the number.
 Commit between changes so the working tree always matches a runnable state.
 
 The kinds of changes that show up in macrobench:
-* **moves work off Main** (sync->async, JNI on `Dispatchers.IO`, TOTP loop
+* moves work off Main (sync->async, JNI on `Dispatchers.IO`, TOTP loop
   off the Compose frame clock) -- visible in `frameDurationCpuMs` /
   `frameOverrunMs` percentiles, especially the tail.
-* **caches a redundant op** (in-flight `Deferred` for repeated
+* caches a redundant op (in-flight `Deferred` for repeated
   `fetchVault`, snapshot dedup against the last response bytes) -- visible
   in `TraceSectionMetric` count and sum if the section is on the cached
   path.
-* **changes UI structure** (replacing `Column.fillMaxSize` with
+* changes UI structure (replacing `Column.fillMaxSize` with
   `LazyColumn`, hoisting state out of composition) -- visible in
   `frameDurationCpuMs` and recomposition tracing.
 
@@ -102,11 +104,9 @@ The kinds that don't show up:
 * changes to a code path the bench doesn't traverse -- see "selectors that
   actually work" below.
 
----
-
 ## Step 3 -- capture new numbers
 
-Run the same command. **Make sure the device state is the same**:
+Run the same command. Make sure the device state is the same:
 * same emulator, same AVD, same API level.
 * no other heavy process on the host (browser tabs, Slack notifications all
   add to host-CPU contention which the emulator inherits).
@@ -118,21 +118,16 @@ of `git checkout -- file`:
 
 ```bash
 git worktree add /tmp/ragewarden-before <baseline-commit-sha>
-# copy build files that aren't tracked (gradlew, wrapper jar)
-cp ragedroid/gradlew /tmp/ragewarden-before/ragedroid/gradlew
-cp ragedroid/gradle/wrapper/gradle-wrapper.jar /tmp/ragewarden-before/ragedroid/gradle/wrapper/
 # also copy the bench code if you've added new tests since the baseline
 cp ragedroid/baselineprofile/src/main/kotlin/.../Macrobenchmark.kt \
    /tmp/ragewarden-before/ragedroid/baselineprofile/src/main/kotlin/.../Macrobenchmark.kt
 # now run the bench from the worktree without disturbing your main checkout
-cd /tmp/ragewarden-before/ragedroid && ./gradlew ...
+cd /tmp/ragewarden-before/ragedroid && gradle ...
 git worktree remove /tmp/ragewarden-before --force
 ```
 
 Worktrees mean your main checkout is unaffected -- never `git checkout HEAD~5
 -- file` on a working tree the user might be editing.
-
----
 
 ## Step 4 -- compare percentile by percentile
 
@@ -159,8 +154,6 @@ For sampled metrics, flatten across iterations first:
   touched detail-screen code) shifting by 5-10%: that's your noise floor.
   Anything else needs to clear that bar to be a real signal.
 
----
-
 ## Step 5 -- iterate or rollback
 
 Rollback is fast: `git revert <sha>` and rebuild. Don't try to "fix" a
@@ -170,36 +163,28 @@ slice.
 If a change shows a real win, commit it standalone, push the bench JSON
 into git or a pinned scratch path, and move to the next one.
 
----
-
 ## Things to be conscious of
 
-### Selectors that actually work
+### Selectors
 
-UIAutomator `By.descContains(...)` matches the Android `contentDescription`
-attribute. Compose `Text(...)` composables produce **no** content
-description by default; their text only flows through the semantic `text`
-property. Use:
+`MainActivity` sets `testTagsAsResourceId`, so a `Modifier.testTag("x")` is
+the resource id `x` to UIAutomator: `By.res("vault-list")`. The tags the bench
+uses are `vault-list`, `signin-server` / `signin-email` / `signin-password`,
+`lock-password`, `action-reveal` and `password-hide`. Compose `Text` is
+reachable with `By.text(...)`; `By.descContains(...)` matches content
+descriptions, which Compose text does not have.
 
-```kotlin
-device.findObject(By.text("Reveal"))      // correct for Compose Text
-```
+Every bench step goes through `BenchVault.find`, which fails the run when the
+selector finds nothing within 20 s. A renamed tag is a red bench, not a
+measurement of nothing.
 
-...not `By.descContains("Reveal")` -- that finds nothing and returns null,
-and your bench silently no-ops because `null?.click()` is fine.
-
-To verify a selector reaches the right node, dump the live UI and grep:
+To see what a selector can reach, dump the live UI:
 
 ```bash
 adb -s emulator-5554 shell uiautomator dump /sdcard/ui.xml
 adb -s emulator-5554 shell cat /sdcard/ui.xml > /tmp/ui.xml
-grep -oE 'text="[^"]+"' /tmp/ui.xml | sort -u
+grep -oE '(text|resource-id)="[^"]+"' /tmp/ui.xml | sort -u
 ```
-
-If multiple sibling Composables show the same text (e.g. an action button
-labeled "Reveal" and a row inside `InlineTapReveal` also labeled "Reveal
-on screen"), pick the more specific text or wrap the target with
-`Modifier.testTag(...)` and select via `By.res(packageName, "tag")`.
 
 ### Frame budgets vs. trace sections
 
@@ -223,8 +208,8 @@ If `ragewarden.<section>Count` is 0, the UI driving in your `measureBlock`
 didn't reach the instrumented code path. Common causes:
 
 * selector typo (returns null, click no-ops).
-* missing prerequisite (e.g. fresh install lands on `OnboardingScreen` --
-  see `skipOnboardingIfPresent()` in `Macrobenchmark.kt`).
+* missing prerequisite: `BenchVault.openVault` signs in, skips enrolment and
+  unlocks; a flow that starts anywhere else is not the flow you think.
 * the action gated behind a state condition that's not met (e.g.
   `IdlePasswordCard` only opens `InlineTapReveal` when `item.rage == true`).
 
@@ -246,7 +231,7 @@ code path.
 
 ### UI sloppiness vs. data correctness
 
-Macrobench measures UI smoothness. It does **not** assert that the data
+Macrobench measures UI smoothness. It does not assert that the data
 shown after a tap is correct. A bench that drives Reveal -> Authorize ->
 Hide for 3 cycles per iteration will still pass even if the password
 revealed is the wrong one. Add an Espresso/UIAutomator assertion on the
@@ -261,25 +246,21 @@ Don't chase them as a perf win unless you also touched layout.
 
 ### Emulator gotchas
 
-* **mDNS auto-connect for nearby devices**: a real Pixel on the LAN with
+* mDNS auto-connect for nearby devices: a real Pixel on the LAN with
   `wireless debugging` enabled will auto-attach to `adb`. Gradle's
   `connectedAndroidTest` runs on every connected device, so a tenth of
   your bench iteration runs on a different device with different perf.
   `export ADB_MDNS=0` before running gradle, and `adb disconnect` any
   TLS-paired devices.
-* **API 36 vs the macrobench parser**: `androidx.benchmark` 1.3.x parses
-  `dumpsys gfxinfo framestats` and silently fails on API 36 emulators
-  (returns `[]`, prints "Unable to confirm activity launch completion").
-  Pin to **1.4.1+**.
-* **`isProfileable` warning**: if you see `ERRORS (not suppressed): PROFILEABLE`,
+* `isProfileable` warning: if you see `ERRORS (not suppressed): PROFILEABLE`,
   you're benching a build type that didn't get `isProfileable = true`. Use
   `:app:assembleStandardBenchmark`, not `assembleStandardRelease`.
-* **Frame budget on emulator is fiction**: emulated GPUs render frames in
-  ~2-4x real-device time. Use the emulator for *relative* before/after
+* Frame budget on emulator is fiction: emulated GPUs render frames in
+  ~2-4x real-device time. Use the emulator for relative before/after
   deltas. Use a real device for absolute "feels snappy at p95" claims.
-* **Two consecutive runs jitter +/-5-10% on cold start** even with no code
+* Two consecutive runs jitter +/-5-10% on cold start even with no code
   change. That's your noise floor; ignore deltas inside it.
-* **Output piping**: never `gradle ... | tail -N` or pipe through `head`.
+* Output piping: never `gradle ... | tail -N` or pipe through `head`.
   When the build fails the diagnostic is 30-200 lines above the FAILURE
   banner; tail eats it. Redirect to a file: `> /tmp/bench.log 2>&1`, then
   `grep` over the file.
@@ -290,8 +271,6 @@ Connect a Pixel over USB or wireless debugging, and the same `connectedAndroidTe
 task targets it. Variance drops 2-3x immediately. Use this when the emulator's
 noise floor is masking your delta.
 
----
-
 ## Building + deploying for manual testing
 
 Sometimes you need to drive the app by hand on a real device -- to verify
@@ -299,7 +278,7 @@ correctness, check IME insets, confirm autofill works on a real form.
 
 ```bash
 # build the standard-debug APK
-./gradlew :app:assembleStandardDebug
+gradle :app:assembleStandardDebug
 
 # install on a connected device
 adb -s <serial> install -r app/build/outputs/apk/standard/debug/app-standard-debug.apk
@@ -307,9 +286,8 @@ adb -s <serial> install -r app/build/outputs/apk/standard/debug/app-standard-deb
 # launch
 adb -s <serial> shell am start -n ragewarden.ragedroid/.MainActivity
 
-# screenshot back to the host (scaled for inline display)
-adb -s <serial> exec-out screencap -p > /tmp/pixel.png
-sips -Z 540 /tmp/pixel.png --out /tmp/pixel-half.png   # macOS
+# the app's windows are FLAG_SECURE, so screencap comes back blank; dump the UI instead
+adb -s <serial> shell uiautomator dump /sdcard/ui.xml && adb -s <serial> shell cat /sdcard/ui.xml > /tmp/ui.xml
 
 # logcat for the running app
 APP_PID=$(adb -s <serial> shell pidof ragewarden.ragedroid | tr -d '\r\n')
@@ -319,8 +297,6 @@ adb -s <serial> logcat -d --pid=$APP_PID
 A standard-debug build won't be representative for perf timing -- JIT, no
 baseline profile, debuggable -- but it's exactly right for "does this UI
 work end-to-end".
-
----
 
 ## Custom trace-section conventions
 
@@ -357,36 +333,32 @@ import androidx.benchmark.macro.TraceSectionMetric
 `Mode.First` / `Mode.Min` / `Mode.Max` / `Mode.Average` are also available;
 pick the one that maps to the question you want to answer.
 
----
-
 ## Iteration count and noise
 
-* **20 iters** on emulator -- coarse, ~5-10% noise floor on aggregate
+* 20 iters on emulator -- coarse, ~5-10% noise floor on aggregate
   metrics. Fine for "is this win > 15% or not?".
-* **50 iters** on emulator -- ~3% noise floor. Most repo-resident benches
+* 50 iters on emulator -- ~3% noise floor. Most repo-resident benches
   use this.
-* **20 iters on a real device** -- typically tighter than 50 on emulator.
-* **100 iters** -- overnight run, rarely worth it unless chasing a
+* 20 iters on a real device -- typically tighter than 50 on emulator.
+* 100 iters -- overnight run, rarely worth it unless chasing a
   sub-3% claimed win.
 
 If you're not sure whether a delta is noise or signal, run the same
 benchmark twice with no code change in between. The variance you see
 between two consecutive runs of the same code IS your noise floor.
 
----
-
 ## When the numbers are mixed
 
 Sometimes a change improves p50 and worsens p95, or vice versa. Don't
 average them. Read what each percentile is telling you:
 
-* **p50 better, p95 same or worse**: typical median frame is faster but
+* p50 better, p95 same or worse: typical median frame is faster but
   the worst-case path didn't change. Often happens when a hot loop got
   faster but a rare allocation or first-frame setup didn't.
-* **p50 same, p95 better**: tail latencies tightened -- typical of moving
+* p50 same, p95 better: tail latencies tightened -- typical of moving
   blocking work off Main, removing a redundant call on a slow path, or
   capping queue size.
-* **p50 worse, p95 better**: rarer. Usually a coarser-grained fix
+* p50 worse, p95 better: rarer. Usually a coarser-grained fix
   (longer median timeslice but no extreme tails). Often acceptable for
   "feels snappy" goals -- you'd rather have many slightly slow frames
   than one frozen second.

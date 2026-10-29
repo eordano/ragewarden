@@ -1,5 +1,7 @@
 import * as wasmGlue from './crypto.js';
+import { attestationEntriesFromRegistry } from './inventory.js';
 import { unwrapWithPrf } from './passkey.js';
+import { b64ToBytes, bytesToB64 } from './b64.js';
 import { loadAllPasskeyRecipients, loadSoftwareIdentity } from './passkey-store.js';
 import { bumpCounter } from './tap-counters.js';
 import {
@@ -9,6 +11,7 @@ import {
     isUserDecline,
     performPresenceTap,
     performPrfTap,
+    performRelayPrfTap,
 } from './hardware-tap.js';
 import {
     NATIVE_ONLY_STANZA_TAGS,
@@ -120,7 +123,7 @@ function sameReceipt(a, b) {
  *     silent software unwrap wearing a hardware receipt.
  */
 async function decryptThroughNativeHost({
-    mod, session, cipher, fieldName, receipts, action, destination, origin, fallbackError,
+    mod, session, cipher, fieldName, receipts, action, destination, origin, cipherId, fallbackError,
 }) {
     const refuse = fallbackError || new Error(
         'internal: the native-host route was entered with no plaintext and no prior error',
@@ -137,7 +140,7 @@ async function decryptThroughNativeHost({
         console.warn(
             '[ragewarden] wasm module has no wasm_decrypt_cipher_field_with_native export; '
             + `${NATIVE_ONLY_STANZA_TAGS.join('/')} stanzas cannot be routed to rageterm in `
-            + 'this build (rebuild the wasm: npm run build:wasm)',
+            + 'this build (rebuild the wasm: pnpm run build:wasm)',
         );
         throw refuse;
     }
@@ -147,12 +150,14 @@ async function decryptThroughNativeHost({
         action,
         destination,
         origin,
+        cipherId,
+        attestationEntries: await attestationEntriesFromRegistry(mod, session),
         onReceipt: r => receipts.push(r),
     });
     /*
      * `asked` separates "the native route was never entered" from "the native
      * route was entered and failed". wasm refuses before calling back whenever
-     * the item carries no piv-p256/fido2-hmac stanza at all -- the common case
+     * the item carries no PIV/fido2-hmac stanza at all -- the common case
      * for an ordinary item that simply could not be opened -- and in that case
      * the user must see the error the browser's own identities produced, not a
      * message about a host that was never relevant. Once the callback HAS run,
@@ -211,13 +216,56 @@ export async function hardwareInventory() {
     return { recipients, software };
 }
 
+function normB64(b64) {
+    try { return bytesToB64(b64ToBytes(b64)); } catch { return String(b64 || ''); }
+}
+
+function stanzaSummary(mod, session, cipher, fieldName) {
+    if (typeof mod.wasm_rage_stanza_summary !== 'function') {
+        throw new Error(
+            'internal: this wasm build has no wasm_rage_stanza_summary export; rebuild the wasm',
+        );
+    }
+    return mod.wasm_rage_stanza_summary(session, cipher, fieldName);
+}
+
+/*
+ * Exactly one ceremony per unlock. The blob is inspected first (header only,
+ * nothing unwrapped) and the single tap that can open it is chosen:
+ *
+ *   - a webauthn-prf stanza for a passkey enrolled in this profile: one PRF
+ *     tap, evaluated for that stanza;
+ *   - otherwise an X25519 stanza and this profile's passkey-wrapped software
+ *     identity: one PRF tap that unwraps the identity;
+ *   - otherwise PIV (piv-x25519-v2, piv-p256) / fido2-hmac stanzas: the rageterm native host.
+ */
+async function unwrapSoftwareIdentity(software, ctx) {
+    const tap = await performPrfTap({
+        pairs: [{ credentialId: software.wrap_credential_id_b64, salt: software.wrap_salt_b64 }],
+        rpId: software.wrap_rp_id,
+        ...ctx,
+    });
+    bumpCounter('prf_eval');
+    try {
+        const secret = await unwrapWithPrf(
+            tap.prfOutput, software.wrapped_secret_iv_b64, software.wrapped_secret_ct_b64,
+        );
+        return { secret, receipt: tap.receipt };
+    } finally {
+        if (tap.prfOutput && tap.prfOutput.fill) tap.prfOutput.fill(0);
+    }
+}
+
 export async function unlockCipherField(opts) {
     const session = opts.session;
     const cipher = opts.cipher;
     const fieldName = opts.fieldName || 'password';
-    const action = opts.action || 'reveal';
-    const destination = opts.destination || '';
-    const origin = opts.origin || '';
+    const ctx = {
+        action: opts.action || 'reveal',
+        destination: opts.destination || '',
+        origin: opts.origin || '',
+        cipherId: (cipher && cipher.id) || opts.cipherId || '',
+    };
 
     if (!session) throw new Error('not signed in');
     if (!cipher) throw new Error('unknown cipher');
@@ -225,103 +273,79 @@ export async function unlockCipherField(opts) {
     const mod = await wasmGlue.init();
     const { recipients, software } = await hardwareInventory();
     const receipts = [];
+    const summary = stanzaSummary(mod, session, cipher, fieldName);
 
     let bytes;
-    if (cipher.rage) {
+    if (summary.rage) {
+        const ours = new Map(recipients.map(r => [normB64(r.credential_id_b64), r]));
+        const prfIds = (summary.prfCredentialIdsB64 || []).map(normB64);
+        const direct = prfIds.find(id => ours.has(id));
+        let browserPathError = null;
         const armoredSecrets = [];
-        if (software) {
-            try {
-                const tap = await performPrfTap({
-                    pairs: [{
-                        credentialId: software.wrap_credential_id_b64,
-                        salt: software.wrap_salt_b64,
-                    }],
-                    rpId: software.wrap_rp_id,
-                    action,
-                    destination,
-                    origin,
-                });
-                bumpCounter('prf_eval');
-                receipts.push(tap.receipt);
-                armoredSecrets.push(await unwrapWithPrf(
-                    tap.prfOutput,
-                    software.wrapped_secret_iv_b64,
-                    software.wrapped_secret_ct_b64,
-                ));
-                if (tap.prfOutput && tap.prfOutput.fill) tap.prfOutput.fill(0);
-            } catch (e) {
-                if (isUserDecline(e)) throw e;
-                console.warn('[ragewarden] software-identity unwrap failed:', e);
-            }
-        }
-
         let prfCallback = null;
-        if (recipients.length > 0) {
-            const rpId = recipients[0].rp_id;
+
+        // A phone passkey (prf-relay.js) is asked only when nothing in this
+        // browser opens the item: the software identity is tried first, in
+        // the same decrypt.
+        const phone = !direct && prfIds.length > 0 && typeof opts.relayCredentials === 'function'
+            ? (await opts.relayCredentials()).filter(c => prfIds.includes(normB64(c.credentialIdB64)))
+            : [];
+        if (direct) {
+            const rpId = ours.get(direct).rp_id;
             prfCallback = async (pairs) => {
-                const tap = await performPrfTap({
-                    pairs, rpId, action, destination, origin,
-                });
+                const mine = pairs.filter(p => ours.has(normB64(bytesToB64(p.credentialId))));
+                const tap = await performPrfTap({ pairs: mine, rpId, ...ctx });
                 bumpCounter('prf_eval');
                 receipts.push(tap.receipt);
                 return { credentialId: tap.credentialId, prfOutput: tap.prfOutput };
             };
+        } else {
+            if (software && summary.x25519 > 0) {
+                const opened = await unwrapSoftwareIdentity(software, ctx);
+                receipts.push(opened.receipt);
+                armoredSecrets.push(opened.secret);
+            }
+            if (phone.length > 0) {
+                prfCallback = async (pairs) => {
+                    const tap = await performRelayPrfTap({ pairs, credentials: phone, ...ctx });
+                    bumpCounter('prf_eval');
+                    receipts.push(tap.receipt);
+                    return { credentialId: tap.credentialId, prfOutput: tap.prfOutput };
+                };
+            }
+        }
+        if (!direct && !prfCallback && armoredSecrets.length === 0
+            && summary.piv === 0 && summary.fido2 === 0) {
+            browserPathError = recipients.length === 0 && !software
+                ? new NoHardwareError(NO_BROWSER_IDENTITY_MESSAGE)
+                : Object.assign(new Error('no identity in this browser opens this item'), {
+                    code: 'no_matching_identity',
+                });
         }
 
-        /*
-         * Everything above opens `webauthn-prf-v1` stanzas: the passkey
-         * recipients, and this profile's software-wrap credential. A blob
-         * wrapped to a YubiKey PIV slot (`piv-p256`) or to a FIDO2 hmac-secret
-         * recipient (`fido2-hmac`) -- written by rageterm or ragedroid -- has no
-         * opener in this browser at all.
-         *
-         * Those now route through `rageterm --native-host`
-         * (glue/native-host.js), which performs the touch on the workstation
-         * and returns a file key plus a `tap` block describing the ceremony.
-         * The route is taken only when the browser's own identities are absent
-         * or have failed, and the receipt it produces goes through the same
-         * assertReceiptIsRealTap() below as every other unlock: a host that
-         * reports `touched: false` -- which is what it reports under
-         * RAGEWARDEN_NATIVE_HOST_ALLOW_SOFTWARE=1 -- produces a refusal here and
-         * no plaintext.
-         *
-         * What is NOT proven: the `tap` block is the host's word. It is not
-         * signed and this side cannot check it, so a native-host receipt
-         * asserts "rageterm says a verified touch happened", not "a verified
-         * touch happened". None of this has met a real key -- the fail-closed
-         * half (no host / untouched / malformed) is what has been exercised.
-         * See the header of glue/native-host.js.
-         */
-        const noBrowserIdentity = !prfCallback && armoredSecrets.length === 0;
-        let browserPathError = noBrowserIdentity
-            ? new NoHardwareError(NO_BROWSER_IDENTITY_MESSAGE)
-            : null;
-
-        if (!noBrowserIdentity) {
+        if (prfCallback || armoredSecrets.length > 0) {
             try {
                 bytes = await mod.wasm_decrypt_cipher_field_with_secrets(
                     session, cipher, fieldName, prfCallback, armoredSecrets,
                 );
                 bumpCounter('wasm_decrypt');
             } catch (e) {
-                // A cancelled ceremony is an answer, not a reason to go and ask
-                // for another one on a different device.
                 if (isUserDecline(e)) throw e;
                 browserPathError = e;
+            } finally {
+                for (let i = 0; i < armoredSecrets.length; i++) armoredSecrets[i] = '';
             }
         }
-        for (let i = 0; i < armoredSecrets.length; i++) armoredSecrets[i] = '';
 
         if (bytes === undefined) {
+            if (browserPathError && !(summary.piv > 0 || summary.fido2 > 0)) throw browserPathError;
             bytes = await decryptThroughNativeHost({
                 mod,
                 session,
                 cipher,
                 fieldName,
                 receipts,
-                action,
-                destination,
-                origin,
+                ...ctx,
                 fallbackError: browserPathError,
             });
         }
@@ -332,9 +356,7 @@ export async function unlockCipherField(opts) {
         const tap = await performPresenceTap({
             credentialIds,
             rpId: recipients.length > 0 ? recipients[0].rp_id : undefined,
-            action,
-            destination,
-            origin,
+            ...ctx,
         });
         bumpCounter('presence_tap');
         receipts.push(tap.receipt);
@@ -352,4 +374,45 @@ export async function unlockCipherField(opts) {
     const value = new TextDecoder().decode(bytes);
     if (bytes && bytes.fill) bytes.fill(0);
     return { value, receipts };
+}
+
+/*
+ * One ceremony for many items: unwrap this profile's software identity once
+ * and open every item wrapped to it with that secret. The secret lives only
+ * inside the returned handle and is wiped by close().
+ */
+export async function openBatch({ action, destination, origin }) {
+    const { software } = await hardwareInventory();
+    if (!software) {
+        throw new NoHardwareError(NO_BROWSER_IDENTITY_MESSAGE);
+    }
+    const opened = await unwrapSoftwareIdentity(software, {
+        action, destination, origin, cipherId: '',
+    });
+    assertReceiptIsRealTap(opened.receipt);
+    let secret = opened.secret;
+    const mod = await wasmGlue.init();
+    return {
+        receipt: opened.receipt,
+        async decrypt(session, cipher, fieldName = 'password') {
+            if (!secret) throw new Error('batch is closed');
+            const summary = stanzaSummary(mod, session, cipher, fieldName);
+            if (!summary.rage) {
+                const bytes = await mod.wasm_decrypt_cipher_field(session, cipher, fieldName, null);
+                const value = new TextDecoder().decode(bytes);
+                if (bytes && bytes.fill) bytes.fill(0);
+                return value;
+            }
+            const bytes = await mod.wasm_decrypt_cipher_field_with_secrets(
+                session, cipher, fieldName, null, [secret],
+            );
+            bumpCounter('wasm_decrypt');
+            const value = new TextDecoder().decode(bytes);
+            if (bytes && bytes.fill) bytes.fill(0);
+            return value;
+        },
+        close() {
+            secret = '';
+        },
+    };
 }

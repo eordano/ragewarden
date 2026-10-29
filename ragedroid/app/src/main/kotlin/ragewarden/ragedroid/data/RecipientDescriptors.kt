@@ -30,7 +30,7 @@ object RecipientDescriptors {
         when (r.kind) {
             RecipientKind.YubiKey -> {
                 val pub = r.pivPubkey
-                if (pub != null && pub.size == 32) {
+                if (pub != null && (pub.size == 32 || pub.size == 33)) {
                     val tag = YubiKeyPivIdentity.expectedRecipientTag(pub)
                     add("${StanzaTags.PIV_P256}:${StanzaCrypto.b64StdEncode(tag)}")
                 }
@@ -57,6 +57,13 @@ object RecipientDescriptors {
                 (r.passkeyCredentialId ?: r.fido2CredentialId)?.takeIf { it.isNotEmpty() }?.let {
                     add("${StanzaTags.WEBAUTHN_PRF_V1}:${StanzaCrypto.b64UrlEncode(it)}")
                 }
+                // Moved from Fido2 (StoredRecipient.migratedToPasskeyPrf): what it
+                // wrapped before the move is still `fido2-hmac`, and still opens.
+                if (r.passkeyCredentialId != null) {
+                    r.fido2CredentialId?.takeIf { it.isNotEmpty() }?.let {
+                        add("${StanzaTags.FIDO2_HMAC}:${StanzaCrypto.b64UrlEncode(it)}")
+                    }
+                }
             }
             // An age X25519 stanza's only arg is the *ephemeral* share, so a
             // software or paper recipient is not identifiable from the header at
@@ -64,6 +71,19 @@ object RecipientDescriptors {
             // which is the truthful outcome, not a gap to paper over.
             RecipientKind.Recovery, RecipientKind.Software -> Unit
         }
+    }
+
+    /**
+     * `fido2-hmac` wraps in an item's header that belong to a passkey since
+     * moved to [RecipientKind.PasskeyPrf]: re-encrypting the item writes them
+     * as `webauthn-prf-v1`.
+     */
+    fun movedPasskeyWraps(itemDescriptors: List<String>, local: List<ragewarden.ragedroid.model.Recipient>): Int {
+        val moved = local.filter { it.kind == RecipientKind.PasskeyPrf }
+            .flatMap { it.descriptors }
+            .filter { it.startsWith("${StanzaTags.FIDO2_HMAC}:") }
+            .toSet()
+        return itemDescriptors.count { it in moved }
     }
 
     data class Resolution(

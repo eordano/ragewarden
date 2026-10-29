@@ -1,5 +1,6 @@
 package ragewarden.ragedroid.ui.screens
 
+import androidx.compose.ui.platform.testTag
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
@@ -33,6 +34,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.material.icons.outlined.Close
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
@@ -44,6 +47,8 @@ import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
 import kotlinx.collections.immutable.ImmutableList
 import kotlinx.collections.immutable.toImmutableList
+import ragewarden.ragedroid.R
+import ragewarden.ragedroid.model.NO_FOLDER
 import ragewarden.ragedroid.model.VaultItem
 import ragewarden.ragedroid.ui.components.AppBar
 import ragewarden.ragedroid.ui.components.ButtonVariant
@@ -67,15 +72,18 @@ fun VaultListScreen(
     onEnrollFirst: () -> Unit = onAdd,
     rotationStale: Boolean = false,
     onRotate: () -> Unit = {},
+    keyListUnreadable: Boolean = false,
+    onResetKeyList: () -> Unit = {},
 ) {
+    val vaultListContext = androidx.compose.ui.platform.LocalContext.current
     val c = rageColors
     var query by remember { mutableStateOf("") }
-    var folder by remember { mutableStateOf("All") }
+    var folder by remember { mutableStateOf(NO_FOLDER) }
 
     val rageCount = items.count { it.rage }
     val filtered: ImmutableList<VaultItem> = remember(items, folder, query) {
         items.filter { it ->
-            if (folder != "All" && it.folder != folder) return@filter false
+            if (folder != NO_FOLDER && it.folder != folder) return@filter false
             if (query.isBlank()) return@filter true
             val q = query.trim().lowercase()
             it.name.lowercase().contains(q) ||
@@ -86,19 +94,19 @@ fun VaultListScreen(
 
     Column(modifier = Modifier.fillMaxSize().background(c.background)) {
         AppBar(
-            title = "Vault",
-            subtitle = "${items.size} items · $rageCount protected",
+            title = stringResource(R.string.vault),
+            subtitle = stringResource(R.string.items_protected_2, items.size, rageCount),
             large = true,
             trailing = {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     IconBtn(
                         icon = Icons.Outlined.Add,
-                        contentDescription = "Add item",
+                        contentDescription = stringResource(R.string.add_item),
                         onClick = onAdd,
                     )
                     IconBtn(
                         icon = Icons.Outlined.Settings,
-                        contentDescription = "Settings",
+                        contentDescription = stringResource(R.string.settings),
                         onClick = onSettings,
                     )
                 }
@@ -123,13 +131,13 @@ fun VaultListScreen(
                 modifier = Modifier.size(16.dp),
             )
             Text(
-                text = "Search vault, recipients, notes",
+                text = stringResource(R.string.search_vault_recipients_notes),
                 style = RageType.sansBody,
                 color = c.fgSecondary,
                 modifier = Modifier.weight(1f),
             )
             Text(
-                text = "FILTER",
+                text = stringResource(R.string.filter),
                 style = RageType.eyebrow.copy(
                     fontSize = 10.sp,
                     fontWeight = FontWeight.SemiBold,
@@ -147,7 +155,7 @@ fun VaultListScreen(
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             folders.forEach { f ->
-                FolderChip(name = f, active = f == folder, onClick = { folder = f })
+                FolderChip(name = if (f == NO_FOLDER) stringResource(R.string.all) else f, active = f == folder, onClick = { folder = f })
             }
         }
 
@@ -158,8 +166,15 @@ fun VaultListScreen(
                 .background(c.divider),
         )
 
-        if (rotationStale && items.any { it.rage }) {
-            RotationBanner(onRotate = onRotate)
+        if (keyListUnreadable) {
+            ragewarden.ragedroid.ui.components.UnreadableKeyListCard(
+                onReset = onResetKeyList,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+            )
+        }
+        var rotationBannerDismissed by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(false) }
+        if (rotationStale && items.any { it.rage } && !rotationBannerDismissed) {
+            RotationBanner(onRotate = onRotate, onDismiss = { rotationBannerDismissed = true })
         }
 
         Box(modifier = Modifier.fillMaxSize().background(c.background)) {
@@ -174,16 +189,16 @@ fun VaultListScreen(
                         ?.removeSuffix("/")
                         ?.removeSuffix("/api")
                         ?.takeIf { it.isNotBlank() }
-                        ?: "your Bitwarden server"
+                        ?: stringResource(R.string.your_bitwarden_server)
                     EmptyVaultHero(
                         syncHost = host,
                         onAdd = onAdd,
-                        onAutofill = {},
+                        onAutofill = { ragewarden.ragedroid.ui.SystemSetup.openAutofillSettings(vaultListContext) },
                     )
                 }
             } else if (filtered.isEmpty()) {
                 Text(
-                    text = "No items match.",
+                    text = stringResource(R.string.no_items_match),
                     style = RageType.body.copy(
                         textAlign = TextAlign.Center,
                         fontSize = 15.sp,
@@ -195,14 +210,13 @@ fun VaultListScreen(
                         .padding(top = 40.dp, bottom = 40.dp, start = 24.dp, end = 24.dp),
                 )
             } else {
-                LazyColumn(modifier = Modifier.fillMaxSize()) {
+                LazyColumn(modifier = Modifier.fillMaxSize().testTag("vault-list")) {
                     items(filtered, key = { it.id }) { item ->
                         VaultRow(item = item, onClick = { onOpen(item) })
                     }
                     item("footer") {
                         Text(
-                            text = "Vault syncs through Bitwarden.\n" +
-                                "Protected items stay opaque to the server.",
+                            text = stringResource(R.string.vault_syncs_through_bitwarden_protected_items),
                             style = RageType.meta.copy(
                                 textAlign = TextAlign.Center,
                                 fontStyle = FontStyle.Italic,
@@ -220,7 +234,7 @@ fun VaultListScreen(
 }
 
 @Composable
-private fun RotationBanner(onRotate: () -> Unit) {
+internal fun RotationBanner(onRotate: () -> Unit, onDismiss: () -> Unit) {
     val c = rageColors
     val tintBg = c.warning.copy(alpha = 0.14f)
     val tintBorder = c.warning.copy(alpha = 0.45f)
@@ -237,25 +251,30 @@ private fun RotationBanner(onRotate: () -> Unit) {
     ) {
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = "Recipients changed",
+                text = stringResource(R.string.recipients_changed_re_encrypt_items),
                 style = RageType.rowTitle.copy(fontSize = 13.5.sp),
                 color = c.fgEmphasis,
             )
             Text(
-                text = "Each item is re-encrypted to the current set as you reveal it on a " +
-                    "device with access. Tap here to dismiss.",
+                text = stringResource(R.string.items_are_re_encrypted_to_the),
                 style = RageType.meta.copy(fontSize = 12.sp),
                 color = c.fgSecondary,
             )
         }
         Text(
-            text = "ROTATE",
+            text = stringResource(R.string.re_encrypt),
             style = RageType.eyebrow.copy(
                 fontSize = 11.sp,
                 fontWeight = FontWeight.SemiBold,
                 letterSpacing = 0.06.em,
             ),
             color = c.warning,
+        )
+        IconBtn(
+            icon = Icons.Outlined.Close,
+            contentDescription = stringResource(R.string.dismiss),
+            onClick = onDismiss,
+            iconSize = 18,
         )
     }
 }
@@ -272,14 +291,14 @@ private fun NoRecipientEmptyState(onEnrollFirst: () -> Unit) {
         verticalArrangement = Arrangement.Center,
     ) {
         Text(
-            text = "Enrol a recipient first.",
+            text = stringResource(R.string.enrol_a_recipient_first),
             style = RageType.h1,
             color = c.fgEmphasis,
             textAlign = TextAlign.Center,
         )
         Spacer(modifier = Modifier.height(12.dp))
         Text(
-            text = "Ragewarden encrypts every item to a recipient you control. Enrol a YubiKey, this phone's StrongBox, a passkey, or a paper recovery phrase before saving anything.",
+            text = stringResource(R.string.ragewarden_encrypts_every_item_to_a),
             style = RageType.body,
             color = c.fgSecondary,
             textAlign = TextAlign.Center,
@@ -288,7 +307,7 @@ private fun NoRecipientEmptyState(onEnrollFirst: () -> Unit) {
         Spacer(modifier = Modifier.height(20.dp))
         Column(modifier = Modifier.widthIn(max = 280.dp).fillMaxWidth()) {
             RageButton(
-                label = "Add recipient",
+                label = stringResource(R.string.add_recipient),
                 icon = Icons.Outlined.PersonAdd,
                 variant = ButtonVariant.Primary,
                 fullWidth = true,

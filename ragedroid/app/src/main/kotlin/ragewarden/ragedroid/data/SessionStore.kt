@@ -7,11 +7,12 @@ import android.util.Log
 /**
  * On-disk home of the Bitwarden session blob.
  *
- * The blob is `SessionDto` (`jni/src/sync_jni.rs`): it carries
- * `user_enc_key_b64` and `user_mac_key_b64` -- the user symmetric key pair
- * derived from the master password -- plus the access and refresh tokens. It is
- * the outer layer of the whole vault, so it is the *most* sensitive thing this
- * app persists.
+ * The blob is `SessionDto` (`jni/src/sync_jni.rs`) as `SessionBlobs.strip`
+ * leaves it: the access and refresh tokens, the account and server fields, and
+ * `protectedUserKey` -- the user key encrypted under the key stretched from the
+ * master password -- but not the user key itself, which exists only in memory
+ * while the vault is unlocked. The tokens still let a holder talk to the
+ * server as this device, so the blob is encrypted at rest all the same.
  *
  * It used to be written as base64 into a plain
  * `getSharedPreferences(MODE_PRIVATE)` file
@@ -44,7 +45,7 @@ class SessionStore(context: Context) {
     }
 
     fun load(): ByteArray? {
-        val encoded = prefs.getString(KEY_SESSION_BLOB, null) ?: return null
+        val encoded = runCatching { prefs.getString(KEY_SESSION_BLOB, null) }.getOrNull() ?: return null
         return runCatching { Base64.decode(encoded, Base64.NO_WRAP) }.getOrNull()
     }
 

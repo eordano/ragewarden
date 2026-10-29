@@ -1,20 +1,12 @@
 import { loadSession } from './glue/storage.js';
-import { hardwareInventory, unlockCipherField, isUserDecline } from './glue/unlock.js';
-import { backendIsMock, performPrfEnroll, performPrfTap } from './glue/hardware-tap.js';
-import { passkeyEnrollWithSoftwareKey } from './glue/passkey.js';
-import * as wasmGlue from './glue/crypto.js';
+import { unlockCipherField, isUserDecline, NoHardwareError } from './glue/unlock.js';
+import { backendIsMock } from './glue/hardware-tap.js';
 import { assertReleaseSafe } from './glue/build-flags.js';
+import { init as initWasm } from './glue/crypto.js';
+import { registryEntries } from './glue/inventory.js';
+import { relayCredentialsFromRegistry } from './glue/prf-relay.js';
 
 assertReleaseSafe();
-
-/*
- * Enrolment runs its two WebAuthn ceremonies (register + PRF) here, in the
- * focused tap window, for the same reason reveals do: the side-panel UI is not
- * a reliable WebAuthn context -- an inline navigator.credentials.create() there
- * hangs and leaves a pending request. This window is a real top-level page, so
- * the ceremony completes. The pair is frozen so enrolment cannot bypass the gate.
- */
-const ENROLL_CEREMONY = Object.freeze({ enroll: performPrfEnroll, prfTap: performPrfTap });
 
 const api = (typeof chrome !== 'undefined' && chrome.runtime) ? chrome
     : ((typeof browser !== 'undefined' && browser.runtime) ? browser : null);
@@ -46,15 +38,6 @@ function setStatus(text, isError = false) {
     s.classList.toggle('err', !!isError);
 }
 
-/*
- * The foot of this window used to also carry `backend: <label>`, which in a
- * release build is the constant string "Security key / passkey (WebAuthn PRF)"
- * under every ceremony forever. A line that never changes teaches people the
- * foot of this dialog is ignorable, and the foot of this dialog is #status --
- * where "Fabricating a MOCK tap (no device involved)..." and "Tap 2 of up to 2"
- * have to be read. Deleted: what sits below the buttons now only ever says
- * something when there is something to say.
- */
 function renderMockBanner() {
     if (!backendIsMock()) return;
     const b = el('mock-banner');
@@ -69,11 +52,7 @@ function renderRequest(req) {
     el('item').textContent = req.cipherName || req.cipherId || '--';
     el('destination').textContent = req.destination;
     const p = el('protection');
-    if (req.action === 'enroll') {
-        p.textContent = 'enrolling this browser as a hardware recipient';
-        p.className = 'hard';
-        el('authorize').textContent = 'Tap your key to enrol';
-    } else if (req.rage) {
+    if (req.rage) {
         p.textContent = 'hardware-encrypted (your tap derives the key)';
         p.className = 'hard';
         el('authorize').textContent = 'Tap your key to decrypt';
@@ -105,123 +84,29 @@ async function finishErr(code, message) {
     } catch {}
 }
 
-async function finishEnroll(enrollment) {
-    settled = true;
-    await send({ kind: 'tap.complete', requestId, enrollment });
-    window.close();
-}
-
-/*
- * How many system dialogs one press of "Tap your key" will raise.
- *
- * A standard enrolment leaves two things behind that can open a hardware item:
- * this browser profile's software-wrap credential, and the passkey recipient
- * stanza carried inside the blob. glue/unlock.js taps for the first, then hands
- * the wasm layer a PRF callback that taps again for the second whenever the
- * blob carries PRF stanzas -- without checking that the first one already
- * opened it. So the ordinary case is two taps of the same key for one press.
- *
- * This is an upper bound, not a count: the second tap does not happen if the
- * blob turns out to carry no passkey stanza, and nothing reachable from this
- * page can tell in advance. Hence "up to" in the wording below -- an honest
- * over-count is fine, a promise of one tap followed by a second prompt is not.
- *
- * Saying it out loud is the entire point. A second authenticator prompt for a
- * click you only made once is exactly what something else asking looks like.
- */
-async function plannedTaps() {
-    if (!request.rage) return 1;
-    try {
-        const { recipients, software } = await hardwareInventory();
-        return (software ? 1 : 0) + (recipients.length > 0 ? 1 : 0);
-    } catch {
-        // The unlock is about to fail on the same inventory read and say why;
-        // narrating badly is not worth pre-empting that error with a worse one.
-        return 1;
-    }
-}
-
-function tapLine(done, planned) {
-    if (backendIsMock()) return 'Fabricating a MOCK tap (no device involved)...';
-    if (planned <= 1) return 'Waiting for your security key...';
-    if (done < 1) {
-        return `Waiting for your security key -- this item takes up to ${planned} taps of the `
-            + 'same key, so a second prompt after the first one is expected.';
-    }
-    return `Tap ${done} of up to ${planned} -- waiting for your security key...`;
-}
-
-/*
- * Count the ceremonies as they are raised, so this window can say which tap the
- * user is on instead of freezing on one line across both of them.
- *
- * navigator.credentials.get() is the call that raises the dialog and the only
- * edge visible from here -- glue/unlock.js exposes no progress hook. The wrapper
- * is read-only: it forwards to the real method it captured and returns that
- * promise untouched, it is installed as an own property so removing it restores
- * the prototype method exactly, and it comes off before the ceremony's caller
- * returns. Every failure path here gives up and narrates less, because
- * narration must never be able to change what gets asserted. It also never sees
- * the mock backend, which fabricates taps without touching WebAuthn -- that is
- * why tapLine() states the plan up front rather than only on the first tap.
- */
-function narrateTaps(planned) {
-    const creds = (typeof navigator !== 'undefined') ? navigator.credentials : null;
-    if (!creds || typeof creds.get !== 'function') return () => {};
-    if (Object.prototype.hasOwnProperty.call(creds, 'get')) return () => {};
-    const real = creds.get.bind(creds);
-    let done = 0;
-    try {
-        creds.get = (...args) => {
-            done += 1;
-            setStatus(tapLine(done, planned));
-            return real(...args);
-        };
-    } catch {
-        return () => {};
-    }
-    return () => { try { delete creds.get; } catch {} };
+function tapLine() {
+    return backendIsMock()
+        ? 'Fabricating a MOCK tap (no device involved)...'
+        : 'Waiting for your security key...';
 }
 
 async function onAuthorize() {
     el('authorize').disabled = true;
     el('cancel').disabled = true;
-    if (request.action === 'enroll') {
-        setStatus('Tap your key to enrol (register, then a second tap to confirm)...');
-        try {
-            const mod = await wasmGlue.init();
-            const enrollment = await passkeyEnrollWithSoftwareKey(
-                { rpId: request.rpId || undefined, label: request.label || 'Primary passkey' },
-                mod,
-                ENROLL_CEREMONY,
-            );
-            await finishEnroll(enrollment);
-        } catch (err) {
-            const message = (err && err.message) || String(err);
-            setStatus(isUserDecline(err) ? 'Cancelled at the authenticator.' : message, true);
-            el('cancel').disabled = false;
-            el('authorize').disabled = false;
-            if (isUserDecline(err)) {
-                await finishErr('tap_declined', 'user declined at the authenticator');
-                window.close();
-            }
-        }
-        return;
-    }
-    setStatus(tapLine(0, 1));
-    const planned = await plannedTaps();
-    setStatus(tapLine(0, planned));
-    const stopNarrating = narrateTaps(planned);
+    setStatus(tapLine());
     try {
         const session = await loadSession();
-        if (!session) throw new Error('not signed in');
+        if (!session) throw new Error('Ragewarden is locked -- unlock it from the toolbar first');
         const out = await unlockCipherField({
             session,
             cipher: request.cipher,
             fieldName: request.fieldName || 'password',
+            relayCredentials: async () => relayCredentialsFromRegistry(
+                await registryEntries(await initWasm(), session)),
             action: request.action,
             destination: request.destination,
             origin: request.origin,
+            cipherId: request.cipherId,
         });
         const plaintext = {
             username: request.username || '',
@@ -230,16 +115,61 @@ async function onAuthorize() {
         await finishOk(plaintext, out.receipts);
     } catch (err) {
         const message = (err && err.message) || String(err);
-        setStatus(isUserDecline(err) ? 'Cancelled at the authenticator.' : message, true);
+        if (isUserDecline(err)) {
+            setStatus('Cancelled at the authenticator. Nothing was released.', true);
+            await finishErr('tap_declined', 'user declined at the authenticator');
+            closeSoon();
+            return;
+        }
+        const code = nonRetryableCode(err);
+        setStatus(message, true);
+        if (code) {
+            await finishErr(code, message);
+            offerEnrolment();
+            el('cancel').textContent = 'Close';
+            el('cancel').disabled = false;
+            el('cancel').focus();
+            return;
+        }
         el('cancel').disabled = false;
         el('authorize').disabled = false;
-        if (isUserDecline(err)) {
-            await finishErr('tap_declined', 'user declined at the authenticator');
-            window.close();
-        }
-    } finally {
-        stopNarrating();
+        el('authorize').focus();
     }
+}
+
+const NON_RETRYABLE = new Set(['no_hardware', 'no_identity_available', 'no_matching_identity']);
+
+function nonRetryableCode(err) {
+    if (err instanceof NoHardwareError) return 'no_hardware';
+    const code = err && err.code;
+    if (NON_RETRYABLE.has(code)) return code;
+    if (/none on this device|matched any stanza/.test(String((err && err.message) || ''))) {
+        return 'no_matching_identity';
+    }
+    return null;
+}
+
+function closeSoon() {
+    el('authorize').disabled = true;
+    el('cancel').textContent = 'Close';
+    el('cancel').disabled = false;
+    el('cancel').focus();
+    setTimeout(() => window.close(), 2500);
+}
+
+function offerEnrolment() {
+    if (el('enrol')) return;
+    const b = document.createElement('button');
+    b.id = 'enrol';
+    b.type = 'button';
+    b.textContent = 'Enrol a passkey';
+    b.addEventListener('click', () => {
+        const url = api.runtime.getURL('popup/index.html');
+        if (api.tabs && api.tabs.create) api.tabs.create({ url });
+        else window.open(url, '_blank');
+        window.close();
+    });
+    el('authorize').replaceWith(b);
 }
 
 async function main() {
@@ -276,8 +206,9 @@ async function main() {
     renderRequest(request);
     el('authorize').disabled = false;
     el('authorize').addEventListener('click', onAuthorize);
+    el('authorize').focus();
     el('cancel').addEventListener('click', async () => {
-        await finishErr('tap_cancelled', 'user cancelled in the Ragewarden prompt');
+        if (!settled) await finishErr('tap_cancelled', 'user cancelled in the Ragewarden prompt');
         window.close();
     });
 }

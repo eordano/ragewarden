@@ -1,5 +1,15 @@
 package ragewarden.ragedroid.ui.components
 
+import ragewarden.ragedroid.R
+import androidx.compose.ui.res.stringResource
+import androidx.compose.material3.Icon
+import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.Icons
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.foundation.layout.defaultMinSize
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -42,6 +52,7 @@ fun Sheet(
 ) {
     val c = rageColors
     val noIndication = remember { MutableInteractionSource() }
+    androidx.activity.compose.BackHandler(enabled = open) { onDismiss() }
     AnimatedVisibility(
         visible = open,
         enter = fadeIn(tween(MotionTokens.DurSlowMs, easing = MotionTokens.EaseOut)),
@@ -75,22 +86,22 @@ fun Sheet(
                             c.surfaceElevated,
                             RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp),
                         )
-                        .clickable(
-                            interactionSource = noIndication,
-                            indication = null,
-                            onClick = {},
-                        )
+                        .pointerInput(Unit) { detectTapGestures { } }
                         .padding(start = 18.dp, end = 18.dp, top = 14.dp, bottom = 28.dp)
                         .verticalScroll(rememberScrollState()),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
+                    val closeLabel = stringResource(R.string.close)
                     Box(
                         modifier = Modifier
-                            .width(36.dp)
-                            .height(4.dp)
-                            .background(c.border, RoundedCornerShape(2.dp)),
-                    )
-                    Spacer(modifier = Modifier.height(14.dp))
+                            .align(Alignment.End)
+                            .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
+                            .clickable(role = androidx.compose.ui.semantics.Role.Button, onClick = onDismiss)
+                            .semantics { contentDescription = closeLabel },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(imageVector = Icons.Outlined.Close, contentDescription = null, tint = c.fgSecondary)
+                    }
                     if (title != null) {
                         Text(
                             text = title,

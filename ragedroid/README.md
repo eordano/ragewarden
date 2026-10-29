@@ -5,87 +5,47 @@ sits behind a hardware tap on top of the regular Bitwarden master-password layer
 master-password leak does not leak any of the actual secrets. See
 [`DESIGN.md`](DESIGN.md) for the full Android-specific design.
 
----
-
 ## Layout
 
-```
-ragedroid/
-+-- settings.gradle.kts
-+-- build.gradle.kts
-+-- gradle.properties
-+-- gradle/libs.versions.toml      <- pinned versions for AGP, Kotlin, Compose, etc.
-+-- jni/                           <- Cargo crate; builds libragedroid_jni.so via cargo-ndk
-|   +-- Cargo.toml
-|   +-- src/lib.rs                 <- JNI exports over ragewarden-core
-+-- app/                           <- single-module Compose app
-    +-- build.gradle.kts           <- AGP config + cargo-ndk task wiring
-    +-- src/main/
-        +-- AndroidManifest.xml
-        +-- kotlin/ragewarden/ragedroid/
-        |   +-- MainActivity.kt
-        |   +-- data/              <- DemoVaultStore (in-memory, JNI-backed)
-        |   +-- fixtures/          <- hardcoded vault + recipient data
-        |   +-- jni/RageNative.kt  <- static native bindings
-        |   +-- ui/
-        |       +-- RageApp.kt
-        |       +-- components/    <- AppBar, RageChip, InlineTapReveal, ...
-        |       +-- screens/       <- VaultListScreen, ItemDetailScreen
-        |       +-- theme/         <- Color, Type, MotionTokens, Theme
-        +-- res/                   <- strings, themes, launcher icon
-```
-
----
+- Gradle root: `settings.gradle.kts`, `build.gradle.kts`, `gradle.properties`,
+  `gradle/libs.versions.toml` (pinned AGP, Kotlin, Compose, ...).
+- `jni/`: Cargo crate built into `libragedroid_jni.so` by cargo-ndk; JNI
+  exports over ragewarden-core (`lib.rs`, `jni_identity.rs`, `sync_jni.rs`,
+  `lock_jni.rs`, `items_jni.rs`, `http.rs`, `error.rs`), each wrapped so a Rust panic
+  throws instead of aborting.
+- `app/`: the single-module Compose app; `build.gradle.kts` carries the AGP
+  config and the cargo-ndk task wiring. Under
+  `src/main/kotlin/ragewarden/ragedroid/`: `MainActivity.kt`,
+  `RageApplication.kt`, `jni/` (static native bindings), `data/` (vault
+  repository, lock state, history, clipboard, audit), `identities/`
+  (Keystore, FIDO2-hmac and passkey-PRF identities, hardware-tap
+  coordination), `autofill/` (autofill service + heuristics), `ime/` (input
+  method delivery), `di/` (Hilt), `model/`, and `ui/` (`RageApp.kt`,
+  `components/`, `screens/`, `theme/`). `res/` holds strings, themes and the
+  launcher icon.
+- `baselineprofile/`: the baseline-profile module.
 
 ## Build (full APK)
 
-Phase 1 needs both an Android SDK and the cargo-ndk plugin. None of these are required to
-verify the Rust JNI crate alone (see "Just the JNI" below).
-
-### Prerequisites
-
-| tool | version | how |
-|------|---------|-----|
-| JDK | 17 | `brew install openjdk@17` or your distro's OpenJDK package |
-| Android SDK | platform 34, build-tools 34.x | install via Android Studio or `sdkmanager` |
-| Android NDK | 26.x or newer | `sdkmanager --install "ndk;26.3.11579264"` |
-| `cargo` | 1.94+ (matches `rust-toolchain.toml`) | rustup |
-| `cargo-ndk` | 3.x | `cargo install cargo-ndk` |
-| Rust Android targets | `aarch64-linux-android`, `x86_64-linux-android` | `rustup target add aarch64-linux-android x86_64-linux-android` |
-
-### Required environment variables
+The NixOS config flake's `android` dev shell pins the toolchain: SDK 37 / build-tools 37.0.0,
+NDK 26.3.11579264, JDK 21, Gradle 9.7.1 (the version in
+`gradle/wrapper/gradle-wrapper.properties`), cargo-ndk, Rust with the Android targets, and
+the `ragedroid-avd` / `ragedroid-emulator` / `ragedroid-wait-boot` helpers. Use its `gradle`
+directly; the wrapper jar is not committed, and CI regenerates it from the pinned version
+and SHA-256.
 
 ```bash
-export ANDROID_HOME="$HOME/Library/Android/sdk"           # or wherever it's installed
-export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/26.3.11579264" # adjust to your installed NDK
-export JAVA_HOME=$(/usr/libexec/java_home -v 17)          # macOS -- Linux: just point at /usr/lib/jvm/...
-```
-
-If building the Rust workspace on macOS you may need to work around a libiconv linker
-quirk -- see the top-level [`README.md`](../README.md#build) for the `LIBRARY_PATH`
-workaround.
-
-### Generate the Gradle wrapper jar
-
-The Gradle wrapper script + properties file are checked in; the `gradle-wrapper.jar` binary
-is not, because we don't ship binaries to the repo. Run once:
-
-```bash
+nix develop <nixos-config>#android
 cd ragedroid/
-gradle wrapper --gradle-version 8.10.2
+gradle :app:testStandardDebugUnitTest :app:testFdroidDebugUnitTest
+gradle :app:assembleStandardDebug :app:assembleFdroidDebug
+(cd .. && cargo test -p ragedroid-jni --lib)
 ```
 
-(Requires a system-installed `gradle` to bootstrap, OR you can copy a `gradle-wrapper.jar`
-from any Android Studio project.)
-
-### Build the APK
-
-```bash
-cd ragedroid/
-./gradlew :app:assembleDebug
-```
-
-Produces `app/build/outputs/apk/debug/app-debug.apk`.
+APKs land in `app/build/outputs/apk/{standard,fdroid}/debug/`. Without the dev shell, the
+same toolchain installed by hand works: JDK 21, the SDK and NDK above, `cargo-ndk`, and
+`rustup target add aarch64-linux-android x86_64-linux-android`, with `ANDROID_HOME` and
+`ANDROID_NDK_HOME` exported.
 
 What this does, in order:
 
@@ -99,17 +59,18 @@ What this does, in order:
 3. AGP merges the JNI libs into the APK, runs `kotlinc` against `app/src/main/kotlin/`,
    builds the resource table, and assembles the APK.
 
-The Rust output is reproducible at the byte level (`codegen-units=1`, `lto=fat`, fixed
-`rust-toolchain.toml`); the Java side will be reproducible once we pin the Gradle wrapper
-SHA in phase 3.
+The Rust release build uses `codegen-units=16`, `lto=fat`, and a fixed
+`rust-toolchain.toml`; `scripts/repro/verify-ragedroid.sh` checks byte-level
+reproducibility of the APKs. `gradle-wrapper.properties` pins the Gradle version and its
+`distributionSha256Sum` (the published SHA-256 of the distribution zip, which nixpkgs'
+`gradle_9` fetches under the same hash); CI passes the sum to `gradle wrapper`, so a
+`./gradlew` it generates refuses any other distribution.
 
 ### Run
 
 ```bash
-./gradlew :app:installDebug && adb shell am start -n ragewarden.ragedroid/.MainActivity
+gradle :app:installStandardDebug && adb shell am start -n ragewarden.ragedroid/.MainActivity
 ```
-
----
 
 ## Just the JNI (no Android SDK needed)
 
@@ -125,47 +86,28 @@ cargo test -p ragedroid-jni
 The tests exercise the same code paths the JNI methods take, just without going through
 JNI. This is the entry point CI runs before any Android-side checks.
 
----
+## Features
 
-## What's in phase 1 (this build)
-
-- Rust JNI bridge: `encrypt`, `decryptWithSoftwareSecret`, `generateSoftwareIdentity`,
-  `pubkeyFromArmoredSecret`, `smoke`. Software-identity round-trip only.
-- Kotlin Compose UI: vault list + item detail with the action-before-tap pattern.
-- Hardcoded fixture data (`fixtures/Fixtures.kt`) standing in for the Bitwarden vault.
-- The "tap" is a software-identity authorize button -- no NFC, no USB-OTG, no Credential
-  Manager. The user's chosen action is named in the prompt before the button appears, so
-  the design principle holds regardless of how the tap is implemented.
-
-## What comes next (per the canonical [5-phase roadmap](../DESIGN.md#7-sequencing))
-
-- **Phase 2** -- replace the in-memory `DemoVaultStore` with a real Bitwarden / Vaultwarden
-  vault. Same `sync` module that already powers rageterm phase 2.
-- **Phase 3** -- hardware identities: yubikit-android (PIV + FIDO2), Credential Manager
-  passkey path (`webauthn-prf-v1`), Android Keystore (StrongBox / TEE). The
-  `PasskeyIdentityStub` class in `jni/RageNative.kt` is the placeholder.
-- **Phase 4** -- Android Autofill API service (the `BitwardenAutofillService` adapter
-  described in `DESIGN.md` §4e), IME service for `Send to keyboard`, multi-flavor builds
-  (`standard` for Play, `fdroid` without Play services).
-- **Phase 5** -- TOTP, baseline profiles, audit prep, signing + Play / F-Droid
-  distribution.
-
-See [`DESIGN.md`](DESIGN.md) for the longer-form roadmap.
-
----
+Sign-in against any Bitwarden or Vaultwarden server (PBKDF2 or Argon2id, KDF pin and
+consented upgrade, token refresh), an encrypted offline cache and a lock that drops the
+keys; logins, notes, cards, identities and SSH keys with per-field protection; YubiKey PIV
+(P-256 and X25519) and FIDO2 over NFC and USB, Android Keystore (StrongBox or TEE),
+Credential Manager passkeys with PRF, a paper recovery phrase; autofill with inline
+suggestions and a keyboard, both able to unlock and tap; TOTP with QR scan; rotation,
+bulk re-encrypt, revision history and an audit log. [`DESIGN.md`](DESIGN.md) has the
+design.
 
 ## Troubleshooting
 
-**`cargo: command not found` during `cargoNdkBuild`** -- Gradle inherits the shell's PATH;
+`cargo: command not found` during `cargoNdkBuild` -- Gradle inherits the shell's PATH;
 make sure your IDE / shell exports `~/.cargo/bin`.
 
-**`error: linker 'aarch64-linux-android-clang' not found`** -- `cargo-ndk` couldn't find the
+`error: linker 'aarch64-linux-android-clang' not found` -- `cargo-ndk` couldn't find the
 NDK. Set `ANDROID_NDK_HOME` (or `ANDROID_NDK_ROOT`) before invoking Gradle.
 
-**`UnsatisfiedLinkError: dlopen failed`** -- the `.so` is in `app/src/main/jniLibs/<abi>/`
+`UnsatisfiedLinkError: dlopen failed` -- the `.so` is in `app/src/main/jniLibs/<abi>/`
 but ABI doesn't match the device. Check `adb shell getprop ro.product.cpu.abi`; arm64-v8a
 should cover any 2017+ phone, x86_64 covers most emulators.
 
-**`error[E0462]: found staticlib instead of cdylib`** -- re-run `cargo ndk` from a clean
-`target/` (the JNI crate's `crate-type` recently changed; stale artifacts can confuse the
-linker).
+`error[E0462]: found staticlib instead of cdylib` -- re-run `cargo ndk` from a clean
+`target/`; stale artifacts from an older `crate-type` confuse the linker.

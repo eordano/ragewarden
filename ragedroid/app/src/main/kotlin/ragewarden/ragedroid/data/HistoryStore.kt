@@ -119,7 +119,7 @@ class HistoryStore @Inject constructor(
     }
 
     private fun loadStored(accountId: String, itemId: String): List<StoredRevision> {
-        val raw = prefs.getString(prefKey(accountId, itemId), null) ?: return emptyList()
+        val raw = runCatching { prefs.getString(prefKey(accountId, itemId), null) }.getOrNull() ?: return emptyList()
         return runCatching { JSON.decodeFromString<List<StoredRevision>>(raw) }.getOrDefault(emptyList())
     }
 

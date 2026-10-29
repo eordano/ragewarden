@@ -1,10 +1,17 @@
 package ragewarden.ragedroid.ui.screens
 
+import androidx.compose.ui.res.stringResource
+import ragewarden.ragedroid.R
+import ragewarden.ragedroid.ui.findActivity
+import ragewarden.ragedroid.di.appEntryPoint
+import ragewarden.ragedroid.model.VaultItem
+import androidx.compose.runtime.remember
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -43,9 +50,12 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import ragewarden.ragedroid.ui.components.AppBar
 import ragewarden.ragedroid.ui.components.IconBtn
 import ragewarden.ragedroid.ui.components.Mono
+import ragewarden.ragedroid.ui.components.ButtonVariant
 import ragewarden.ragedroid.ui.components.RageButton
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
+import ragewarden.ragedroid.ui.uiQuantity
+import ragewarden.ragedroid.ui.uiString
 
 @Composable
 fun BackfillWizardScreen(
@@ -56,6 +66,25 @@ fun BackfillWizardScreen(
 ) {
     val c = rageColors
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val activity = remember(context) { context.findActivity() as? androidx.fragment.app.FragmentActivity }
+    val repo = ragewarden.ragedroid.data.VaultBridge.repository()
+    val coordinator = remember(activity, repo?.accountId) {
+        ragewarden.ragedroid.identities.HardwareTapCoordinator(
+            activity = activity,
+            recipientStore = context.appEntryPoint().recipientStore(),
+            accountId = repo?.accountId.orEmpty(),
+        )
+    }
+    val pinRequest by coordinator.pinRequest.collectAsStateWithLifecycle()
+    val rewrapPurpose = stringResource(R.string.rewrap_purpose)
+    val rewrapItem: suspend (VaultItem) -> Unit = { item ->
+        val r = repo ?: error("not signed in")
+        coordinator.authorize(purpose = rewrapPurpose.format(item.name)) { identities ->
+            r.rewrap(item.id, identities).getOrThrow()
+            ByteArray(0)
+        }
+    }
 
     LaunchedEffect(Unit) {
         viewModel.loadCandidates()
@@ -71,11 +100,13 @@ fun BackfillWizardScreen(
 
     Column(modifier = Modifier.fillMaxSize().background(c.background)) {
         AppBar(
-            title = "Protect existing items",
+            title = stringResource(
+                if (state.total == 0 && state.staleRageItemCount > 0) R.string.re_encrypt_items else R.string.protect_existing_items,
+            ),
             leading = {
                 IconBtn(
                     icon = Icons.AutoMirrored.Outlined.ArrowBack,
-                    contentDescription = "Back",
+                    contentDescription = stringResource(R.string.back),
                     onClick = { if (!state.running) backHandler() },
                 )
             },
@@ -86,12 +117,14 @@ fun BackfillWizardScreen(
                 count = state.total,
                 staleRageCount = state.staleRageItemCount,
                 onBegin = { viewModel.start() },
+                onRewrap = { viewModel.rewrapStale(rewrapItem) },
                 onMarkRotated = {
                     viewModel.markRotationFresh()
-                    onToast("Rotation banner cleared")
+                    onToast(uiString(R.string.rotation_banner_cleared))
                     onComplete()
                 },
             )
+            pinRequest != null -> ragewarden.ragedroid.ui.components.PivPinPrompt(request = pinRequest!!)
             state.running -> RunningStep(
                 processed = state.processed,
                 total = state.total,
@@ -104,9 +137,9 @@ fun BackfillWizardScreen(
                     val protectedCount = state.total - state.failed.size
                     onToast(
                         if (state.failed.isEmpty()) {
-                            "Protected $protectedCount item${if (protectedCount == 1) "" else "s"}"
+                            uiQuantity(R.plurals.protected_items, protectedCount, protectedCount)
                         } else {
-                            "Protected $protectedCount, ${state.failed.size} failed"
+                            uiString(R.string.protected_failed, protectedCount, state.failed.size)
                         },
                     )
                     onComplete()
@@ -117,10 +150,11 @@ fun BackfillWizardScreen(
 }
 
 @Composable
-private fun IntroStep(
+internal fun IntroStep(
     count: Int,
     staleRageCount: Int,
     onBegin: () -> Unit,
+    onRewrap: () -> Unit = {},
     onMarkRotated: () -> Unit,
 ) {
     val c = rageColors
@@ -153,14 +187,14 @@ private fun IntroStep(
             }
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = if (count == 1) "1 item" else "$count items",
+                    text = androidx.compose.ui.res.pluralStringResource(R.plurals.item_count, count, count),
                     style = RageType.rowTitle.copy(fontSize = 14.sp),
                     color = c.fgEmphasis,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    text = "Currently unprotected",
+                    text = stringResource(R.string.currently_unprotected),
                     style = RageType.caption.copy(fontSize = 11.5.sp),
                     color = c.fgSecondary,
                 )
@@ -169,9 +203,9 @@ private fun IntroStep(
         Spacer(modifier = Modifier.height(18.dp))
         Text(
             text = if (count == 0) {
-                "Nothing to protect."
+                stringResource(R.string.nothing_to_protect)
             } else {
-                "$count item${if (count == 1) "" else "s"} in your vault aren't yet rage-protected."
+                androidx.compose.ui.res.pluralStringResource(R.plurals.items_not_protected_yet, count, count)
             },
             style = RageType.h1.copy(
                 fontSize = 22.sp,
@@ -184,13 +218,12 @@ private fun IntroStep(
         Text(
             text = when {
                 count == 0 && staleRageCount > 0 -> {
-                    val itemForm = if (staleRageCount == 1) "item is" else "items are"
-                    "All items are already protected, but $staleRageCount $itemForm encrypted to a previous recipient set."
+                    androidx.compose.ui.res.pluralStringResource(R.plurals.all_protected_but_stale, staleRageCount, staleRageCount)
                 }
                 count == 0 ->
-                    "All your existing items are already wrapped with rage. There's nothing to do here."
+                    stringResource(R.string.all_your_existing_items_are_already)
                 else ->
-                    "Encrypting them now will make them require a tap to reveal."
+                    stringResource(R.string.encrypting_them_now_will_make_them)
             },
             style = RageType.body.copy(fontSize = 15.sp, lineHeight = 22.sp),
             color = c.fgPrimary,
@@ -198,26 +231,45 @@ private fun IntroStep(
         Spacer(modifier = Modifier.height(14.dp))
         InfoCallout(
             text = if (count == 0 && staleRageCount > 0) {
-                "Reveal an item from the vault and the app silently re-encrypts it to the current recipient set in the background. Once every item has been touched, the banner clears itself. You can also dismiss the banner now if you've already rotated everything you care about."
+                stringResource(R.string.rewrap_explainer)
             } else {
-                "Each item is decrypted with your current session key, then re-encrypted as a multi-recipient age stanza using your enrolled recipients."
+                stringResource(R.string.each_item_is_opened_with_your)
             },
         )
         Spacer(modifier = Modifier.weight(1f))
-        if (count == 0 && staleRageCount > 0) {
+        if (count > 0) {
             RageButton(
-                label = "Mark all rotated",
-                onClick = onMarkRotated,
-                icon = Icons.Outlined.Check,
-                fullWidth = true,
-            )
-        } else {
-            RageButton(
-                label = "Begin",
+                label = stringResource(R.string.begin),
                 onClick = onBegin,
                 icon = Icons.Outlined.TouchApp,
                 fullWidth = true,
-                enabled = count > 0,
+            )
+        }
+        if (staleRageCount > 0) {
+            if (count > 0) Spacer(modifier = Modifier.height(8.dp))
+            RageButton(
+                label = androidx.compose.ui.res.pluralStringResource(R.plurals.rewrap_now, staleRageCount, staleRageCount),
+                onClick = onRewrap,
+                icon = Icons.Outlined.TouchApp,
+                variant = if (count > 0) ButtonVariant.Secondary else ButtonVariant.Primary,
+                fullWidth = true,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            RageButton(
+                label = stringResource(R.string.mark_all_rotated),
+                onClick = onMarkRotated,
+                icon = Icons.Outlined.Check,
+                variant = ButtonVariant.Secondary,
+                fullWidth = true,
+            )
+        }
+        if (count == 0 && staleRageCount == 0) {
+            RageButton(
+                label = stringResource(R.string.begin),
+                onClick = onBegin,
+                icon = Icons.Outlined.TouchApp,
+                fullWidth = true,
+                enabled = false,
             )
         }
     }
@@ -254,14 +306,14 @@ private fun RunningStep(processed: Int, total: Int, currentName: String?) {
             }
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "Re-encrypting...",
+                text = stringResource(R.string.re_encrypting),
                 style = RageType.h2.copy(fontSize = 18.sp),
                 color = c.fgEmphasis,
                 textAlign = TextAlign.Center,
             )
             Spacer(modifier = Modifier.height(6.dp))
             Text(
-                text = "$processed of $total",
+                text = stringResource(R.string.of, processed, total),
                 style = RageType.caption.copy(fontSize = 12.5.sp),
                 color = c.fgSecondary,
                 textAlign = TextAlign.Center,
@@ -332,14 +384,14 @@ private fun DoneStep(
                 }
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(
-                    text = "Done.",
+                    text = stringResource(R.string.done_2),
                     style = RageType.h2.copy(fontSize = 20.sp),
                     color = c.fgEmphasis,
                     textAlign = TextAlign.Center,
                 )
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
-                    text = "$protectedCount item${if (protectedCount == 1) "" else "s"} now protected.",
+                    text = androidx.compose.ui.res.pluralStringResource(R.plurals.items_now_protected, protectedCount, protectedCount),
                     style = RageType.body.copy(fontSize = 14.sp, lineHeight = 20.sp),
                     color = c.fgSecondary,
                     textAlign = TextAlign.Center,
@@ -348,7 +400,7 @@ private fun DoneStep(
             if (failed.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(14.dp))
                 Text(
-                    text = "Failed (${failed.size})",
+                    text = stringResource(R.string.failed, failed.size),
                     style = RageType.rowTitle.copy(fontSize = 14.sp),
                     color = c.fgEmphasis,
                 )
@@ -381,7 +433,7 @@ private fun DoneStep(
         }
         Spacer(modifier = Modifier.height(14.dp))
         RageButton(
-            label = "Close",
+            label = stringResource(R.string.close),
             onClick = onClose,
             icon = Icons.Outlined.Check,
             fullWidth = true,
@@ -395,6 +447,7 @@ private fun InfoCallout(text: String) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .height(IntrinsicSize.Min)
             .background(c.surfaceSunken, RoundedCornerShape(8.dp))
             .border(1.dp, c.border, RoundedCornerShape(8.dp)),
         verticalAlignment = Alignment.Top,

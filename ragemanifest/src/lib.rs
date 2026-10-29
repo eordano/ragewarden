@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 #![warn(rust_2018_idioms)]
 
+pub mod decide;
+pub mod prf_identity;
+pub mod recipient_select;
 pub mod reveal;
 pub mod snapshot;
 

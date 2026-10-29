@@ -2,6 +2,7 @@
 name = "rageterm"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
@@ -15,11 +16,6 @@ path = "src/main.rs"
 [features]
 default = []
 
-# Compiles the software stand-ins for YubiKey PIV and FIDO2 hmac-secret.
-# `build.rs` sets `cfg(release_build)` when PROFILE=release and `hw.rs` turns
-# that into a `compile_error!`, so a release binary that accepts
-# RAGEWARDEN_MOCK_HARDWARE=1 cannot be produced. The stand-ins are also
-# compiled under `cfg(test)` so `cargo test` needs no extra flag.
 mock-hardware = []
 
 [dependencies]
@@ -38,13 +34,11 @@ rand = { workspace = true }
 
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 
-arboard = "3"
+arboard = { version = "3", default-features = false }
 
-dirs = "6"
+dirs = "7"
 
 notify-rust = "4"
-
-directories = "6"
 
 walkdir = "2"
 
@@ -70,6 +64,7 @@ ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ecd
 
 chacha20poly1305 = { workspace = true }
 x25519-dalek = { workspace = true }
+p256 = { workspace = true, features = ["ecdsa"] }
 hkdf = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
@@ -79,6 +74,7 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Pipes"] }
 
 [dev-dependencies]
 tempfile = "3"

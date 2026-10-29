@@ -7,12 +7,13 @@ dist/
 # Staged WASM (regenerated from pkg/)
 ext/wasm/
 
-# npm
+# pnpm
 node_modules/
-package-lock.json
-# Playwright test harness pins its lockfile.
-!tests/playwright/package-lock.json
 
 # IDE
 .vscode/
 *.iml
+
+# Safari app build (safari-host-app/build.sh) and SwiftPM output
+safari-host-app/build/
+safari-host-app/.build/

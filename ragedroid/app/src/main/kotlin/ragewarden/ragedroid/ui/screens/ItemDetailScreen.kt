@@ -1,5 +1,11 @@
 package ragewarden.ragedroid.ui.screens
 
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
+import kotlinx.collections.immutable.toImmutableList
+import ragewarden.ragedroid.R
+import ragewarden.ragedroid.data.VaultBridge
+import ragewarden.ragedroid.di.appEntryPoint
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -16,14 +22,12 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.East
 import androidx.compose.material.icons.outlined.Devices
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Key
-import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
 import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Visibility
@@ -55,6 +59,7 @@ import ragewarden.ragedroid.model.Recipient
 import ragewarden.ragedroid.model.VaultItem
 import ragewarden.ragedroid.jni.generateTotp
 import ragewarden.ragedroid.ui.components.AppBar
+import ragewarden.ragedroid.ui.components.BackButton
 import ragewarden.ragedroid.ui.components.ButtonVariant
 import ragewarden.ragedroid.ui.components.CopyButton
 import ragewarden.ragedroid.ui.components.Field
@@ -77,6 +82,7 @@ import ragewarden.ragedroid.identities.PinRequest
 import ragewarden.ragedroid.identities.StanzaTags
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
+import ragewarden.ragedroid.ui.uiString
 
 private const val REVEAL_AUTO_CLEAR_SECS = 8
 
@@ -86,18 +92,21 @@ private const val REVEAL_AUTO_CLEAR_SECS = 8
  * back to substring-sniffing the message for errors that came up through the
  * JNI/age layer untyped.
  */
-private fun classifyTapFailure(err: Throwable): TapFailureKind = when (err) {
+internal fun classifyTapFailure(err: Throwable): TapFailureKind = when (err) {
     is HardwareTapTimeoutException -> TapFailureKind.Timeout
     is HardwareTapCancelledException -> TapFailureKind.Cancelled
+    is ragewarden.ragedroid.identities.HardwareTapWrongKeyException -> TapFailureKind.WrongKey
     is NoUsableIdentityException -> TapFailureKind.NoMatch
     is kotlinx.coroutines.TimeoutCancellationException -> TapFailureKind.Timeout
     else -> {
         val msg = err.message.orEmpty()
         when {
             msg.contains("cancel", ignoreCase = true) -> TapFailureKind.Cancelled
-            msg.contains("match", ignoreCase = true) ||
-                msg.contains("no identities", ignoreCase = true) -> TapFailureKind.NoMatch
-            else -> TapFailureKind.WrongKey
+            msg.contains("no matching identity", ignoreCase = true) -> TapFailureKind.NoMatch
+            msg.contains("wrong key", ignoreCase = true) ||
+                msg.contains("not a recipient", ignoreCase = true) ||
+                msg.contains("unwrap", ignoreCase = true) -> TapFailureKind.WrongKey
+            else -> TapFailureKind.Unknown
         }
     }
 }
@@ -114,7 +123,7 @@ fun ItemDetailScreen(
      * It must **throw** on refusal. Returning a fallback plaintext, or an empty
      * array, is how a hardware requirement turns into a suggestion.
      */
-    decryptPassword: suspend (itemId: String, onlyRecipientIds: Set<String>?) -> ByteArray,
+    decryptPassword: suspend (itemId: String, onlyRecipientIds: Set<String>?, purpose: String, use: ragewarden.ragedroid.data.audit.AuditAction?) -> ByteArray,
     clipboard: Clipboard,
     showToast: (String) -> Unit,
     onBack: () -> Unit,
@@ -128,17 +137,53 @@ fun ItemDetailScreen(
     onIdentityPickerOpened: () -> Unit = {},
     onSetUpDevice: (() -> Unit)? = null,
     /** What the prompt is allowed to claim about the key. Derived from a real IdentitySet. */
-    tapPresentation: TapPresentation = TapPresentation.softwareOnly("this device"),
+    tapPresentation: TapPresentation = TapPresentation.softwareOnly(uiString(R.string.this_device_2)),
     /** Pending PIV PIN request from the tap coordinator, if any. */
     pinRequest: PinRequest? = null,
+    /** One protected field other than the password (a TOTP seed, notes), behind its own tap. */
+    decryptField: (suspend (field: String) -> ByteArray)? = null,
 ) {
+    val strings = androidx.compose.ui.platform.LocalContext.current
     val c = rageColors
 
     var tapMode by remember { mutableStateOf<TapMode>(TapMode.Idle) }
     var selectedRecipientIds by remember { mutableStateOf<Set<String>?>(null) }
     var revealedPlaintext by remember { mutableStateOf<ByteArray?>(null) }
+    // Protected login fields other than the password (another client may have
+    // protected the TOTP seed or the notes), opened one at a time.
+    val protectedFields = remember(item.id, item.protectedFields, item.rage) {
+        ragewarden.ragedroid.data.ItemFields.protectedFields(item).filter { it == "totp" || it == "notes" }.toSet()
+    }
+    val openedFields = androidx.compose.runtime.remember(item.id) { androidx.compose.runtime.mutableStateMapOf<String, String>() }
+    val fieldScope = androidx.compose.runtime.rememberCoroutineScope()
+    val fieldContext = androidx.compose.ui.platform.LocalContext.current
+    val openField: (String) -> Unit = { field ->
+        val decrypt = decryptField
+        if (decrypt != null) {
+            fieldScope.launch {
+                runCatching { decrypt(field) }
+                    .onSuccess { b ->
+                        openedFields[field] = String(b, Charsets.UTF_8)
+                        b.fill(0)
+                    }
+                    .onFailure { e -> showToast(fieldContext.getString(R.string.not_opened, e.message ?: "")) }
+            }
+        }
+    }
+    // Text on screen needs a String; this is the one made per reveal.
+    val revealedText = remember(revealedPlaintext) { revealedPlaintext?.let { String(it, Charsets.UTF_8) } }
     var revealSecsLeft by remember { mutableStateOf(REVEAL_AUTO_CLEAR_SECS) }
     var showSheet by remember { mutableStateOf(false) }
+    val liveRecipientsForWraps = ragewarden.ragedroid.ui.LocalLiveRecipients.current
+    val legacyWraps = remember(item.id, item.recipients, liveRecipientsForWraps) {
+        if (item.rage) {
+            (repository?.legacyPrfWraps(item.id) ?: 0) +
+                ragewarden.ragedroid.data.RecipientDescriptors.movedPasskeyWraps(item.recipients, liveRecipientsForWraps)
+        } else {
+            0
+        }
+    }
+    var folderChoices by remember { mutableStateOf<kotlinx.collections.immutable.ImmutableList<ragewarden.ragedroid.ui.components.FolderOption>?>(null) }
     var identityPickerOpen by remember { mutableStateOf(false) }
     var pendingTapAction by remember { mutableStateOf<TapAction?>(null) }
     var deleteConfirmOpen by remember { mutableStateOf(false) }
@@ -180,7 +225,7 @@ fun ItemDetailScreen(
         pt.fill(0)
         revealedPlaintext = null
         tapMode = TapMode.Idle
-        showToast("Password cleared from screen")
+        showToast(strings.getString(R.string.password_cleared_from_screen))
     }
 
     DisposableEffect(item.id) {
@@ -198,25 +243,19 @@ fun ItemDetailScreen(
         AppBar(
             title = item.name,
             subtitle = item.site.ifBlank { null },
-            leading = {
-                IconBtn(
-                    icon = Icons.AutoMirrored.Outlined.ArrowBack,
-                    contentDescription = "Back",
-                    onClick = onBack,
-                )
-            },
+            leading = { BackButton(onBack) },
             trailing = {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (onEdit != null) {
                         IconBtn(
                             icon = Icons.Outlined.Edit,
-                            contentDescription = "Edit",
+                            contentDescription = stringResource(R.string.edit),
                             onClick = onEdit,
                         )
                     }
                     IconBtn(
                         icon = Icons.Outlined.MoreVert,
-                        contentDescription = "More actions",
+                        contentDescription = stringResource(R.string.more_actions),
                         onClick = { showSheet = true },
                     )
                 }
@@ -229,7 +268,7 @@ fun ItemDetailScreen(
                 .padding(horizontal = 16.dp, vertical = 12.dp),
         ) {
             item("username") {
-                Field(label = "Username") {
+                Field(label = stringResource(R.string.username)) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -250,7 +289,7 @@ fun ItemDetailScreen(
                         CopyButton(
                             onCopy = {
                                 clipboard.copyVisible(item.username, "username")
-                                showToast("Username copied")
+                                showToast(strings.getString(R.string.username_copied))
                             },
                             compact = true,
                         )
@@ -260,13 +299,13 @@ fun ItemDetailScreen(
 
             item("password") {
                 Field(
-                    label = "Password",
-                    hint = if (!item.rage) "This item is not protected by Ragewarden." else null,
+                    label = stringResource(R.string.password),
+                    hint = if (!item.rage) stringResource(R.string.this_item_is_not_protected_by) else null,
                 ) {
                     when {
                         revealedPlaintext != null -> {
                             RevealedPasswordCard(
-                                plaintext = String(revealedPlaintext!!, Charsets.UTF_8),
+                                plaintext = revealedText.orEmpty(),
                                 secsLeft = revealSecsLeft,
                                 onHide = {
                                     revealedPlaintext?.fill(0)
@@ -288,7 +327,7 @@ fun ItemDetailScreen(
                                 onAuthorize = {
                                     val plaintext = withContext(Dispatchers.IO) {
                                         trace("ragewarden.decrypt") {
-                                            decryptPassword(item.id, selectedRecipientIds)
+                                            decryptPassword(item.id, selectedRecipientIds, uiString(R.string.re_encrypt_to_the_current_keys, item.name), null)
                                         }
                                     }
                                     val rotateFn = onRotate
@@ -306,7 +345,7 @@ fun ItemDetailScreen(
                                         // its Failed phase can render -- clearing it
                                         // here would unmount the component and
                                         // cancel the effect that reports the error.
-                                        showToast("Rotated to current recipients")
+                                        showToast(strings.getString(R.string.rotated_to_current_recipients))
                                         tapMode = TapMode.Idle
                                     }
                                 },
@@ -320,11 +359,12 @@ fun ItemDetailScreen(
                                 presentation = tapPresentation,
                                 initialAction = (tapMode as TapMode.Active).preselected,
                                 pinRequest = pinRequest,
+                                copiesForAutofill = true,
                                 onAuthorize = { action ->
                                     val plaintext = try {
                                         withContext(Dispatchers.IO) {
                                             trace("ragewarden.decrypt") {
-                                                decryptPassword(item.id, selectedRecipientIds)
+                                                decryptPassword(item.id, selectedRecipientIds, tapPurpose(action, item.name), if (action == TapAction.Reveal) ragewarden.ragedroid.data.audit.AuditAction.Reveal else ragewarden.ragedroid.data.audit.AuditAction.Copy)
                                             }
                                         }
                                     } catch (err: Throwable) {
@@ -343,19 +383,18 @@ fun ItemDetailScreen(
                                     }
                                     when (action) {
                                         TapAction.Autofill -> {
-                                            clipboard.copySensitive(plaintext, "password")
+                                            clipboard.copySensitive(plaintext, "password", audit = null)
                                             plaintext.fill(0)
                                             tapMode = TapMode.Idle
                                             showToast(
-                                                "Copied · paste into ${item.site.ifBlank { item.name }}. " +
-                                                    "Tap the Ragewarden chip on the field for direct autofill.",
+                                                uiString(R.string.copied_paste_into_tap_the_ragewarden, item.site.ifBlank { item.name }),
                                             )
                                         }
                                         TapAction.Copy -> {
-                                            clipboard.copySensitive(plaintext, "password")
+                                            clipboard.copySensitive(plaintext, "password", audit = null)
                                             plaintext.fill(0)
                                             tapMode = TapMode.Idle
-                                            showToast("Copied · clears in 30s")
+                                            showToast(strings.getString(R.string.copied_clears_in_30s))
                                         }
                                         TapAction.Reveal -> {
                                             revealedPlaintext = plaintext
@@ -386,18 +425,17 @@ fun ItemDetailScreen(
                                         when (action) {
                                             TapAction.Autofill -> {
                                                 val pw = item.password.toByteArray(Charsets.UTF_8)
-                                                clipboard.copySensitive(pw, "password")
+                                                clipboard.copySensitive(pw, "password", item = item.name)
                                                 pw.fill(0)
                                                 showToast(
-                                                    "Copied · paste into ${item.site.ifBlank { item.name }}. " +
-                                                        "Tap the Ragewarden chip on the field for direct autofill.",
+                                                    uiString(R.string.copied_paste_into_tap_the_ragewarden, item.site.ifBlank { item.name }),
                                                 )
                                             }
                                             TapAction.Copy -> {
                                                 val pw = item.password.toByteArray(Charsets.UTF_8)
-                                                clipboard.copySensitive(pw, "password")
+                                                clipboard.copySensitive(pw, "password", item = item.name)
                                                 pw.fill(0)
-                                                showToast("Copied · clears in 30s")
+                                                showToast(strings.getString(R.string.copied_clears_in_30s))
                                             }
                                             TapAction.Reveal -> {
                                                 revealedPlaintext = item.password.toByteArray(Charsets.UTF_8)
@@ -411,25 +449,43 @@ fun ItemDetailScreen(
                 }
             }
 
-            if (item.totpSeed != null) {
+            if (item.totpSeed != null || "totp" in protectedFields) {
                 item("totp") {
-                    Field(label = "TOTP", hint = "Code refreshes every 30s.") {
+                    Field(label = stringResource(R.string.totp), hint = stringResource(R.string.code_refreshes_every_30s)) {
+                        val seed = item.totpSeed ?: openedFields["totp"]
+                        if (seed == null) {
+                            OpenProtectedFieldButton(
+                                label = stringResource(R.string.show_totp_codes),
+                                enabled = decryptField != null,
+                                onOpen = { openField("totp") },
+                            )
+                            return@Field
+                        }
                         TotpCard(
-                            seed = item.totpSeed,
+                            seed = seed,
                             onCopy = { code ->
                                 val bytes = code.toByteArray(Charsets.UTF_8)
-                                clipboard.copySensitive(bytes, "totp")
+                                clipboard.copySensitive(bytes, "totp", audit = ragewarden.ragedroid.data.audit.AuditAction.Totp, item = item.name)
                                 bytes.fill(0)
-                                showToast("TOTP copied · clears in 30s")
+                                showToast(strings.getString(R.string.totp_copied_clears_in_30s))
                             },
                         )
                     }
                 }
             }
 
-            if (item.notes != null) {
+            if (item.notes != null || "notes" in protectedFields) {
                 item("notes") {
-                    Field(label = "Notes") {
+                    Field(label = stringResource(R.string.notes)) {
+                        val noteText = item.notes ?: openedFields["notes"]
+                        if (noteText == null) {
+                            OpenProtectedFieldButton(
+                                label = stringResource(R.string.open_note),
+                                enabled = decryptField != null,
+                                onOpen = { openField("notes") },
+                            )
+                            return@Field
+                        }
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -438,7 +494,7 @@ fun ItemDetailScreen(
                                 .padding(horizontal = 12.dp, vertical = 10.dp),
                         ) {
                             Text(
-                                text = item.notes,
+                                text = noteText,
                                 style = RageType.body,
                                 color = c.fgPrimary,
                             )
@@ -450,13 +506,11 @@ fun ItemDetailScreen(
             if (item.rage && (recipients.isNotEmpty() || anonymousRecipientCount > 0)) {
                 item("recipients") {
                     Field(
-                        label = "Unlock recipients",
+                        label = stringResource(R.string.unlock_recipients),
                         hint = if (anonymousRecipientCount > 0) {
-                            "Any one of these can decrypt this secret. " +
-                                "$anonymousRecipientCount software or paper recipient(s) are also " +
-                                "wrapped in -- age headers do not name those, so they cannot be listed."
+                            stringResource(R.string.any_one_of_these_can_open_2, anonymousRecipientCount)
                         } else {
-                            "Any one of these can decrypt this secret."
+                            stringResource(R.string.any_one_of_these_can_decrypt_3)
                         },
                     ) {
                         Column(
@@ -502,6 +556,18 @@ fun ItemDetailScreen(
             }
 
             item("meta") {
+                val metaContext = androidx.compose.ui.platform.LocalContext.current
+                val (lastUsedText, historyCount) = remember(item.id, item.name) {
+                    val entry = runCatching { metaContext.appEntryPoint() }.getOrNull()
+                    val account = VaultBridge.repository()?.accountId.orEmpty()
+                    val last = entry?.let { e ->
+                        runCatching { e.auditFeed().list().firstOrNull { it.item == item.name } }.getOrNull()
+                    }?.let { "${it.bucket} ${it.timestamp}".trim() }
+                    val revisions = entry?.takeIf { account.isNotBlank() }?.let { e ->
+                        runCatching { e.historyStore().forItem(account, item.id).size }.getOrNull()
+                    }
+                    last to revisions
+                }
                 Spacer(modifier = Modifier.height(4.dp))
                 Row(
                     modifier = Modifier
@@ -512,24 +578,27 @@ fun ItemDetailScreen(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "LAST USED",
+                            text = stringResource(R.string.last_used),
                             style = RageType.eyebrow,
                             color = c.fgSecondary,
                         )
                         Text(
-                            text = item.lastUsed,
+                            text = lastUsedText ?: stringResource(R.string.not_used_on_this_phone),
                             style = RageType.sansBody,
                             color = c.fgPrimary,
                         )
                     }
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "HISTORY",
+                            text = stringResource(R.string.history),
                             style = RageType.eyebrow,
                             color = c.fgSecondary,
                         )
                         Text(
-                            text = "${item.history} versions",
+                            text = when (historyCount) {
+                                null -> stringResource(R.string.no_local_history)
+                                else -> androidx.compose.ui.res.pluralStringResource(R.plurals.version_count, historyCount, historyCount)
+                            },
                             style = RageType.sansBody,
                             color = c.fgPrimary,
                         )
@@ -540,24 +609,27 @@ fun ItemDetailScreen(
         }
     }
 
-    Sheet(open = showSheet, onDismiss = { showSheet = false }, title = "More actions") {
+    Sheet(open = showSheet, onDismiss = { showSheet = false }, title = stringResource(R.string.more_actions)) {
         SheetActions(
             includeLaunchWebsite = item.site.isNotBlank(),
             includeRotate = item.rage && onRotate != null,
+            rotateLabel = if (legacyWraps > 0) androidx.compose.ui.res.pluralStringResource(R.plurals.re_encrypt_renews_passkey_wraps, legacyWraps, legacyWraps) else stringResource(R.string.re_encrypt_to_current_keys),
             includeHistory = onHistory != null,
             // No repository means no master-password gate can be built, so the
             // delete affordance is withheld rather than shown ungated.
             includeDelete = onDelete != null && repository != null,
-            onAction = { label ->
+            includeChooseKey = recipients.size > 1,
+            includeMove = repository != null,
+            onAction = { action ->
                 showSheet = false
-                when (label) {
-                    "Launch website" -> {
+                when (action) {
+                    ItemSheetAction.LaunchWebsite -> {
                         val raw = item.site.trim()
                         val target = if (raw.contains("://")) raw else "https://$raw"
                         runCatching { uriHandler.openUri(target) }
-                            .onFailure { e -> showToast("Couldn't open $target: ${e.message}") }
+                            .onFailure { e -> showToast(strings.getString(R.string.couldn_t_open, target, e.message ?: strings.getString(R.string.unknown_error))) }
                     }
-                    "Rotate to current recipients" -> {
+                    ItemSheetAction.Rotate -> {
                         if (recipients.size > 1) {
                             pendingTapAction = null
                             identityPickerOpen = true
@@ -566,9 +638,33 @@ fun ItemDetailScreen(
                             tapMode = TapMode.Rotating
                         }
                     }
-                    "View history" -> onHistory?.invoke()
-                    "Edit recipients" -> identityPickerOpen = true
-                    "Delete item" -> deleteConfirmOpen = true
+                    ItemSheetAction.History -> onHistory?.invoke()
+                    ItemSheetAction.Move -> scope.launch {
+                        folderChoices = repository?.listFolders()?.getOrNull()
+                            ?.map { ragewarden.ragedroid.ui.components.FolderOption(it.id, it.name, null) }
+                            ?.let { listOf(ragewarden.ragedroid.ui.components.FolderOption(null, uiString(R.string.no_folder), null)) + it }
+                            ?.toImmutableList()
+                        if (folderChoices == null) showToast(strings.getString(R.string.couldn_t_load_folders))
+                    }
+                    ItemSheetAction.ChooseKey -> identityPickerOpen = true
+                    ItemSheetAction.Delete -> deleteConfirmOpen = true
+                }
+            },
+        )
+    }
+
+    folderChoices?.let { choices ->
+        ragewarden.ragedroid.ui.components.MoveToFolderSheet(
+            open = true,
+            onClose = { folderChoices = null },
+            folders = choices,
+            currentId = item.folderId,
+            onPick = { picked ->
+                folderChoices = null
+                scope.launch {
+                    repository?.moveToFolder(item.id, picked.id)
+                        ?.onSuccess { showToast(strings.getString(R.string.moved_to, picked.name)) }
+                        ?.onFailure { e -> showToast(strings.getString(R.string.not_moved, e.message ?: strings.getString(R.string.unknown_error))) }
                 }
             },
         )
@@ -588,13 +684,13 @@ fun ItemDetailScreen(
         MasterPasswordConfirm(
             open = deletePwOpen,
             onClose = { deletePwOpen = false },
-            title = "Delete \"${item.name}\"?",
+            title = stringResource(R.string.delete, item.name),
             body = if (item.rage) {
-                "RageDroid-protected items are removed for good. Confirm with your master password to continue."
+                stringResource(R.string.ragedroid_protected_items_are_removed_for)
             } else {
-                "The server keeps a 30-day soft-delete window. Confirm with your master password to continue."
+                stringResource(R.string.the_server_keeps_a_30_day_2)
             },
-            action = if (item.rage) "Delete permanently" else "Delete",
+            action = if (item.rage) stringResource(R.string.delete_permanently) else stringResource(R.string.delete_2),
             danger = true,
             repository = repository,
             onConfirm = {
@@ -603,8 +699,8 @@ fun ItemDetailScreen(
                 deleting = true
                 scope.launch {
                     runCatching { handler() }
-                        .onSuccess { showToast("Deleted \"${item.name}\"") }
-                        .onFailure { e -> showToast("Delete failed: ${e.message}") }
+                        .onSuccess { showToast(strings.getString(R.string.deleted, item.name)) }
+                        .onFailure { e -> showToast(strings.getString(R.string.delete_failed, e.message ?: strings.getString(R.string.unknown_error))) }
                     deleting = false
                 }
             },
@@ -622,7 +718,7 @@ fun ItemDetailScreen(
             // only showed "Using <name>" and then handed every identity on the
             // device to age, so the pick was cosmetic.
             selectedRecipientIds = setOf(recipient.id)
-            showToast("Using ${recipient.name}")
+            showToast(strings.getString(R.string.using, recipient.name))
             if (action != null) {
                 tapMode = TapMode.Active(preselected = action)
             }
@@ -644,23 +740,31 @@ private fun SheetActions(
     includeRotate: Boolean = false,
     includeHistory: Boolean = false,
     includeDelete: Boolean = false,
-    onAction: (String) -> Unit,
+    includeChooseKey: Boolean = false,
+    includeMove: Boolean = false,
+    rotateLabel: String = uiString(R.string.re_encrypt_to_current_keys),
+    onAction: (ItemSheetAction) -> Unit,
 ) {
     val c = rageColors
-    data class ActionRow(val label: String, val icon: ImageVector, val danger: Boolean = false)
+    data class ActionRow(val action: ItemSheetAction, val label: String, val icon: ImageVector, val danger: Boolean = false)
     val rows = buildList {
         if (includeLaunchWebsite) {
-            add(ActionRow("Launch website", Icons.Outlined.East))
+            add(ActionRow(ItemSheetAction.LaunchWebsite, stringResource(R.string.launch_website), Icons.Outlined.East))
         }
-        add(ActionRow("Edit recipients", Icons.Outlined.MoreVert))
+        if (includeChooseKey) {
+            add(ActionRow(ItemSheetAction.ChooseKey, stringResource(R.string.choose_which_key_to_use), Icons.Outlined.MoreVert))
+        }
+        if (includeMove) {
+            add(ActionRow(ItemSheetAction.Move, stringResource(R.string.move_to_folder), Icons.Outlined.MoreVert))
+        }
         if (includeRotate) {
-            add(ActionRow("Rotate to current recipients", Icons.Outlined.Refresh))
+            add(ActionRow(ItemSheetAction.Rotate, rotateLabel, Icons.Outlined.Refresh))
         }
         if (includeHistory) {
-            add(ActionRow("View history", Icons.Outlined.MoreVert))
+            add(ActionRow(ItemSheetAction.History, stringResource(R.string.view_history), Icons.Outlined.MoreVert))
         }
         if (includeDelete) {
-            add(ActionRow("Delete item", Icons.Outlined.DeleteOutline, danger = true))
+            add(ActionRow(ItemSheetAction.Delete, stringResource(R.string.delete_item), Icons.Outlined.DeleteOutline, danger = true))
         }
     }
     Column(modifier = Modifier.fillMaxWidth()) {
@@ -669,7 +773,7 @@ private fun SheetActions(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { onAction(row.label) }
+                    .clickable { onAction(row.action) }
                     .padding(vertical = 12.dp, horizontal = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -707,7 +811,7 @@ private fun DeleteConfirmSheet(
     val expected = item.name
     val ok = !protectedItem || typed.trim().equals(expected.trim(), ignoreCase = true)
 
-    Sheet(open = open, onDismiss = onClose, title = "Delete this item?") {
+    Sheet(open = open, onDismiss = onClose, title = stringResource(R.string.delete_this_item)) {
         Column(modifier = Modifier.fillMaxWidth()) {
             Column(
                 modifier = Modifier
@@ -731,16 +835,16 @@ private fun DeleteConfirmSheet(
             Spacer(modifier = Modifier.height(14.dp))
             Text(
                 text = if (protectedItem) {
-                    "This item is RageDroid-protected. Deleting it removes every encrypted version from the server. There is no undo."
+                    stringResource(R.string.this_item_is_ragedroid_protected_deleting)
                 } else {
-                    "The server keeps a 30-day soft-delete. You can restore it from the trash within that window."
+                    stringResource(R.string.the_server_keeps_a_30_day)
                 },
                 style = RageType.body,
                 color = c.fgPrimary,
             )
             Spacer(modifier = Modifier.height(14.dp))
             if (protectedItem) {
-                Field(label = "Type \"$expected\" to confirm") {
+                Field(label = stringResource(R.string.type_to_confirm, expected)) {
                     TextInput(
                         value = typed,
                         onValueChange = { typed = it },
@@ -753,12 +857,12 @@ private fun DeleteConfirmSheet(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 RageButton(
-                    label = "Cancel",
+                    label = stringResource(R.string.cancel),
                     onClick = onClose,
                     variant = ButtonVariant.Secondary,
                 )
                 RageButton(
-                    label = if (protectedItem) "Delete permanently" else "Delete",
+                    label = if (protectedItem) stringResource(R.string.delete_permanently) else stringResource(R.string.delete_2),
                     onClick = { if (ok) onConfirm() },
                     variant = ButtonVariant.Danger,
                     enabled = ok,
@@ -785,17 +889,14 @@ private fun NeedsSetupCard(
 ) {
     val c = rageColors
     val title = if (firstDevice) {
-        "Set up this device"
+        stringResource(R.string.set_up_this_device)
     } else {
-        "This item was protected on another device"
+        stringResource(R.string.this_item_was_protected_on_another_2)
     }
     val body = if (firstDevice) {
-        "You haven't enrolled any keys on this device yet. Set this device up -- ideally " +
-            "from one that already has access to your vault -- and protected items will open here."
+        stringResource(R.string.you_haven_t_enrolled_any_keys)
     } else {
-        "None of the keys on this device are recipients for this item. Add one of this " +
-            "device's keys to the recipient set from a device that already has access; " +
-            "the next sync re-encrypts to include it."
+        stringResource(R.string.none_of_the_keys_on_this)
     }
     Column(
         modifier = Modifier
@@ -824,7 +925,7 @@ private fun NeedsSetupCard(
             color = c.fgSecondary,
         )
         RageButton(
-            label = "Set up this device",
+            label = stringResource(R.string.set_up_this_device),
             onClick = onSetUpDevice,
             icon = Icons.Outlined.Key,
             fullWidth = true,
@@ -891,6 +992,7 @@ private fun ActionButton(
     val (icon, label) = actionMetadata(action)
     Column(
         modifier = modifier
+            .testTag("action-${action.name.lowercase()}")
             .background(bg, RoundedCornerShape(8.dp))
             .border(1.dp, borderColor, RoundedCornerShape(8.dp))
             .clickable(onClick = onClick)
@@ -904,9 +1006,9 @@ private fun ActionButton(
 }
 
 private fun actionMetadata(action: TapAction): Pair<ImageVector, String> = when (action) {
-    TapAction.Autofill -> Icons.Outlined.East to "Autofill"
-    TapAction.Copy -> Icons.Outlined.ContentCopy to "Copy"
-    TapAction.Reveal -> Icons.Outlined.Visibility to "Reveal"
+    TapAction.Autofill -> Icons.Outlined.East to uiString(R.string.copy_for_autofill)
+    TapAction.Copy -> Icons.Outlined.ContentCopy to uiString(R.string.copy)
+    TapAction.Reveal -> Icons.Outlined.Visibility to uiString(R.string.reveal)
 }
 
 @Composable
@@ -952,7 +1054,7 @@ private fun RevealedPasswordCard(
                         .background(c.success, RoundedCornerShape(50)),
                 )
                 Text(
-                    text = "Auto-clear in ${secsLeft}s",
+                    text = stringResource(R.string.auto_clear_in_s, secsLeft),
                     style = RageType.meta,
                     color = c.fgSecondary,
                 )
@@ -961,6 +1063,7 @@ private fun RevealedPasswordCard(
                 modifier = Modifier
                     .background(c.surface, RoundedCornerShape(6.dp))
                     .border(1.dp, c.border, RoundedCornerShape(6.dp))
+                    .testTag("password-hide")
                     .clickable(onClick = onHide)
                     .padding(horizontal = 8.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -972,7 +1075,7 @@ private fun RevealedPasswordCard(
                     tint = c.fgPrimary,
                     modifier = Modifier.size(13.dp),
                 )
-                Text(text = "Hide", style = RageType.caption, color = c.fgPrimary)
+                Text(text = stringResource(R.string.hide), style = RageType.caption, color = c.fgPrimary)
             }
         }
     }
@@ -1020,7 +1123,7 @@ private fun TotpCard(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Text(
-                text = "${secsLeft}s",
+                text = stringResource(R.string.seconds_short, secsLeft),
                 style = RageType.meta,
                 color = c.fgSecondary,
             )
@@ -1041,9 +1144,28 @@ private fun TotpCard(
                         tint = c.fgPrimary,
                         modifier = Modifier.size(13.dp),
                     )
-                    Text(text = "Copy", style = RageType.caption, color = c.fgPrimary)
+                    Text(text = stringResource(R.string.copy), style = RageType.caption, color = c.fgPrimary)
                 }
             }
         }
     }
+}
+
+internal fun tapPurpose(action: TapAction, itemName: String): String = when (action) {
+    TapAction.Autofill -> uiString(R.string.copy_password_for_autofill, itemName)
+    TapAction.Copy -> uiString(R.string.copy_password_to_the_clipboard, itemName)
+    TapAction.Reveal -> uiString(R.string.show_password_on_screen_for_8, itemName)
+}
+
+internal enum class ItemSheetAction { LaunchWebsite, ChooseKey, Move, Rotate, History, Delete }
+
+@Composable
+private fun OpenProtectedFieldButton(label: String, enabled: Boolean, onOpen: () -> Unit) {
+    ragewarden.ragedroid.ui.components.RageButton(
+        label = label,
+        onClick = onOpen,
+        variant = ragewarden.ragedroid.ui.components.ButtonVariant.Secondary,
+        fullWidth = true,
+        enabled = enabled,
+    )
 }

@@ -8,7 +8,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createServer } from 'node:net';
-import { EXTENSION_DIST, PLAYWRIGHT_DIR } from './playwright.config';
+import { EXTENSION_DIST, MOCK_EXTENSION_DIST, PLAYWRIGHT_DIR } from './playwright.config';
 
 const execFileP = promisify(execFile);
 
@@ -25,8 +25,8 @@ const CARGO_BIN = join(CACHE_DIR, 'bin', 'vaultwarden');
 const RUNTIME_DATA_DIR = join(CACHE_DIR, 'data');
 const RUNTIME_LOG = join(CACHE_DIR, 'vaultwarden.log');
 
-const VAULTWARDEN_VERSION = '1.36.0';
-const VAULTWARDEN_IMAGE = `vaultwarden/server:${VAULTWARDEN_VERSION}`;
+const VAULTWARDEN_VERSION = '1.37.3';
+const VAULTWARDEN_IMAGE = `docker.io/vaultwarden/server:${VAULTWARDEN_VERSION}`;
 const VAULTWARDEN_GIT_TAG = VAULTWARDEN_VERSION;
 const HEALTH_TIMEOUT_MS = 60_000;
 const NATIVE_HEALTH_TIMEOUT_MS = 90_000;
@@ -86,8 +86,8 @@ async function stageExtension(): Promise<void> {
   if (!existsSync(join(CHROMIUM_DIST, 'manifest.json'))) {
     throw new Error(`build.mjs completed but ${CHROMIUM_DIST}/manifest.json is missing`);
   }
-  if (!existsSync(join(CHROMIUM_DIST, 'popup', 'RageDroid.html'))) {
-    throw new Error(`build.mjs completed but ${CHROMIUM_DIST}/popup/RageDroid.html is missing`);
+  if (!existsSync(join(CHROMIUM_DIST, 'popup', 'index.html'))) {
+    throw new Error(`build.mjs completed but ${CHROMIUM_DIST}/popup/index.html is missing`);
   }
 
   console.log('[global-setup] staging canonical chromium build into', EXTENSION_DIST);
@@ -99,13 +99,28 @@ async function stageExtension(): Promise<void> {
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
   const popupEntry =
     manifest?.action?.default_popup ?? manifest?.side_panel?.default_path ?? null;
-  if (popupEntry !== 'popup/RageDroid.html') {
+  if (popupEntry !== 'popup/index.html') {
     throw new Error(
       `staged manifest entry-point = ${JSON.stringify(popupEntry)} ` +
-      `(expected "popup/RageDroid.html" via action.default_popup or side_panel.default_path); ` +
+      `(expected "popup/index.html" via action.default_popup or side_panel.default_path); ` +
       `build.mjs may have regressed`,
     );
   }
+}
+
+/**
+ * A mock-tap build for the content-script leg. The CDP virtual authenticator is
+ * per target and its PRF secret does not follow into the tap window, so the
+ * chip -> tap window -> fill path runs against a build that fabricates taps.
+ * Never shipped: build.mjs refuses --zip with --allow-mock-tap.
+ */
+async function stageMockExtension(): Promise<void> {
+  console.log('[global-setup] building the mock-tap variant for the content-script spec');
+  await runStreaming('node', [BUILD_SCRIPT, 'chromium', '--test-hooks', '--allow-mock-tap', '--force-mock-tap'],
+    RAGEMANIFEST_ROOT, { RAGEWARDEN_UNSAFE_MOCK_TAP: '1' });
+  rmSync(MOCK_EXTENSION_DIST, { recursive: true, force: true });
+  mkdirSync(MOCK_EXTENSION_DIST, { recursive: true });
+  cpSync(CHROMIUM_DIST, MOCK_EXTENSION_DIST, { recursive: true });
 }
 
 async function bringUpVaultwarden(): Promise<State> {
@@ -161,14 +176,14 @@ async function bringUpVaultwarden(): Promise<State> {
       '        nix develop .#ragewarden',
       '',
       '  (a) Run a Vaultwarden any way you like and export VAULTWARDEN_URL:',
-      '        VAULTWARDEN_URL=http://127.0.0.1:8080 npm test',
+      '        VAULTWARDEN_URL=http://127.0.0.1:8080 pnpm test',
       '',
       '  (b) Install a container runtime (docker, colima, podman, ...) so the',
       '      existing Tier-2 container path can run.',
       '',
       `  (c) Have Rust available and opt into building Vaultwarden ${VAULTWARDEN_VERSION} from`,
       '      source (slow first time, ~5-10 min, then cached):',
-      '        RAGEWARDEN_USE_CARGO_VAULTWARDEN=1 npm test',
+      '        RAGEWARDEN_USE_CARGO_VAULTWARDEN=1 pnpm test',
       '',
       'See ragemanifest/README.md -> "Tier-2 (Playwright) without Docker" for details.',
     ].join('\n'),
@@ -354,12 +369,34 @@ async function startNativeBinary(): Promise<State> {
 }
 
 async function isOnPath(cmd: string): Promise<boolean> {
-  try {
-    await execFileP('which', [cmd]);
-    return true;
-  } catch {
-    return false;
+  return (process.env.PATH ?? '').split(':').some(dir => {
+    if (!dir) return false;
+    try {
+      const st = statSync(join(dir, cmd));
+      return st.isFile() && (st.mode & 0o111) !== 0;
+    } catch {
+      return false;
+    }
+  });
+}
+
+/**
+ * The rageterm binary the cross-client specs drive. Built here when the caller
+ * did not hand one in, so a fresh checkout runs the whole suite with one command.
+ */
+async function ensureRagetermBinary(): Promise<void> {
+  if (process.env.RAGETERM_BIN) {
+    if (!existsSync(process.env.RAGETERM_BIN)) {
+      throw new Error(`RAGETERM_BIN=${process.env.RAGETERM_BIN} does not exist`);
+    }
+    return;
   }
+  const targetDir = process.env.CARGO_TARGET_DIR ?? join(WORKSPACE_ROOT, 'target');
+  const bin = join(targetDir, 'debug', 'rageterm');
+  console.log('[global-setup] cargo build -p rageterm (debug) for the cross-client specs');
+  await runStreaming('cargo', ['build', '-p', 'rageterm'], WORKSPACE_ROOT);
+  if (!existsSync(bin)) throw new Error(`cargo build -p rageterm finished but ${bin} is missing`);
+  process.env.RAGETERM_BIN = bin;
 }
 
 async function waitForAlive(url: string, timeoutMs: number): Promise<void> {
@@ -381,9 +418,9 @@ async function waitForAlive(url: string, timeoutMs: number): Promise<void> {
   throw new Error(`Vaultwarden /alive never returned 2xx within ${timeoutMs}ms (last: ${lastErr})`);
 }
 
-async function runStreaming(cmd: string, args: string[], cwd: string): Promise<void> {
+async function runStreaming(cmd: string, args: string[], cwd: string, env: Record<string, string> = {}): Promise<void> {
   await new Promise<void>((resolveP, rejectP) => {
-    const proc = spawn(cmd, args, { cwd, stdio: 'inherit' });
+    const proc = spawn(cmd, args, { cwd, stdio: 'inherit', env: { ...process.env, ...env } });
     proc.on('error', rejectP);
     proc.on('exit', code => {
       if (code === 0) resolveP();
@@ -394,7 +431,9 @@ async function runStreaming(cmd: string, args: string[], cwd: string): Promise<v
 
 export default async function globalSetup(): Promise<void> {
   await buildWasmIfStale();
+  await stageMockExtension();
   await stageExtension();
+  await ensureRagetermBinary();
   const state = await bringUpVaultwarden();
   writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
   process.env.VAULTWARDEN_URL = state.vaultwardenUrl;

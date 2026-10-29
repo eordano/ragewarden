@@ -1,5 +1,7 @@
 package ragewarden.ragedroid.ui.screens
 
+import ragewarden.ragedroid.R
+import androidx.compose.ui.res.stringResource
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -16,7 +18,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Nfc
@@ -30,21 +31,19 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import ragewarden.ragedroid.model.Recipient
 import ragewarden.ragedroid.model.VaultItem
 import ragewarden.ragedroid.ui.components.AppBar
+import ragewarden.ragedroid.ui.components.BackButton
 import ragewarden.ragedroid.ui.components.ButtonVariant
-import ragewarden.ragedroid.ui.components.IconBtn
 import ragewarden.ragedroid.ui.components.RageButton
 import ragewarden.ragedroid.ui.components.RecipientPip
-import ragewarden.ragedroid.ui.theme.RageTheme
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
 
-enum class TapFailureKind { Timeout, WrongKey, Cancelled, NoMatch }
+enum class TapFailureKind { Timeout, WrongKey, Cancelled, NoMatch, Unknown }
 
 @Composable
 fun TapFailureScreen(
@@ -76,14 +75,8 @@ fun TapFailureScreen(
 
     Column(modifier = Modifier.fillMaxSize().background(c.background)) {
         AppBar(
-            title = "Reveal",
-            leading = {
-                IconBtn(
-                    icon = Icons.AutoMirrored.Outlined.ArrowBack,
-                    contentDescription = "Back",
-                    onClick = onBack,
-                )
-            },
+            title = stringResource(R.string.reveal),
+            leading = { BackButton(onBack) },
         )
 
         Column(
@@ -114,14 +107,14 @@ fun TapFailureScreen(
                 }
                 Spacer(modifier = Modifier.height(16.dp))
                 Text(
-                    text = copy.title,
+                    text = stringResource(copy.title),
                     style = RageType.h1.copy(fontSize = 22.sp, lineHeight = 26.sp),
                     color = c.fgEmphasis,
                     textAlign = TextAlign.Center,
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = copy.body,
+                    text = stringResource(copy.body),
                     style = RageType.body.copy(fontSize = 14.sp, lineHeight = 22.sp),
                     color = c.fgSecondary,
                     textAlign = TextAlign.Center,
@@ -132,7 +125,7 @@ fun TapFailureScreen(
             if (recipients.size > 1) {
                 Spacer(modifier = Modifier.height(20.dp))
                 Text(
-                    text = "OR TRY A DIFFERENT RECIPIENT",
+                    text = stringResource(R.string.or_try_a_different_recipient),
                     style = RageType.eyebrow,
                     color = c.fgSecondary,
                     modifier = Modifier.padding(start = 4.dp, bottom = 8.dp),
@@ -181,7 +174,7 @@ fun TapFailureScreen(
             Spacer(modifier = Modifier.weight(1f))
             if (kind == TapFailureKind.NoMatch && onSetUpDevice != null) {
                 RageButton(
-                    label = "Set up this device",
+                    label = stringResource(R.string.set_up_this_device),
                     onClick = onSetUpDevice,
                     icon = Icons.Outlined.Nfc,
                     fullWidth = true,
@@ -189,7 +182,7 @@ fun TapFailureScreen(
                 )
             } else {
                 RageButton(
-                    label = "Try again",
+                    label = stringResource(R.string.try_again),
                     onClick = onRetry,
                     icon = Icons.Outlined.Nfc,
                     fullWidth = true,
@@ -203,8 +196,8 @@ fun TapFailureScreen(
 private enum class Tone { Danger, Warning, Muted }
 
 private data class FailureCopy(
-    val title: String,
-    val body: String,
+    @androidx.annotation.StringRes val title: Int,
+    @androidx.annotation.StringRes val body: Int,
     val icon: ImageVector,
     val tone: Tone,
 )
@@ -213,32 +206,32 @@ private data class ToneColors(val bg: Color, val fg: Color)
 
 private fun failureCopy(kind: TapFailureKind): FailureCopy = when (kind) {
     TapFailureKind.WrongKey -> FailureCopy(
-        title = "That key isn't on the recipient list",
-        body = "The key you tapped is registered to this account, but isn't a recipient " +
-            "for this item. Try a different one of your enrolled keys, or pick a recipient " +
-            "below.",
+        title = R.string.that_key_isn_t_on_the,
+        body = R.string.the_key_you_tapped_is_registered,
         icon = Icons.Outlined.Close,
         tone = Tone.Warning,
     )
     TapFailureKind.Timeout -> FailureCopy(
-        title = "Timed out",
-        body = "No tap detected within 30 seconds. NFC keys time out faster than USB; hold " +
-            "steady against the back of the phone.",
+        title = R.string.timed_out,
+        body = R.string.no_tap_detected_within_30_seconds,
         icon = Icons.Outlined.Schedule,
         tone = Tone.Warning,
     )
     TapFailureKind.Cancelled -> FailureCopy(
-        title = "Cancelled",
-        body = "You dismissed the prompt before tapping. The cipher is unchanged.",
+        title = R.string.cancelled,
+        body = R.string.you_dismissed_the_prompt_before_tapping,
         icon = Icons.Outlined.Close,
         tone = Tone.Muted,
     )
     TapFailureKind.NoMatch -> FailureCopy(
-        title = "You'll need to set up this device first",
-        body = "This item was protected on another device, so the keys on this phone can't " +
-            "open it yet. Set this device up from one that already has access -- your other " +
-            "phone, the browser extension, or rageterm. After it adds this device as a " +
-            "recipient and syncs, protected items open here too.",
+        title = R.string.you_ll_need_to_set_up,
+        body = R.string.this_item_was_protected_on_another,
+        icon = Icons.Outlined.WarningAmber,
+        tone = Tone.Warning,
+    )
+    TapFailureKind.Unknown -> FailureCopy(
+        title = R.string.couldn_t_open_this_item,
+        body = R.string.something_failed_before_or_after_your,
         icon = Icons.Outlined.WarningAmber,
         tone = Tone.Warning,
     )

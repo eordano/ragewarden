@@ -49,6 +49,8 @@ class RecipientRegistry @Inject constructor(
         val fido2RpId: String? = null,
         val fido2Salt: String? = null,
         val recoveryArmoredPubkey: String? = null,
+        val stanzaVersion: Int? = null,
+        val attestationPublicKey: String? = null,
     )
 
     @Serializable

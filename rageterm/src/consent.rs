@@ -3,8 +3,10 @@
 //! The gate is not a message and not a flag: it is *which identities are handed
 //! to `ragewarden_core::decrypt`*. `require` only builds the guard; the guard is
 //! the only thing `commands::decrypt_named` accepts, and `decrypt_named` asks it
-//! what may be offered the header. So there is no path from a stored blob to
-//! plaintext that does not go through the rules below.
+//! what may be offered the header. So no rageterm command reaches plaintext
+//! without the rules below. A process that reads the config directory itself is
+//! outside this gate: `identity.age` is passphrase-encrypted when enrolled at a
+//! terminal, and a bare one is only as private as its file permissions.
 //!
 //! 1. A blob that names an enrolled *real* device in its header is unwrapped by
 //!    that device or not at all. `decrypt_named` runs a hardware-only pass
@@ -30,9 +32,9 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use std::io::{self};
 #[cfg(not(test))]
 use std::io::{BufRead, IsTerminal, Write};
-use std::io::{self};
 
 use thiserror::Error;
 
@@ -152,10 +154,6 @@ impl ConsentGuard {
 
         match self.gate {
             SoftwareGate::YesFlag if self.hardware == HardwareState::Real => {
-                // Unreachable via `require`, which downgrades `--yes` to
-                // `Prompt` on a real-hardware vault. Kept as a second, explicit
-                // refusal so a future caller building the guard by hand cannot
-                // reintroduce the unattended read.
                 return Err(ConsentError::YesRefusedOnHardwareVault {
                     action: format!("{} `{}`", self.action, self.item),
                     item: self.item.clone(),
@@ -225,10 +223,6 @@ pub fn hardware_state() -> Result<HardwareState, ConsentError> {
     })
 }
 
-pub fn hardware_identity_enrolled() -> Result<bool, ConsentError> {
-    Ok(hardware_state()? == HardwareState::Real)
-}
-
 /// Gate one use of one credential. `action` is the user-facing verb, `item` the
 /// credential name, `destination` where the plaintext is about to land.
 ///
@@ -256,9 +250,6 @@ pub fn require(
         ));
     }
 
-    // `--yes` is honoured only where there is no device to tap. With a real
-    // device enrolled it is downgraded to the prompt, so a hardware vault has
-    // no unattended read at all.
     let gate = if yes && hardware != HardwareState::Real {
         SoftwareGate::YesFlag
     } else {
@@ -276,14 +267,15 @@ pub fn require(
     })
 }
 
-/// For callers that have already taken an explicit interactive confirmation of
-/// their own -- today only the TUI, whose overlay `[Enter]` is that
-/// confirmation. It stands in for the y/N prompt and for nothing else: the
-/// hardware rules in `decrypt_named` are identical either way.
+/// For the TUI, whose overlay `[Enter]` is the confirmation. `UiConfirmed` can
+/// only be built by that key handler, so no other caller can claim a
+/// confirmation it never took. It stands in for the y/N prompt and for nothing
+/// else: the hardware rules in `decrypt_named` are identical either way.
 pub fn require_after_confirm(
     action: &str,
     item: &str,
     destination: &str,
+    _confirmed: crate::tui::UiConfirmed,
 ) -> Result<ConsentGuard, ConsentError> {
     crate::hw::warn_banner_once();
 
@@ -355,16 +347,6 @@ fn ask_via_stdin(prompt: &str) -> Result<String, ConsentError> {
     Ok(buf)
 }
 
-// ---------------------------------------------------------------------------
-// Terminal stand-in for the test binary only
-// ---------------------------------------------------------------------------
-//
-// `#[cfg(test)]`, not a cargo feature: unlike `hw::mock_enabled` there is no
-// build of `rageterm` -- release, debug, or `--features mock-hardware` -- in
-// which this code exists. `cargo test` runs under whatever terminal the
-// developer started it from, so the real `ask` would open `/dev/tty` and block
-// the whole test binary on a human. The default when a test has not said
-// otherwise is "no consent surface", i.e. the closed answer.
 #[cfg(test)]
 pub(crate) static TEST_TTY_ANSWER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
@@ -373,17 +355,13 @@ pub(crate) static TEST_TTY_ANSWER: std::sync::Mutex<Option<String>> = std::sync:
 /// around the environment: this is process-global.
 #[cfg(test)]
 pub(crate) fn set_test_tty_answer(answer: Option<&str>) {
-    let mut slot = TEST_TTY_ANSWER
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut slot = TEST_TTY_ANSWER.lock().unwrap_or_else(|e| e.into_inner());
     *slot = answer.map(|s| s.to_string());
 }
 
 #[cfg(test)]
 fn ask(_prompt: &str) -> Result<String, ConsentError> {
-    let slot = TEST_TTY_ANSWER
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let slot = TEST_TTY_ANSWER.lock().unwrap_or_else(|e| e.into_inner());
     match slot.as_deref() {
         Some(answer) => Ok(answer.to_string()),
         None => Err(ConsentError::NoConsentSurface {
@@ -402,9 +380,9 @@ mod tests {
         let _g = crate::tests_lock::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("RAGEWARDEN_CONFIG_DIR", tmp.path());
+        crate::tests_lock::set_var("RAGEWARDEN_CONFIG_DIR", tmp.path());
         let result = hardware_state();
-        std::env::remove_var("RAGEWARDEN_CONFIG_DIR");
+        crate::tests_lock::remove_var("RAGEWARDEN_CONFIG_DIR");
         assert_eq!(result.unwrap(), HardwareState::None);
     }
 
@@ -416,7 +394,7 @@ mod tests {
         let _g = crate::tests_lock::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("RAGEWARDEN_CONFIG_DIR", tmp.path());
+        crate::tests_lock::set_var("RAGEWARDEN_CONFIG_DIR", tmp.path());
 
         let mut ids = Identities::default();
         ids.insert(EnrolledIdentity {
@@ -449,7 +427,7 @@ mod tests {
         ids.save().unwrap();
         let with_real = hardware_state();
 
-        std::env::remove_var("RAGEWARDEN_CONFIG_DIR");
+        crate::tests_lock::remove_var("RAGEWARDEN_CONFIG_DIR");
         assert_eq!(mock_only.unwrap(), HardwareState::MockOnly);
         assert_eq!(with_real.unwrap(), HardwareState::Real);
     }

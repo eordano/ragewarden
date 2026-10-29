@@ -109,10 +109,6 @@ impl VaultKey {
         &self.0
     }
 
-    pub fn to_vec(&self) -> Vec<u8> {
-        self.0.to_vec()
-    }
-
     pub fn len(&self) -> usize {
         self.0.len()
     }
@@ -165,18 +161,6 @@ impl PartialEq for VaultKey {
 }
 
 impl Eq for VaultKey {}
-
-impl Serialize for VaultKey {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_bytes(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for VaultKey {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Ok(Self(Zeroizing::new(Vec::<u8>::deserialize(d)?)))
-    }
-}
 
 #[cfg(test)]
 mod tests {

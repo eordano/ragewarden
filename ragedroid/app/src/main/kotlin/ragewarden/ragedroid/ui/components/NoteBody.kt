@@ -1,5 +1,7 @@
 package ragewarden.ragedroid.ui.components
 
+import ragewarden.ragedroid.R
+import androidx.compose.ui.res.stringResource
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -52,6 +54,7 @@ fun NoteBody(
     clipboard: Clipboard,
     showToast: (String) -> Unit,
 ) {
+    val strings = androidx.compose.ui.platform.LocalContext.current
     val c = rageColors
     var showing by remember { mutableStateOf(false) }
     val body: String = item.notes.orEmpty()
@@ -65,7 +68,7 @@ fun NoteBody(
 
     val linkified: AnnotatedString = remember(body) { linkifyNotes(body, c.accent) }
 
-    Field(label = "Body") {
+    Field(label = stringResource(R.string.body)) {
         if (showing) {
             Column(
                 modifier = Modifier
@@ -80,43 +83,12 @@ fun NoteBody(
                     color = c.fgEmphasis,
                 )
                 Spacer(modifier = Modifier.height(12.dp))
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(1.dp)
-                        .background(c.divider),
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(6.dp)
-                                .background(c.success, RoundedCornerShape(50)),
-                        )
-                        Text(
-                            text = "Auto-hides in 10s",
-                            style = RageType.meta.copy(fontWeight = FontWeight.SemiBold),
-                            color = c.success,
-                        )
-                    }
-                    CopyButton(
-                        onCopy = {
-                            val bytes = body.toByteArray(Charsets.UTF_8)
-                            clipboard.copySensitive(bytes, "note")
-                            bytes.fill(0)
-                            showToast("Note copied")
-                        },
-                        compact = true,
-                    )
-                }
+                AutoHideFooter(onCopy = {
+                    val bytes = body.toByteArray(Charsets.UTF_8)
+                    clipboard.copySensitive(bytes, "note", item = item.name)
+                    bytes.fill(0)
+                    showToast(strings.getString(R.string.note_copied))
+                })
             }
         } else {
             Column(
@@ -136,7 +108,7 @@ fun NoteBody(
                     modifier = Modifier.size(20.dp),
                 )
                 Text(
-                    text = "Tap your authenticator to reveal",
+                    text = stringResource(R.string.show_note),
                     style = RageType.sansBody.copy(
                         fontSize = 13.sp,
                         textAlign = TextAlign.Center,
@@ -169,4 +141,38 @@ private fun linkifyNotes(
         last = end
     }
     if (last < text.length) append(text.substring(last))
+}
+
+@Composable
+internal fun AutoHideFooter(onCopy: () -> Unit) {
+    val c = rageColors
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(1.dp)
+            .background(c.divider),
+    )
+    Spacer(modifier = Modifier.height(8.dp))
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(6.dp)
+                    .background(c.success, RoundedCornerShape(50)),
+            )
+            Text(
+                text = stringResource(R.string.auto_hides_in_10s),
+                style = RageType.meta.copy(fontWeight = FontWeight.SemiBold),
+                color = c.success,
+            )
+        }
+        CopyButton(onCopy = onCopy, compact = true)
+    }
 }

@@ -1,10 +1,10 @@
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use cbc::cipher::{block_padding::Pkcs7, BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
+use cbc::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
 use rand_core::Rng;
-use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
 use rsa::RsaPrivateKey;
+use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -19,18 +19,16 @@ pub const KDF_ITERATIONS_DEFAULT: u32 = 600_000;
 /// Hard floor for a *server-supplied* PBKDF2-SHA256 iteration count.
 ///
 /// 100_000 is the Bitwarden client default that shipped from 2018 until the
-/// 2023 bump to 600_000, so it is the lowest count a legitimately-provisioned
-/// account is likely to still carry. Anything below it (notably the 5_000 of
-/// the 2013-era default) is refused outright: at 5_000 iterations a stolen
-/// master-password hash is roughly 120x cheaper to crack than at the current
-/// default, and the remedy -- raising the count server-side -- is available to
-/// the user without this client.
+/// 2023 bump to 600_000. A count below it (down to the 5_000 of the 2013-era
+/// default, [`crate::kdf::KDF_ITERATIONS_LEGACY_MIN`]) is a legacy account: a
+/// stolen master-password hash is up to 120x cheaper to crack, so login asks
+/// the user to confirm it and then raises the count on the server with
+/// [`crate::sync::upgrade_kdf`].
 ///
-/// A floor alone does not close the downgrade attack. A hostile server can
-/// still answer prelogin with 100_000 for an account that really uses 600_000
-/// and stay above the floor. The only mechanism that catches that is pinning
-/// the count observed on a previous login; see
-/// [`crate::sync::check_kdf_not_downgraded`].
+/// A floor alone does not close the downgrade attack: a hostile server can
+/// answer prelogin with 100_000 for an account that really uses 600_000. The
+/// parameters pinned from the last login catch that; see
+/// [`crate::sync::check_server_kdf`].
 pub const KDF_ITERATIONS_MIN: u32 = 100_000;
 
 /// Floor for a count *this client chooses* when creating an account.
@@ -51,6 +49,9 @@ pub fn kdf_type_name(kdf: u32) -> &'static str {
 pub enum Type2Error {
     #[error("malformed Type-2 string")]
     Malformed,
+
+    #[error("EncString type {0} is not Type-2 (AES-256-CBC + HMAC-SHA256); not decryptable here")]
+    UnsupportedEncType(u32),
 
     #[error("MAC verification failed")]
     MacFailed,
@@ -79,9 +80,9 @@ pub fn derive_master_key(password: &str, email: &str, iterations: u32) -> Zeroiz
 }
 
 pub fn master_password_hash(master_key: &[u8; 32], password: &str) -> String {
-    let mut hash = [0u8; 32];
-    pbkdf2::pbkdf2_hmac::<Sha256>(master_key, password.as_bytes(), 1, &mut hash);
-    B64.encode(hash)
+    let mut hash = Zeroizing::new([0u8; 32]);
+    pbkdf2::pbkdf2_hmac::<Sha256>(master_key, password.as_bytes(), 1, &mut hash[..]);
+    B64.encode(&hash[..])
 }
 
 pub fn stretch_master_key(master_key: &[u8; 32]) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
@@ -186,8 +187,16 @@ pub fn decrypt_type2(
     s: &str,
     enc_key: &[u8; 32],
     mac_key: &[u8; 32],
-) -> Result<Vec<u8>, Type2Error> {
-    let body = s.strip_prefix("2.").ok_or(Type2Error::Malformed)?;
+) -> Result<Zeroizing<Vec<u8>>, Type2Error> {
+    let body = match s.split_once('.') {
+        Some(("2", body)) => body,
+        Some((n, _)) => {
+            return Err(n
+                .parse::<u32>()
+                .map_or(Type2Error::Malformed, Type2Error::UnsupportedEncType));
+        }
+        None => return Err(Type2Error::Malformed),
+    };
     let mut parts = body.split('|');
     let iv_b64 = parts.next().ok_or(Type2Error::Malformed)?;
     let ct_b64 = parts.next().ok_or(Type2Error::Malformed)?;
@@ -217,7 +226,11 @@ pub fn decrypt_type2(
 
     let iv_arr: [u8; 16] = iv.as_slice().try_into().expect("iv length checked above");
     let cipher = Aes256CbcDec::new(enc_key.into(), (&iv_arr).into());
-    cipher
-        .decrypt_padded_vec::<Pkcs7>(&ct)
-        .map_err(|e| Type2Error::Decrypt(format!("{e}")))
+    let mut buf = Zeroizing::new(ct);
+    let len = cipher
+        .decrypt_padded::<Pkcs7>(&mut buf)
+        .map_err(|e| Type2Error::Decrypt(format!("{e}")))?
+        .len();
+    buf.truncate(len);
+    Ok(buf)
 }

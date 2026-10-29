@@ -1,5 +1,5 @@
 import {
-  test, expect, fillOnboarding, waitForBootstrap, randomSuffix,
+  test, expect, fillOnboarding, finishWizardWithPaper, waitForBootstrap, randomSuffix,
 } from './fixtures';
 import type { Page, BrowserContext } from '@playwright/test';
 
@@ -222,6 +222,7 @@ async function bootstrapFreshPopup(
   });
   await popup.waitForSelector('.ragewarden-onb-card h1', { state: 'visible' });
   await popup.click('.ragewarden-onb-primary');
+  await finishWizardWithPaper(popup);
   await waitForBootstrap(popup);
 
   return popup;
@@ -237,7 +238,7 @@ interface AuditEntry {
 interface HistoryEntryShort {
   recordedAt: number;
   cipherId: string;
-  priorPayload: string;
+  priorPayloadArmored: string;
   recipientsSummary: string[];
 }
 
@@ -280,14 +281,9 @@ test('design surface -- audit + history bindings', async ({ context, popupUrl, v
   });
   expect(surfaces).toEqual({
     auditTail: true,
-    auditClear: true,
+    auditClear: false,
     historyLoad: true,
     historyRecord: true,
-  });
-
-  await page.evaluate(async () => {
-    const w = window as unknown as AuditHistoryBridge;
-    await w.RagewardenVault.audit.clear();
   });
 
   await page.evaluate(async () => {
@@ -309,20 +305,11 @@ test('design surface -- audit + history bindings', async ({ context, popupUrl, v
     return w.RagewardenVault.audit.tail();
   });
   expect(entries.length).toBeGreaterThanOrEqual(1);
-  const reveal = entries.find(e => e.kind === 'RevealPassword');
-  expect(reveal, 'expected one RevealPassword audit entry').toBeTruthy();
+  const reveal = entries.find(e => e.kind === 'Reveal');
+  expect(reveal, 'expected one Reveal audit entry').toBeTruthy();
   expect(reveal!.target).toMatch(/^does-not-exist-/);
   expect(typeof reveal!.recordedAt).toBe('number');
-
-  await page.evaluate(async () => {
-    const w = window as unknown as AuditHistoryBridge;
-    await w.RagewardenVault.audit.clear();
-  });
-  const cleared = await page.evaluate(async () => {
-    const w = window as unknown as AuditHistoryBridge;
-    return w.RagewardenVault.audit.tail();
-  });
-  expect(cleared.length).toBe(0);
+  expect((reveal as { result?: string }).result).toBe('failed');
 
   const cipherId = `synthetic-${suffix}`;
   await page.evaluate(async ([cid]) => {
@@ -342,7 +329,7 @@ test('design surface -- audit + history bindings', async ({ context, popupUrl, v
   expect(loaded.length).toBeGreaterThanOrEqual(1);
   expect(loaded[0].cipherId).toBe(cipherId);
   expect(loaded[0].recipientsSummary).toContain('x25519-dummy:test');
-  expect(loaded[0].priorPayload).toContain('fake-prior-payload');
+  expect(loaded[0].priorPayloadArmored).toContain('fake-prior-payload');
 
   await page.close();
 });

@@ -1,66 +1,23 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use testcontainers::{
-    core::{ContainerPort, IntoContainerPort, WaitFor},
-    runners::AsyncRunner,
-    GenericImage, ImageExt,
-};
-
-const VAULTWARDEN_IMAGE: &str = "vaultwarden/server";
-const VAULTWARDEN_TAG: &str = "1.32.7";
-const HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(60);
-
-fn opted_in() -> bool {
-    matches!(std::env::var("RAGEWARDEN_E2E").as_deref(), Ok("1"))
-}
-
-const RELAXED_LOGIN_RATELIMIT_MAX_BURST: &str = "1000";
-const RELAXED_LOGIN_RATELIMIT_SECONDS: &str = "1";
-const RELAXED_ADMIN_RATELIMIT_MAX_BURST: &str = "1000";
-const RELAXED_ADMIN_RATELIMIT_SECONDS: &str = "1";
+mod support;
 
 #[test]
-#[ignore = "requires Docker; opt in with RAGEWARDEN_E2E=1"]
 fn round_trip_via_real_vaultwarden() {
-    if !opted_in() {
-        eprintln!("RAGEWARDEN_E2E not set; skipping. Run with: RAGEWARDEN_E2E=1 cargo test ... -- --ignored");
-        return;
-    }
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
+    let rt = support::runtime();
 
     rt.block_on(async {
-        let container = GenericImage::new(VAULTWARDEN_IMAGE, VAULTWARDEN_TAG)
-            .with_exposed_port(ContainerPort::Tcp(80))
-            .with_wait_for(WaitFor::message_on_stdout("Rocket has launched"))
-            .with_env_var("SIGNUPS_ALLOWED", "true")
-            .with_env_var("WEB_VAULT_ENABLED", "false")
-            .with_env_var("ROCKET_PORT", "80")
-            .with_env_var("DOMAIN", "http://localhost")
-            .with_env_var("LOGIN_RATELIMIT_MAX_BURST", RELAXED_LOGIN_RATELIMIT_MAX_BURST)
-            .with_env_var("LOGIN_RATELIMIT_SECONDS", RELAXED_LOGIN_RATELIMIT_SECONDS)
-            .with_env_var("ADMIN_RATELIMIT_MAX_BURST", RELAXED_ADMIN_RATELIMIT_MAX_BURST)
-            .with_env_var("ADMIN_RATELIMIT_SECONDS", RELAXED_ADMIN_RATELIMIT_SECONDS)
-            .start()
-            .await
-            .expect("start vaultwarden");
-        let host_port = container
-            .get_host_port_ipv4(80.tcp())
-            .await
-            .expect("vaultwarden host port");
-
-        let server_url = format!("http://localhost:{host_port}");
-        wait_for_alive(&server_url).await;
+        let Some(vw) = support::start().await else {
+            return;
+        };
+        let server_url = vw.url.clone();
 
         let server = ragewarden_core::sync::Server::self_hosted(&server_url);
 
         server.require_secure().expect("loopback http allowed");
-        let http = make_client();
+        let http = support::client();
 
-        let suffix = random_suffix();
+        let suffix = support::random_suffix();
         let email = format!("e2e-{suffix}@ragewarden.test");
         let password = "e2e-password-correct-horse-battery";
 
@@ -76,7 +33,7 @@ fn round_trip_via_real_vaultwarden() {
                 .expect("login");
 
         eprintln!("[e2e] generating recovery identity + encrypting payload");
-        let gen = ragewarden_core::recovery::generate().expect("generate recovery");
+        let generated = ragewarden_core::recovery::generate().expect("generate recovery");
         let plaintext = format!(
             "e2e-payload-{}-{}",
             SystemTime::now()
@@ -86,7 +43,7 @@ fn round_trip_via_real_vaultwarden() {
             suffix,
         );
         let recipient = ragewarden_core::Recipient::SoftwarePassphrase {
-            armored_pubkey: gen.armored_pubkey.clone(),
+            armored_pubkey: generated.armored_pubkey.clone(),
         };
         let blob = ragewarden_core::encrypt(plaintext.as_bytes(), &[recipient]).expect("encrypt");
         let armored = String::from_utf8(blob.0).unwrap();
@@ -118,7 +75,8 @@ fn round_trip_via_real_vaultwarden() {
 
         eprintln!("[e2e] reconstructing identity from mnemonic + decrypting");
         use age::secrecy::ExposeSecret;
-        let id = ragewarden_core::recovery::from_mnemonic(&gen.mnemonic).expect("from_mnemonic");
+        let id =
+            ragewarden_core::recovery::from_mnemonic(&generated.mnemonic).expect("from_mnemonic");
         let armored_secret = ragewarden_core::ArmoredAgeSecret::from_trusted(
             id.to_string().expose_secret().to_string(),
         );
@@ -133,43 +91,18 @@ fn round_trip_via_real_vaultwarden() {
 }
 
 #[test]
-#[ignore = "requires Docker; opt in with RAGEWARDEN_E2E=1"]
 fn cross_frontend_interop_via_ragemanifest_snapshot() {
-    if !opted_in() {
-        eprintln!("RAGEWARDEN_E2E not set; skipping.");
-        return;
-    }
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
+    let rt = support::runtime();
 
     rt.block_on(async {
-        let container = GenericImage::new(VAULTWARDEN_IMAGE, VAULTWARDEN_TAG)
-            .with_exposed_port(ContainerPort::Tcp(80))
-            .with_wait_for(WaitFor::message_on_stdout("Rocket has launched"))
-            .with_env_var("SIGNUPS_ALLOWED", "true")
-            .with_env_var("WEB_VAULT_ENABLED", "false")
-            .with_env_var("ROCKET_PORT", "80")
-            .with_env_var("DOMAIN", "http://localhost")
-            .with_env_var("LOGIN_RATELIMIT_MAX_BURST", RELAXED_LOGIN_RATELIMIT_MAX_BURST)
-            .with_env_var("LOGIN_RATELIMIT_SECONDS", RELAXED_LOGIN_RATELIMIT_SECONDS)
-            .with_env_var("ADMIN_RATELIMIT_MAX_BURST", RELAXED_ADMIN_RATELIMIT_MAX_BURST)
-            .with_env_var("ADMIN_RATELIMIT_SECONDS", RELAXED_ADMIN_RATELIMIT_SECONDS)
-            .start()
-            .await
-            .expect("start vaultwarden");
-        let host_port = container
-            .get_host_port_ipv4(80.tcp())
-            .await
-            .expect("port");
-        let server_url = format!("http://localhost:{host_port}");
-        wait_for_alive(&server_url).await;
+        let Some(vw) = support::start().await else {
+            return;
+        };
+        let server_url = vw.url.clone();
 
         let server = ragewarden_core::sync::Server::self_hosted(&server_url);
-        let http = make_client();
-        let suffix = random_suffix();
+        let http = support::client();
+        let suffix = support::random_suffix();
         let email = format!("e2e-interop-{suffix}@ragewarden.test");
         let password = "e2e-interop-correct-horse-battery";
 
@@ -186,10 +119,10 @@ fn cross_frontend_interop_via_ragemanifest_snapshot() {
         .await
         .expect("login");
 
-        let gen = ragewarden_core::recovery::generate().expect("generate");
+        let generated = ragewarden_core::recovery::generate().expect("generate");
         let plaintext = format!("interop-{suffix}");
         let recipient = ragewarden_core::Recipient::SoftwarePassphrase {
-            armored_pubkey: gen.armored_pubkey.clone(),
+            armored_pubkey: generated.armored_pubkey.clone(),
         };
         let blob = ragewarden_core::encrypt(plaintext.as_bytes(), &[recipient]).expect("encrypt");
         let armored = String::from_utf8(blob.0).unwrap();
@@ -219,40 +152,18 @@ fn cross_frontend_interop_via_ragemanifest_snapshot() {
 }
 
 #[test]
-#[ignore = "requires Docker; opt in with RAGEWARDEN_E2E=1"]
 fn ragedroid_jni_wire_format_round_trip() {
-    if !opted_in() {
-        eprintln!("RAGEWARDEN_E2E not set; skipping.");
-        return;
-    }
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
+    let rt = support::runtime();
 
     rt.block_on(async {
-        let container = GenericImage::new(VAULTWARDEN_IMAGE, VAULTWARDEN_TAG)
-            .with_exposed_port(ContainerPort::Tcp(80))
-            .with_wait_for(WaitFor::message_on_stdout("Rocket has launched"))
-            .with_env_var("SIGNUPS_ALLOWED", "true")
-            .with_env_var("WEB_VAULT_ENABLED", "false")
-            .with_env_var("ROCKET_PORT", "80")
-            .with_env_var("DOMAIN", "http://localhost")
-            .with_env_var("LOGIN_RATELIMIT_MAX_BURST", RELAXED_LOGIN_RATELIMIT_MAX_BURST)
-            .with_env_var("LOGIN_RATELIMIT_SECONDS", RELAXED_LOGIN_RATELIMIT_SECONDS)
-            .with_env_var("ADMIN_RATELIMIT_MAX_BURST", RELAXED_ADMIN_RATELIMIT_MAX_BURST)
-            .with_env_var("ADMIN_RATELIMIT_SECONDS", RELAXED_ADMIN_RATELIMIT_SECONDS)
-            .start()
-            .await
-            .expect("start vaultwarden");
-        let host_port = container.get_host_port_ipv4(80.tcp()).await.expect("port");
-        let server_url = format!("http://localhost:{host_port}");
-        wait_for_alive(&server_url).await;
+        let Some(vw) = support::start().await else {
+            return;
+        };
+        let server_url = vw.url.clone();
 
         let server = ragewarden_core::sync::Server::self_hosted(&server_url);
-        let http = make_client();
-        let suffix = random_suffix();
+        let http = support::client();
+        let suffix = support::random_suffix();
         let email = format!("e2e-droid-{suffix}@ragewarden.test");
         let password = "e2e-droid-correct-horse-battery";
 
@@ -275,6 +186,7 @@ fn ragedroid_jni_wire_format_round_trip() {
         };
         let prf_table = vec![ragewarden_core::PrfEntry {
             rp_id: "ragewarden",
+            credential_id: &[],
             salt: &salt,
             prf_output: &prf_output,
         }];
@@ -337,32 +249,4 @@ fn ragedroid_jni_wire_format_round_trip() {
             plaintext.len()
         );
     });
-}
-
-async fn wait_for_alive(server_url: &str) {
-    let alive = format!("{server_url}/alive");
-    let client = reqwest::Client::new();
-    let deadline = std::time::Instant::now() + HEALTHCHECK_TIMEOUT;
-    loop {
-        match client.get(&alive).send().await {
-            Ok(r) if r.status().is_success() => return,
-            _ => {}
-        }
-        if std::time::Instant::now() >= deadline {
-            panic!("vaultwarden /alive never returned 2xx within {HEALTHCHECK_TIMEOUT:?}");
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-}
-
-fn random_suffix() -> String {
-    use rand::Rng;
-    let mut b = [0u8; 4];
-    rand::rng().fill_bytes(&mut b);
-    hex::encode(b)
-}
-
-fn make_client() -> impl ragewarden_core::sync::HttpClient {
-    ragewarden_core::http_reqwest::ReqwestClient::new("rageterm-e2e-test/0.1")
-        .expect("rustls client should always build")
 }

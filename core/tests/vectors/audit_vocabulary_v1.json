@@ -1,0 +1,43 @@
+{
+  "kinds": [
+    "Reveal",
+    "Copy",
+    "Autofill",
+    "Set",
+    "Update",
+    "Rotate",
+    "Delete",
+    "EnrollIdentity",
+    "RemoveRecipient",
+    "Login",
+    "Logout",
+    "Sync",
+    "CreateFolder",
+    "RenameFolder",
+    "DeleteFolder",
+    "Recover",
+    "BulkProtect",
+    "Totp",
+    "Exec",
+    "AgentAdd"
+  ],
+  "legacy_names": {
+    "AutofillPassword": "Autofill",
+    "CopyPassword": "Copy",
+    "DeleteCipher": "Delete",
+    "EditCipher": "Update",
+    "Enroll": "EnrollIdentity",
+    "EnrollPasskey": "EnrollIdentity",
+    "EnrollRecovery": "EnrollIdentity",
+    "RecoverFromPhrase": "Recover",
+    "RevealPassword": "Reveal",
+    "RotateCipher": "Rotate",
+    "SetCipher": "Set"
+  },
+  "results": [
+    "ok",
+    "declined",
+    "failed"
+  ],
+  "vocabulary_version": 1
+}

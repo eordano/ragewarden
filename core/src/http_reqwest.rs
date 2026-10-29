@@ -1,7 +1,7 @@
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 
-use crate::sync::{is_secure_url, HttpBody, HttpClient, HttpError, HttpResponse};
+use crate::sync::{HttpBody, HttpClient, HttpError, HttpResponse, is_secure_url};
 
 #[derive(Clone)]
 pub struct ReqwestClient {
@@ -24,10 +24,6 @@ impl ReqwestClient {
             .default_headers(default_headers)
             .connect_timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                // A 30x from https:// to http:// would otherwise replay the
-                // Authorization header in cleartext. reqwest only strips
-                // sensitive headers across a host change, so a same-host
-                // scheme downgrade has to be refused here.
                 if is_secure_url(attempt.url().as_str()) {
                     if attempt.previous().len() >= 10 {
                         attempt.error("too many redirects")
@@ -82,6 +78,29 @@ async fn execute(req: reqwest::RequestBuilder) -> Result<HttpResponse, HttpError
     Ok(HttpResponse { status, body })
 }
 
+impl ReqwestClient {
+    async fn send(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        headers: &[(String, String)],
+        body: Option<HttpBody>,
+    ) -> Result<HttpResponse, HttpError> {
+        guard(url)?;
+        let mut headers = header_map(headers)?;
+        let mut req = self.inner.request(method, url);
+        if let Some(body) = body {
+            let (content_type, bytes) = match body {
+                HttpBody::Json(b) => ("application/json", b),
+                HttpBody::Form(b) => ("application/x-www-form-urlencoded", b),
+            };
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+            req = req.body(bytes);
+        }
+        execute(req.headers(headers)).await
+    }
+}
+
 #[async_trait]
 impl HttpClient for ReqwestClient {
     async fn post(
@@ -90,23 +109,8 @@ impl HttpClient for ReqwestClient {
         body: HttpBody,
         headers: &[(String, String)],
     ) -> Result<HttpResponse, HttpError> {
-        guard(url)?;
-        let mut headers = header_map(headers)?;
-        let req = self.inner.post(url);
-        let req = match body {
-            HttpBody::Json(b) => {
-                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-                req.body(b)
-            }
-            HttpBody::Form(b) => {
-                headers.insert(
-                    CONTENT_TYPE,
-                    HeaderValue::from_static("application/x-www-form-urlencoded"),
-                );
-                req.body(b)
-            }
-        };
-        execute(req.headers(headers)).await
+        self.send(reqwest::Method::POST, url, headers, Some(body))
+            .await
     }
 
     async fn put(
@@ -115,23 +119,8 @@ impl HttpClient for ReqwestClient {
         body: HttpBody,
         headers: &[(String, String)],
     ) -> Result<HttpResponse, HttpError> {
-        guard(url)?;
-        let mut headers = header_map(headers)?;
-        let req = self.inner.put(url);
-        let req = match body {
-            HttpBody::Json(b) => {
-                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-                req.body(b)
-            }
-            HttpBody::Form(b) => {
-                headers.insert(
-                    CONTENT_TYPE,
-                    HeaderValue::from_static("application/x-www-form-urlencoded"),
-                );
-                req.body(b)
-            }
-        };
-        execute(req.headers(headers)).await
+        self.send(reqwest::Method::PUT, url, headers, Some(body))
+            .await
     }
 
     async fn get(
@@ -139,10 +128,7 @@ impl HttpClient for ReqwestClient {
         url: &str,
         headers: &[(String, String)],
     ) -> Result<HttpResponse, HttpError> {
-        guard(url)?;
-        let headers = header_map(headers)?;
-        let req = self.inner.get(url).headers(headers);
-        execute(req).await
+        self.send(reqwest::Method::GET, url, headers, None).await
     }
 
     async fn delete(
@@ -150,9 +136,6 @@ impl HttpClient for ReqwestClient {
         url: &str,
         headers: &[(String, String)],
     ) -> Result<HttpResponse, HttpError> {
-        guard(url)?;
-        let headers = header_map(headers)?;
-        let req = self.inner.delete(url).headers(headers);
-        execute(req).await
+        self.send(reqwest::Method::DELETE, url, headers, None).await
     }
 }

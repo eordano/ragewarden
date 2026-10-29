@@ -15,17 +15,14 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Bolt
-import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.DeleteOutline
@@ -42,6 +39,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -49,19 +47,22 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
 import kotlinx.collections.immutable.ImmutableList
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.data.audit.AuditAction
 import ragewarden.ragedroid.data.audit.AuditEntry
 import ragewarden.ragedroid.ui.components.AppBar
+import ragewarden.ragedroid.ui.components.BackButton
 import ragewarden.ragedroid.ui.components.IconBtn
 import ragewarden.ragedroid.ui.components.RecipientPip
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
+import ragewarden.ragedroid.ui.uiString
 
-private enum class AuditFilter(val id: String, val label: String) {
-    All("all", "All"),
-    Unlocks("unlocks", "Unlocks"),
-    Failures("failures", "Failures"),
-    Admin("admin", "Enrol & rotate"),
+private enum class AuditFilter(val id: String, @androidx.annotation.StringRes val label: Int) {
+    All("all", R.string.all),
+    Unlocks("unlocks", R.string.unlocks),
+    Failures("failures", R.string.failures),
+    Admin("admin", R.string.enrol_rotate),
 }
 
 @Composable
@@ -83,12 +84,17 @@ fun AuditLogScreen(
                     AuditAction.Copy,
                     AuditAction.Reveal,
                     AuditAction.Totp,
+                    AuditAction.Exec,
+                    AuditAction.AgentAdd,
                 )
-                AuditFilter.Failures -> e.action == AuditAction.Failed
-                AuditFilter.Admin -> e.action in setOf(
-                    AuditAction.Enroll,
-                    AuditAction.Rotate,
-                    AuditAction.Delete,
+                AuditFilter.Failures -> e.result != ragewarden.ragedroid.data.audit.AuditResult.Ok
+                AuditFilter.Admin -> e.action !in setOf(
+                    AuditAction.Autofill,
+                    AuditAction.Copy,
+                    AuditAction.Reveal,
+                    AuditAction.Totp,
+                    AuditAction.Exec,
+                    AuditAction.AgentAdd,
                 )
             }
         }
@@ -107,23 +113,34 @@ fun AuditLogScreen(
         out
     }
 
+    var confirmClear by remember { mutableStateOf(false) }
+    if (confirmClear) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { confirmClear = false },
+            title = { Text(stringResource(R.string.clear_activity)) },
+            text = { Text(stringResource(R.string.this_deletes_the_activity_history_kept)) },
+            confirmButton = {
+                androidx.compose.material3.TextButton(onClick = {
+                    confirmClear = false
+                    onClear()
+                }) { Text(stringResource(R.string.clear)) }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(onClick = { confirmClear = false }) { Text(stringResource(R.string.cancel)) }
+            },
+        )
+    }
     Column(modifier = Modifier.fillMaxSize().background(c.background)) {
         AppBar(
-            title = "Activity",
-            subtitle = "Local · this device",
-            leading = {
-                IconBtn(
-                    icon = Icons.AutoMirrored.Outlined.ArrowBack,
-                    contentDescription = "Back",
-                    onClick = onBack,
-                )
-            },
+            title = stringResource(R.string.activity),
+            subtitle = stringResource(R.string.local_this_device),
+            leading = { BackButton(onBack) },
             trailing = if (entries.isNotEmpty()) {
                 {
                     IconBtn(
-                        icon = Icons.Outlined.Close,
-                        contentDescription = "Clear activity",
-                        onClick = onClear,
+                        icon = Icons.Outlined.DeleteOutline,
+                        contentDescription = stringResource(R.string.clear_activity_2),
+                        onClick = { confirmClear = true },
                     )
                 }
             } else null,
@@ -153,7 +170,7 @@ fun AuditLogScreen(
                         .padding(horizontal = 12.dp, vertical = 5.dp),
                 ) {
                     Text(
-                        text = f.label,
+                        text = stringResource(f.label),
                         style = RageType.button.copy(fontSize = 12.sp),
                         color = if (active) c.background else c.fgPrimary,
                     )
@@ -176,7 +193,7 @@ fun AuditLogScreen(
                 contentAlignment = Alignment.TopCenter,
             ) {
                 Text(
-                    text = "No matching activity.",
+                    text = stringResource(R.string.no_matching_activity),
                     style = RageType.body.copy(
                         fontSize = 14.sp,
                         fontStyle = FontStyle.Italic,
@@ -205,7 +222,7 @@ fun AuditLogScreen(
                 }
                 item("trail") {
                     Text(
-                        text = "Activity is stored on this device only. Nothing leaves the phone.",
+                        text = stringResource(R.string.activity_is_stored_on_this_device),
                         style = RageType.caption.copy(
                             fontSize = 11.sp,
                             fontStyle = FontStyle.Italic,
@@ -246,13 +263,13 @@ private fun AuditRow(entry: AuditEntry) {
                 verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
                 Text(
-                    text = actionLabel(entry.action),
+                    text = entryLabel(entry),
                     style = RageType.rowTitle.copy(fontSize = 14.sp),
                     color = c.fgEmphasis,
                 )
                 if (entry.cleared) {
                     Text(
-                        text = "· cleared".uppercase(),
+                        text = stringResource(R.string.cleared).uppercase(),
                         style = RageType.eyebrow.copy(fontSize = 10.sp, letterSpacing = 0.06.em),
                         color = c.fgSecondary,
                     )
@@ -270,7 +287,7 @@ private fun AuditRow(entry: AuditEntry) {
                 Text(
                     text = entry.reason,
                     style = RageType.caption.copy(fontSize = 11.5.sp),
-                    color = if (entry.action == AuditAction.Failed) c.danger else c.fgSecondary,
+                    color = if (entry.result != ragewarden.ragedroid.data.audit.AuditResult.Ok) c.danger else c.fgSecondary,
                     modifier = Modifier.padding(top = 2.dp),
                 )
             }
@@ -336,14 +353,32 @@ private fun ActionIcon(action: AuditAction) {
 }
 
 private fun actionLabel(action: AuditAction): String = when (action) {
-    AuditAction.Autofill -> "Autofilled"
-    AuditAction.Copy -> "Copied"
-    AuditAction.Reveal -> "Revealed"
-    AuditAction.Totp -> "TOTP read"
-    AuditAction.Failed -> "Failed"
-    AuditAction.Enroll -> "Enrolled"
-    AuditAction.Rotate -> "Rotated"
-    AuditAction.Delete -> "Deleted"
+    AuditAction.Autofill -> uiString(R.string.audit_autofilled)
+    AuditAction.Copy -> uiString(R.string.audit_copied)
+    AuditAction.Reveal -> uiString(R.string.audit_revealed)
+    AuditAction.Totp -> uiString(R.string.totp_read)
+    AuditAction.Set -> uiString(R.string.audit_created)
+    AuditAction.Update -> uiString(R.string.audit_edited)
+    AuditAction.Rotate -> uiString(R.string.audit_re_encrypted)
+    AuditAction.Delete -> uiString(R.string.audit_deleted)
+    AuditAction.EnrollIdentity -> uiString(R.string.key_added)
+    AuditAction.RemoveRecipient -> uiString(R.string.key_removed)
+    AuditAction.Login -> uiString(R.string.signed_in)
+    AuditAction.Logout -> uiString(R.string.signed_out)
+    AuditAction.Sync -> uiString(R.string.audit_synced)
+    AuditAction.CreateFolder -> uiString(R.string.folder_created)
+    AuditAction.RenameFolder -> uiString(R.string.folder_renamed)
+    AuditAction.DeleteFolder -> uiString(R.string.folder_deleted)
+    AuditAction.Recover -> uiString(R.string.audit_recovered)
+    AuditAction.BulkProtect -> uiString(R.string.audit_protected)
+    AuditAction.Exec -> uiString(R.string.audit_passed_to_a_command)
+    AuditAction.AgentAdd -> uiString(R.string.audit_loaded_into_ssh_agent)
+}
+
+private fun entryLabel(entry: AuditEntry): String = when (entry.result) {
+    ragewarden.ragedroid.data.audit.AuditResult.Ok -> actionLabel(entry.action)
+    ragewarden.ragedroid.data.audit.AuditResult.Declined -> uiString(R.string.declined, actionLabel(entry.action))
+    ragewarden.ragedroid.data.audit.AuditResult.Failed -> uiString(R.string.failed_2, actionLabel(entry.action))
 }
 
 private fun actionIconAndTint(action: AuditAction): Pair<ImageVector, (ragewarden.ragedroid.ui.theme.RageColors) -> androidx.compose.ui.graphics.Color> {
@@ -352,9 +387,12 @@ private fun actionIconAndTint(action: AuditAction): Pair<ImageVector, (ragewarde
         AuditAction.Copy -> Icons.Outlined.ContentCopy to { c -> c.accent }
         AuditAction.Reveal -> Icons.Outlined.Visibility to { c -> c.accent }
         AuditAction.Totp -> Icons.Outlined.Schedule to { c -> c.accent }
-        AuditAction.Failed -> Icons.Outlined.Close to { c -> c.dangerStrong }
-        AuditAction.Enroll -> Icons.Outlined.Add to { c -> c.success }
-        AuditAction.Rotate -> Icons.Outlined.Refresh to { c -> c.success }
-        AuditAction.Delete -> Icons.Outlined.DeleteOutline to { c -> c.dangerStrong }
+        AuditAction.Exec, AuditAction.AgentAdd -> Icons.Outlined.Bolt to { c -> c.accent }
+        AuditAction.EnrollIdentity, AuditAction.Set, AuditAction.CreateFolder, AuditAction.Login ->
+            Icons.Outlined.Add to { c -> c.success }
+        AuditAction.Rotate, AuditAction.Update, AuditAction.RenameFolder, AuditAction.Sync,
+        AuditAction.Recover, AuditAction.BulkProtect -> Icons.Outlined.Refresh to { c -> c.success }
+        AuditAction.Delete, AuditAction.RemoveRecipient, AuditAction.DeleteFolder, AuditAction.Logout ->
+            Icons.Outlined.DeleteOutline to { c -> c.dangerStrong }
     }
 }

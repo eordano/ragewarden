@@ -18,15 +18,6 @@ export async function init() {
     return wasmInitPromise;
 }
 
-export async function softwareKeygen() {
-    const mod = await init();
-    const result = mod.wasm_software_keygen();
-    const secretBytes = result.secret;
-    const publicKey = result.public_key;
-    const secretArmored = new TextDecoder().decode(secretBytes);
-    return { secretArmored, publicKey };
-}
-
 export async function encrypt(plaintext, recipientPubkey) {
     const mod = await init();
     const ptBytes = typeof plaintext === 'string'
@@ -35,19 +26,9 @@ export async function encrypt(plaintext, recipientPubkey) {
     return mod.wasm_encrypt(ptBytes, recipientPubkey);
 }
 
-export async function decryptWithSoftware(blob, secretArmored) {
-    const mod = await init();
-    return mod.wasm_decrypt_with_software(blob, secretArmored);
-}
-
 export async function moduleTag() {
     const mod = await init();
     return mod.wasm_module_tag();
-}
-
-export async function totpGenerate(input) {
-    const mod = await init();
-    return mod.wasm_totp_generate(input);
 }
 
 export function isReady() {

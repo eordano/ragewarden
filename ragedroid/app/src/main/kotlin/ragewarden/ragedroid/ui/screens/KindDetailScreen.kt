@@ -1,5 +1,11 @@
 package ragewarden.ragedroid.ui.screens
 
+import androidx.compose.foundation.lazy.items
+import androidx.compose.ui.platform.testTag
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.res.stringResource
+import kotlinx.coroutines.launch
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -14,7 +20,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.CreditCard
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Edit
@@ -29,10 +34,12 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.data.Clipboard
 import ragewarden.ragedroid.model.VaultItem
 import ragewarden.ragedroid.model.VaultItemKind
 import ragewarden.ragedroid.ui.components.AppBar
+import ragewarden.ragedroid.ui.components.BackButton
 import ragewarden.ragedroid.ui.components.CardBody
 import ragewarden.ragedroid.ui.components.IconBtn
 import ragewarden.ragedroid.ui.components.IdentityBody
@@ -41,6 +48,7 @@ import ragewarden.ragedroid.ui.components.RageChip
 import ragewarden.ragedroid.ui.components.SshBody
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
+import ragewarden.ragedroid.ui.uiString
 
 enum class DetailKind { Card, Note, Identity, Ssh }
 
@@ -60,10 +68,10 @@ private fun kindIcon(kind: DetailKind): ImageVector = when (kind) {
 }
 
 private fun kindLabel(kind: DetailKind): String = when (kind) {
-    DetailKind.Card -> "Card"
-    DetailKind.Note -> "Secure note"
-    DetailKind.Identity -> "Identity"
-    DetailKind.Ssh -> "SSH key"
+    DetailKind.Card -> uiString(R.string.card)
+    DetailKind.Note -> uiString(R.string.secure_note)
+    DetailKind.Identity -> uiString(R.string.identity)
+    DetailKind.Ssh -> uiString(R.string.ssh_key)
 }
 
 @Composable
@@ -73,24 +81,29 @@ fun KindDetailScreen(
     onEdit: () -> Unit,
     clipboard: Clipboard,
     showToast: (String) -> Unit,
+    decryptProtected: (suspend (field: String) -> ByteArray)? = null,
 ) {
+    val strings = androidx.compose.ui.platform.LocalContext.current
     val c = rageColors
     val kind = item.kind.toDetailKind()
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    val shown = androidx.compose.runtime.remember(item.id) { androidx.compose.runtime.mutableStateMapOf<String, String>() }
+    var opening by androidx.compose.runtime.remember(item.id) { androidx.compose.runtime.mutableStateOf<String?>(null) }
+    androidx.compose.runtime.LaunchedEffect(shown.keys.toSet()) {
+        if (shown.isNotEmpty()) {
+            kotlinx.coroutines.delay(30_000)
+            shown.clear()
+        }
+    }
 
     Column(modifier = Modifier.fillMaxSize().background(c.background)) {
         AppBar(
             title = kindLabel(kind),
-            leading = {
-                IconBtn(
-                    icon = Icons.AutoMirrored.Outlined.ArrowBack,
-                    contentDescription = "Back",
-                    onClick = onBack,
-                )
-            },
+            leading = { BackButton(onBack) },
             trailing = {
                 IconBtn(
                     icon = Icons.Outlined.Edit,
-                    contentDescription = "Edit",
+                    contentDescription = stringResource(R.string.edit),
                     onClick = onEdit,
                 )
             },
@@ -99,6 +112,50 @@ fun KindDetailScreen(
         LazyColumn(modifier = Modifier.fillMaxSize()) {
             item("hero") {
                 Hero(item = item, kind = kind)
+            }
+            val protectedFields = ragewarden.ragedroid.data.ItemFields.protectedFields(item)
+            if (decryptProtected != null) {
+                items(protectedFields, key = { "protected-$it" }) { field ->
+                    val label = ragewarden.ragedroid.data.ItemFields.label(field)
+                    Column(modifier = Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, bottom = 16.dp)) {
+                        Text(text = label.uppercase(), style = RageType.eyebrow, color = c.fgSecondary)
+                        Spacer(modifier = Modifier.height(6.dp))
+                        val value = shown[field]
+                        if (value == null) {
+                            ragewarden.ragedroid.ui.components.RageButton(
+                                label = if (opening == field) stringResource(R.string.waiting_for_your_key) else stringResource(R.string.open, label.lowercase()),
+                                onClick = {
+                                    if (opening == null) {
+                                        opening = field
+                                        scope.launch {
+                                            val bytes = runCatching { decryptProtected(field) }
+                                            opening = null
+                                            bytes.onSuccess { b ->
+                                                shown[field] = String(b, Charsets.UTF_8)
+                                                b.fill(0)
+                                            }.onFailure { e -> showToast(strings.getString(R.string.not_opened, e.message ?: uiString(R.string.the_key_did_not_open_it))) }
+                                        }
+                                    }
+                                },
+                                fullWidth = true,
+                                modifier = Modifier.testTag("open-$field"),
+                            )
+                        } else {
+                            Text(text = value, style = RageType.mono, color = c.fgEmphasis, modifier = Modifier.testTag("shown-$field"))
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                ragewarden.ragedroid.ui.components.RageButton(
+                                    label = stringResource(R.string.copy),
+                                    onClick = {
+                                        clipboard.copySensitive(value.toByteArray(Charsets.UTF_8), label.lowercase(), item = item.name)
+                                        showToast(strings.getString(R.string.copied_clears_in_30_s))
+                                    },
+                                )
+                                ragewarden.ragedroid.ui.components.RageButton(label = stringResource(R.string.hide), onClick = { shown.remove(field) })
+                            }
+                        }
+                    }
+                }
             }
             item("body") {
                 Column(
@@ -155,12 +212,12 @@ private fun Hero(item: VaultItem, kind: DetailKind) {
                     color = c.fgEmphasis,
                 )
                 if (item.rage) {
-                    RageChip(recipientCount = item.recipients.size)
+                    RageChip(recipientCount = item.recipients.distinct().size)
                 }
             }
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = "${kindLabel(kind).uppercase()} · ${item.folder.uppercase()}",
+                text = stringResource(R.string.dot_join, kindLabel(kind).uppercase(), item.folder.uppercase()),
                 style = RageType.eyebrow,
                 color = c.fgSecondary,
             )

@@ -1,5 +1,7 @@
 package ragewarden.ragedroid.ui.screens
 
+import ragewarden.ragedroid.R
+import androidx.compose.ui.res.stringResource
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -57,12 +59,7 @@ fun SystemAutofillPickerScreen(
     val c = rageColors
     val ctx = androidx.compose.ui.platform.LocalContext.current.applicationContext
     val backend = remember(ctx) { VaultBridge.ensureBackend(ctx) }
-    val sampleDomains: List<String> = remember(backend) {
-        backend.snapshot()
-            .mapNotNull { it.site.takeIf { s -> s.isNotBlank() } }
-            .distinct()
-            .take(3)
-    }
+    val sampleDomains: List<String> = remember { listOf("example.com") }
     var activeDomain by remember(domain, sampleDomains) {
         mutableStateOf(domain ?: sampleDomains.firstOrNull() ?: "")
     }
@@ -98,7 +95,7 @@ fun SystemAutofillPickerScreen(
                 ) {
                     Column {
                         Mono(
-                            text = "https://$activeDomain/sign_in",
+                            text = stringResource(R.string.preview_nothing_here_is_live_https, activeDomain),
                             size = 11,
                             color = c.fgSecondary,
                         )
@@ -110,7 +107,7 @@ fun SystemAutofillPickerScreen(
                                 .padding(horizontal = 8.dp, vertical = 8.dp),
                         ) {
                             Text(
-                                text = "Email",
+                                text = stringResource(R.string.email),
                                 style = RageType.sansBody.copy(fontSize = 13.sp),
                                 color = c.fgSecondary,
                             )
@@ -123,7 +120,7 @@ fun SystemAutofillPickerScreen(
                                 .padding(horizontal = 8.dp, vertical = 8.dp),
                         ) {
                             Text(
-                                text = "Password",
+                                text = stringResource(R.string.password),
                                 style = RageType.sansBody.copy(fontSize = 13.sp),
                                 color = c.fgSecondary,
                             )
@@ -172,19 +169,19 @@ fun SystemAutofillPickerScreen(
                 }
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "RageDroid",
+                        text = stringResource(R.string.ragedroid),
                         style = RageType.rowTitle.copy(fontSize = 14.sp, lineHeight = 18.sp),
                         color = c.fgEmphasis,
                     )
                     Mono(
-                        text = "autofill · $activeDomain",
+                        text = stringResource(R.string.autofill_2, activeDomain),
                         size = 11,
                         color = c.fgSecondary,
                     )
                 }
                 IconBtn(
                     icon = Icons.Outlined.Close,
-                    contentDescription = "Close",
+                    contentDescription = stringResource(R.string.close),
                     onClick = onBack,
                     iconSize = 18,
                 )
@@ -266,21 +263,21 @@ private fun NoMatchView(domain: String, onCreate: () -> Unit) {
         }
         Spacer(modifier = Modifier.height(12.dp))
         Text(
-            text = "No match for $domain",
+            text = stringResource(R.string.no_match_for, domain),
             style = RageType.h2.copy(fontSize = 16.sp, lineHeight = 20.sp),
             color = c.fgEmphasis,
             textAlign = TextAlign.Center,
         )
         Spacer(modifier = Modifier.height(4.dp))
         Text(
-            text = "Save your credentials here and they'll appear next time.",
+            text = stringResource(R.string.save_your_credentials_here_and_they),
             style = RageType.body.copy(fontSize = 13.sp, lineHeight = 20.sp),
             color = c.fgSecondary,
             textAlign = TextAlign.Center,
         )
         Spacer(modifier = Modifier.height(14.dp))
         RageButton(
-            label = "Save new login",
+            label = stringResource(R.string.save_new_login),
             onClick = onCreate,
             icon = Icons.Outlined.Add,
         )
@@ -340,14 +337,14 @@ private fun AutofillRow(item: VaultItem, onClick: () -> Unit) {
                     modifier = Modifier.size(12.dp),
                 )
                 Text(
-                    text = "TAP TO FILL",
+                    text = stringResource(R.string.tap_to_fill),
                     style = RageType.eyebrow.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold),
                     color = c.accent,
                 )
             }
         } else {
             Text(
-                text = "FILL",
+                text = stringResource(R.string.fill),
                 style = RageType.eyebrow.copy(fontSize = 10.sp, fontWeight = FontWeight.SemiBold),
                 color = c.fgSecondary,
             )

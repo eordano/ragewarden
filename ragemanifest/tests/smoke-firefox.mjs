@@ -33,7 +33,7 @@ function info(msg) {
 function validateManifest() {
     const manifestPath = join(DIST_FIREFOX, 'manifest.json');
     if (!existsSync(manifestPath)) {
-        fail(`${manifestPath} missing -- run \`npm run build:firefox\` first.`);
+        fail(`${manifestPath} missing -- run \`pnpm run build:firefox\` first.`);
     }
     const m = JSON.parse(readFileSync(manifestPath, 'utf8'));
 
@@ -58,8 +58,8 @@ function validateManifest() {
     }
     pass(`background.scripts=${JSON.stringify(bg.scripts)}`);
 
-    if (Array.isArray(m.permissions) && m.permissions.includes('nativeMessaging')) {
-        fail('nativeMessaging is out of scope this round; remove from Firefox build');
+    if (!Array.isArray(m.permissions) || !m.permissions.includes('nativeMessaging')) {
+        fail('nativeMessaging missing: the PIV/FIDO2 bridge to rageterm opens a native port in Firefox too');
     }
     if (Array.isArray(m.permissions) && m.permissions.includes('sidePanel')) {
         fail('sidePanel is Chromium-only; remove from Firefox build');
@@ -69,8 +69,8 @@ function validateManifest() {
     }
     pass(`permissions=${JSON.stringify(m.permissions)}`);
 
-    if (!m.action || m.action.default_popup !== 'popup/RageDroid.html') {
-        fail('action.default_popup must point at popup/RageDroid.html (Firefox keeps the popup; side panel is Chromium-only)');
+    if (!m.action || m.action.default_popup !== 'popup/index.html') {
+        fail('action.default_popup must point at popup/index.html (Firefox keeps the popup; side panel is Chromium-only)');
     }
     if (m.web_accessible_resources?.length) {
         fail(
@@ -85,7 +85,7 @@ function validateManifest() {
     for (const f of [
         'background.js',
         'content.js',
-        'popup/RageDroid.html',
+        'popup/index.html',
         'wasm/ragemanifest.js',
         'wasm/ragemanifest_bg.wasm',
     ]) {
@@ -100,7 +100,7 @@ function validateManifest() {
 
 function runWebExtLint() {
     if (!existsSync(WEB_EXT)) {
-        fail(`web-ext not found at ${WEB_EXT}; run \`npm install\` in ragemanifest/ first.`);
+        fail(`web-ext not found at ${WEB_EXT}; run \`pnpm install --frozen-lockfile\` in ragemanifest/ first.`);
     }
     let r;
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -189,7 +189,7 @@ async function loadPopupInChromium() {
             playwright = await import('playwright');
         } catch {
             info('playwright not available; skipping Chromium-proxy popup load');
-            info('install via `npm install --save-dev playwright-core` to enable this layer');
+            info('install via `pnpm install --frozen-lockfile` (playwright-core is a pinned devDependency) to enable this layer');
             return;
         }
     }
@@ -214,7 +214,7 @@ async function loadPopupInChromium() {
 
     const server = await startStaticServer(DIST_FIREFOX);
     const port = server.address().port;
-    const url = `http://127.0.0.1:${port}/popup/RageDroid.html`;
+    const url = `http://127.0.0.1:${port}/popup/index.html`;
     info(`serving dist/firefox at http://127.0.0.1:${port}`);
 
     const browser = await playwright.chromium.launch({
@@ -296,7 +296,7 @@ async function launchFirefox() {
 
     const profileDir = mkdtempSync(join(tmpdir(), 'ragewarden-smoke-'));
     info(`headed Firefox profile=${profileDir}`);
-    const popupUrl = `moz-extension://${EXTENSION_INTERNAL_UUID}/popup/RageDroid.html`;
+    const popupUrl = `moz-extension://${EXTENSION_INTERNAL_UUID}/popup/index.html`;
 
     const webExtArgs = [
         'run',

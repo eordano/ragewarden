@@ -1,7 +1,12 @@
 package ragewarden.ragedroid.ui.screens
 
+import androidx.compose.ui.res.stringResource
+import ragewarden.ragedroid.R
+import ragewarden.ragedroid.ui.describe
+import androidx.compose.ui.platform.testTag
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
+import ragewarden.ragedroid.di.appEntryPoint
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -53,6 +58,7 @@ import ragewarden.ragedroid.ui.components.TextInput
 import ragewarden.ragedroid.ui.findActivity
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
+import ragewarden.ragedroid.ui.uiString
 
 private enum class LockPhase { Idle, Scanning, Success, Password, Failed }
 
@@ -94,12 +100,11 @@ fun LockScreen(
         if (activity == null) {
             false
         } else {
-            val manager = BiometricManager.from(activity)
-            val allowed = BiometricManager.Authenticators.BIOMETRIC_STRONG or
-                BiometricManager.Authenticators.DEVICE_CREDENTIAL
-            manager.canAuthenticate(allowed) == BiometricManager.BIOMETRIC_SUCCESS
+            BiometricManager.from(activity)
+                .canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG) == BiometricManager.BIOMETRIC_SUCCESS
         }
     }
+    val keyWrap = remember(context) { runCatching { context.appEntryPoint().sessionKeyWrap() }.getOrNull() }
 
     val identityLabel = remember(repo) {
         val mail = repo?.email.orEmpty()
@@ -108,12 +113,13 @@ fun LockScreen(
             mail.isNotEmpty() && srv.isNotEmpty() -> "$mail · $srv"
             mail.isNotEmpty() -> mail
             srv.isNotEmpty() -> srv
-            else -> "Signed-in vault"
+            else -> uiString(R.string.signed_in_vault)
         }
     }
 
     val launchPrompt: () -> Unit = launch@{
-        if (activity == null || !biometricSupported) {
+        val cipher = if (activity != null && biometricSupported && repo != null) keyWrap?.decryptCipher() else null
+        if (activity == null || cipher == null) {
             phase = LockPhase.Password
             return@launch
         }
@@ -122,8 +128,20 @@ fun LockScreen(
         val executor = ContextCompat.getMainExecutor(activity)
         val callback = object : BiometricPrompt.AuthenticationCallback() {
             override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                phase = LockPhase.Success
-                onUnlock()
+                val authed = result.cryptoObject?.cipher
+                scope.launch {
+                    val unlocked = authed?.let { c -> runCatching { keyWrap?.unwrap(c) }.getOrNull() }
+                    val ok = unlocked != null && repo?.unlockWithSessionBlob(unlocked)?.isSuccess == true
+                    unlocked?.fill(0)
+                    if (ok) {
+                        phase = LockPhase.Success
+                        onUnlock()
+                    } else {
+                        keyWrap?.clear()
+                        phase = LockPhase.Password
+                        onToast(uiString(R.string.biometric_unlock_needs_setting_up_again))
+                    }
+                }
             }
 
             override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
@@ -151,14 +169,52 @@ fun LockScreen(
         }
         val prompt = BiometricPrompt(activity, executor, callback)
         val info = BiometricPrompt.PromptInfo.Builder()
-            .setTitle("Unlock RageDroid")
+            .setTitle(uiString(R.string.unlock_ragedroid))
             .setSubtitle(identityLabel)
-            .setAllowedAuthenticators(
-                BiometricManager.Authenticators.BIOMETRIC_STRONG or
-                    BiometricManager.Authenticators.DEVICE_CREDENTIAL,
-            )
+            .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+            .setNegativeButtonText(uiString(R.string.use_master_password))
             .build()
-        prompt.authenticate(info)
+        prompt.authenticate(info, BiometricPrompt.CryptoObject(cipher))
+    }
+
+    val finishPasswordUnlock: () -> Unit = finish@{
+        val wrap = keyWrap
+        val enrollCipher = if (activity != null && biometricSupported && wrap != null && !wrap.isEnrolled() && !wrap.declined) {
+            wrap.encryptCipher()
+        } else {
+            null
+        }
+        val session = repo?.unlockedSessionForWrapping()
+        if (activity == null || wrap == null || enrollCipher == null || session == null) {
+            session?.fill(0)
+            phase = LockPhase.Success
+            onUnlock()
+            return@finish
+        }
+        val callback = object : BiometricPrompt.AuthenticationCallback() {
+            override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                result.cryptoObject?.cipher?.let { c -> runCatching { wrap.store(c, session) } }
+                session.fill(0)
+                phase = LockPhase.Success
+                onUnlock()
+            }
+
+            override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                if (errorCode == BiometricPrompt.ERROR_NEGATIVE_BUTTON) wrap.declined = true
+                session.fill(0)
+                phase = LockPhase.Success
+                onUnlock()
+            }
+        }
+        BiometricPrompt(activity, ContextCompat.getMainExecutor(activity), callback).authenticate(
+            BiometricPrompt.PromptInfo.Builder()
+                .setTitle(uiString(R.string.unlock_with_biometrics_next_time))
+                .setSubtitle(uiString(R.string.your_vault_key_is_sealed_to))
+                .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+                .setNegativeButtonText(uiString(R.string.not_now))
+                .build(),
+            BiometricPrompt.CryptoObject(enrollCipher),
+        )
     }
 
     LaunchedEffect(activity, biometricSupported) {
@@ -196,25 +252,24 @@ fun LockScreen(
             // the state a cold, locked launch is in, because the stage tree that
             // calls VaultBridge.ensureBackend is not composed behind the lock.
             // Nothing here can verify the password, so nothing here may pass it.
-            pwError = "No vault session on this device to check the password against. " +
-                "Sign out and sign in again."
+            pwError = uiString(R.string.no_vault_session_on_this_device)
             return@submit
         }
         working = true
         scope.launch {
-            val result = repo.verifyMasterPassword(pw)
+            val result = repo.unlockWithPassword(pw)
             working = false
             result.fold(
                 onSuccess = { ok ->
                     if (ok) {
-                        phase = LockPhase.Success
-                        onUnlock()
+                        pw = ""
+                        finishPasswordUnlock()
                     } else {
-                        pwError = "Wrong master password."
+                        pwError = uiString(R.string.wrong_master_password)
                     }
                 },
-                onFailure = { e ->
-                    pwError = e.message ?: "Could not verify password."
+                onFailure = {
+                    pwError = uiString(R.string.couldn_t_check_the_password_a)
                 },
             )
         }
@@ -246,7 +301,7 @@ fun LockScreen(
             }
             Spacer(modifier = Modifier.height(18.dp))
             Text(
-                text = "RageDroid",
+                text = stringResource(R.string.ragedroid),
                 style = RageType.h1.copy(
                     fontSize = 28.sp,
                     lineHeight = 31.sp,
@@ -303,10 +358,10 @@ fun LockScreen(
                 Spacer(modifier = Modifier.height(28.dp))
                 Text(
                     text = when (phase) {
-                        LockPhase.Idle -> if (biometricSupported) "Touch the sensor to unlock" else "Use master password to unlock"
-                        LockPhase.Scanning -> "Authenticating..."
-                        LockPhase.Success -> "Welcome back"
-                        LockPhase.Failed -> "Try again"
+                        LockPhase.Idle -> if (biometricSupported) stringResource(R.string.touch_the_sensor_to_unlock) else stringResource(R.string.use_master_password_to_unlock)
+                        LockPhase.Scanning -> stringResource(R.string.authenticating)
+                        LockPhase.Success -> stringResource(R.string.welcome_back)
+                        LockPhase.Failed -> stringResource(R.string.try_again)
                         LockPhase.Password -> ""
                     },
                     style = RageType.h2.copy(fontSize = 18.sp, lineHeight = 22.sp),
@@ -315,7 +370,7 @@ fun LockScreen(
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = "Unlocks the vault. Each protected item still needs its own tap.",
+                    text = stringResource(R.string.unlocks_the_vault_each_protected_item),
                     style = RageType.caption.copy(fontSize = 12.5.sp, lineHeight = 19.sp),
                     color = c.fgSecondary,
                     textAlign = TextAlign.Center,
@@ -341,13 +396,16 @@ fun LockScreen(
                     }
                     Spacer(modifier = Modifier.height(12.dp))
                     Text(
-                        text = "Master password",
+                        text = stringResource(R.string.master_password),
                         style = RageType.h2.copy(fontSize = 20.sp),
                         color = c.fgEmphasis,
                     )
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = "PBKDF2 KDF, run on this device.",
+                        text = stringResource(
+                            R.string.master_password_stretched_here,
+                            repo?.kdf?.describe(context.resources) ?: stringResource(R.string.master_password),
+                        ),
                         style = RageType.caption,
                         color = c.fgSecondary,
                         textAlign = TextAlign.Center,
@@ -361,6 +419,7 @@ fun LockScreen(
                         },
                         placeholder = "••••••••••••",
                         password = true,
+                        modifier = Modifier.testTag("lock-password"),
                     )
                     if (pwError != null) {
                         Spacer(modifier = Modifier.height(8.dp))
@@ -373,7 +432,7 @@ fun LockScreen(
                     }
                     Spacer(modifier = Modifier.height(14.dp))
                     RageButton(
-                        label = if (working) "Verifying..." else "Unlock",
+                        label = if (working) stringResource(R.string.verifying) else stringResource(R.string.unlock),
                         onClick = submitPassword,
                         icon = Icons.AutoMirrored.Outlined.ArrowForward,
                         fullWidth = true,
@@ -405,9 +464,9 @@ fun LockScreen(
                 ) {
                     Text(
                         text = if (phase != LockPhase.Password) {
-                            "Use master password instead"
+                            stringResource(R.string.use_master_password_instead)
                         } else {
-                            "Use fingerprint instead"
+                            stringResource(R.string.use_fingerprint_instead)
                         },
                         style = RageType.button.copy(fontSize = 13.sp),
                         color = c.fgSecondary,
@@ -421,7 +480,7 @@ fun LockScreen(
                     .padding(horizontal = 12.dp, vertical = 8.dp),
             ) {
                 Text(
-                    text = "Sign out of this vault",
+                    text = stringResource(R.string.sign_out_of_this_vault),
                     style = RageType.button.copy(fontSize = 13.sp),
                     color = c.fgSecondary,
                     textAlign = TextAlign.Center,

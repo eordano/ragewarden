@@ -2,7 +2,6 @@ package ragewarden.ragedroid.ui.screens
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,7 +15,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Fingerprint
 import androidx.compose.material.icons.outlined.Key
@@ -36,10 +34,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.data.BitwardenVaultRepository
 import ragewarden.ragedroid.data.RecipientRegistry
 import ragewarden.ragedroid.data.RecipientStore
@@ -47,12 +47,13 @@ import ragewarden.ragedroid.data.VaultBridge
 import ragewarden.ragedroid.di.appEntryPoint
 import ragewarden.ragedroid.model.RecipientKind
 import ragewarden.ragedroid.ui.components.AppBar
+import ragewarden.ragedroid.ui.components.BackButton
 import ragewarden.ragedroid.ui.components.ButtonVariant
-import ragewarden.ragedroid.ui.components.IconBtn
 import ragewarden.ragedroid.ui.components.Mono
 import ragewarden.ragedroid.ui.components.RageButton
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
+import ragewarden.ragedroid.ui.uiString
 
 @Composable
 fun RecipientsScreen(
@@ -88,14 +89,8 @@ fun RecipientsScreen(
 
     Column(modifier = Modifier.fillMaxSize().background(c.background)) {
         AppBar(
-            title = "Recipients",
-            leading = {
-                IconBtn(
-                    icon = Icons.AutoMirrored.Outlined.ArrowBack,
-                    contentDescription = "Back",
-                    onClick = onBack,
-                )
-            },
+            title = stringResource(R.string.recipients_2),
+            leading = { BackButton(onBack) },
         )
 
         LazyColumn(
@@ -103,9 +98,21 @@ fun RecipientsScreen(
                 .fillMaxSize()
                 .padding(horizontal = 18.dp, vertical = 12.dp),
         ) {
+            if (accountId.isNotBlank() && recipientStore.isUnreadable(accountId)) {
+                item("key-list-unreadable") {
+                    ragewarden.ragedroid.ui.components.UnreadableKeyListCard(
+                        onReset = {
+                            recipientStore.resetUnreadable(accountId)
+                            refreshTick += 1
+                            onToast(context.getString(R.string.key_list_reset_done))
+                        },
+                        modifier = Modifier.padding(bottom = 12.dp),
+                    )
+                }
+            }
             item("intro") {
                 Text(
-                    text = "Every recipient enrolled on any of your devices. Removing one re-publishes the registry without it; future encrypts won't include it.",
+                    text = stringResource(R.string.every_recipient_enrolled_on_any_of),
                     style = RageType.body.copy(fontSize = 13.5.sp, lineHeight = 20.sp),
                     color = c.fgSecondary,
                 )
@@ -122,7 +129,7 @@ fun RecipientsScreen(
                             .padding(horizontal = 14.dp, vertical = 18.dp),
                     ) {
                         Text(
-                            text = "No recipients in the cross-device registry yet. Enrol one from Settings.",
+                            text = stringResource(R.string.no_recipients_in_the_cross_device),
                             style = RageType.body.copy(fontSize = 13.5.sp, lineHeight = 20.sp),
                             color = c.fgSecondary,
                         )
@@ -145,19 +152,18 @@ fun RecipientsScreen(
     if (targeted != null) {
         AlertDialog(
             onDismissRequest = { if (!working) pendingRemoval = null },
-            title = { Text("Remove recipient?") },
+            title = { Text(stringResource(R.string.remove_recipient)) },
             text = {
                 Column {
                     Text(
-                        text = "Removes ${targeted.displayName} from the cross-device registry. " +
-                            "Other devices will see it disappear on their next sync.",
+                        text = stringResource(R.string.removes_from_the_cross_device_registry, targeted.displayName),
                         style = RageType.body.copy(fontSize = 14.sp, lineHeight = 20.sp),
                         color = c.fgPrimary,
                     )
                     if (targeted.local) {
                         Spacer(modifier = Modifier.height(10.dp))
                         Text(
-                            text = "This recipient is enrolled on this device -- its local material will also be removed.",
+                            text = stringResource(R.string.this_recipient_is_enrolled_on_this),
                             style = RageType.caption.copy(fontSize = 12.sp, lineHeight = 17.sp),
                             color = c.warning,
                         )
@@ -170,7 +176,7 @@ fun RecipientsScreen(
                     onClick = {
                         if (repo == null || accountId.isBlank()) {
                             pendingRemoval = null
-                            onToast("No active account")
+                            onToast(uiString(R.string.no_active_account))
                             return@TextButton
                         }
                         working = true
@@ -181,19 +187,19 @@ fun RecipientsScreen(
                                     recipientStore.remove(accountId, targeted.id)
                                 }
                                 refreshTick += 1
-                                onToast("Recipient removed")
+                                onToast(uiString(R.string.recipient_removed))
                             }.onFailure { e ->
-                                onToast("Remove failed: ${e.message}")
+                                onToast(uiString(R.string.remove_failed, e.message.orEmpty()))
                             }
                             working = false
                             pendingRemoval = null
                         }
                     },
-                ) { Text(if (working) "Removing..." else "Remove") }
+                ) { Text(if (working) stringResource(R.string.removing) else stringResource(R.string.remove)) }
             },
             dismissButton = {
                 TextButton(enabled = !working, onClick = { pendingRemoval = null }) {
-                    Text("Cancel")
+                    Text(stringResource(R.string.cancel))
                 }
             },
         )
@@ -289,8 +295,11 @@ internal fun RecipientRowCard(
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    text = "${recipientKindLabel(row.kind, row.rawKind)} · ${row.deviceLabel}" +
-                        if (row.local) " · this device" else "",
+                    text = if (row.local) {
+                        stringResource(R.string.recipient_row_meta_local, recipientKindLabel(row.kind, row.rawKind), row.deviceLabel)
+                    } else {
+                        stringResource(R.string.dot_join, recipientKindLabel(row.kind, row.rawKind), row.deviceLabel)
+                    },
                     style = RageType.caption.copy(fontSize = 11.5.sp),
                     color = if (row.kind == null) c.warning else c.fgSecondary,
                     maxLines = 1,
@@ -313,7 +322,7 @@ internal fun RecipientRowCard(
             horizontalArrangement = Arrangement.End,
         ) {
             RageButton(
-                label = "Remove",
+                label = stringResource(R.string.remove),
                 onClick = onRemove,
                 variant = ButtonVariant.Danger,
                 enabled = enabled,
@@ -333,12 +342,12 @@ private fun recipientIcon(kind: RecipientKind?): ImageVector = when (kind) {
 }
 
 private fun recipientKindLabel(kind: RecipientKind?, rawKind: String): String = when (kind) {
-    RecipientKind.YubiKey -> "YubiKey · PIV"
-    RecipientKind.Fido2 -> "FIDO2 hmac-secret"
-    RecipientKind.PasskeyPrf -> "Passkey · WebAuthn PRF"
-    RecipientKind.StrongBox -> "Android StrongBox"
-    RecipientKind.Recovery -> "Paper recovery"
-    RecipientKind.Software -> "Software identity"
+    RecipientKind.YubiKey -> uiString(R.string.yubikey_piv)
+    RecipientKind.Fido2 -> uiString(R.string.fido2_hmac_secret)
+    RecipientKind.PasskeyPrf -> uiString(R.string.passkey_webauthn_prf)
+    RecipientKind.StrongBox -> uiString(R.string.android_strongbox)
+    RecipientKind.Recovery -> uiString(R.string.paper_recovery)
+    RecipientKind.Software -> uiString(R.string.software_identity)
     // Deliberately does not guess. All this build knows is the wire string.
-    null -> "Unknown key type" + rawKind.takeIf { it.isNotBlank() }?.let { " ($it)" }.orEmpty()
+    null -> uiString(R.string.unknown_key_type) + rawKind.takeIf { it.isNotBlank() }?.let { " ($it)" }.orEmpty()
 }

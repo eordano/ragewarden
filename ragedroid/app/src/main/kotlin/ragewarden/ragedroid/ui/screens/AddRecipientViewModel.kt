@@ -4,6 +4,7 @@ import android.content.Context
 import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.UserNotAuthenticatedException
 import android.util.Log
+import androidx.compose.ui.res.stringResource
 import androidx.credentials.exceptions.CreateCredentialCancellationException
 import androidx.credentials.exceptions.GetCredentialCancellationException
 import androidx.fragment.app.FragmentActivity
@@ -24,6 +25,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.data.RecipientStore
 import ragewarden.ragedroid.data.StoredRecipient
 import ragewarden.ragedroid.data.VaultBridge
@@ -33,38 +35,39 @@ import ragewarden.ragedroid.model.RecipientKind
 import ragewarden.ragedroid.identities.YubiKeyX25519UnsupportedException
 import ragewarden.ragedroid.identities.enrollKeystoreIdentity
 import ragewarden.ragedroid.identities.enrollPasskeyWithPrf
-import ragewarden.ragedroid.identities.enrollYubiKeyPivX25519
+import ragewarden.ragedroid.identities.enrollYubiKeyPiv
 import ragewarden.ragedroid.identities.isStrongBoxAvailable
+import ragewarden.ragedroid.ui.uiString
 
 private const val TAG = "AddRecipientViewModel"
 
 enum class EnrollKind(
-    val title: String,
-    val desc: String,
+    @androidx.annotation.StringRes val title: Int,
+    @androidx.annotation.StringRes val desc: Int,
     val recipientKind: RecipientKind,
     val singleton: Boolean,
 ) {
     YubiKey(
-        title = "YubiKey (PIV slot)",
-        desc = "X25519 keypair on the device. Identical to age-plugin-yubikey.",
+        title = R.string.yubikey_piv_slot,
+        desc = R.string.x25519_keypair_on_the_device_identical,
         recipientKind = RecipientKind.YubiKey,
         singleton = false,
     ),
     Fido2(
-        title = "FIDO2 hmac-secret",
-        desc = "Any FIDO2 authenticator. Tap is built into the protocol.",
-        recipientKind = RecipientKind.Fido2,
+        title = R.string.passkey,
+        desc = R.string.a_passkey_on_this_phone_in,
+        recipientKind = RecipientKind.PasskeyPrf,
         singleton = false,
     ),
     StrongBox(
-        title = "This phone (StrongBox)",
-        desc = "TEE-backed key. Convenient, but tied to this device.",
+        title = R.string.this_phone_strongbox,
+        desc = R.string.tee_backed_key_convenient_but_tied,
         recipientKind = RecipientKind.StrongBox,
         singleton = true,
     ),
     Recovery(
-        title = "Paper recovery identity",
-        desc = "Printable age identity. No-network backup.",
+        title = R.string.paper_recovery_identity,
+        desc = R.string.paper_recovery_desc,
         recipientKind = RecipientKind.Recovery,
         singleton = true,
     ),
@@ -75,9 +78,12 @@ sealed interface AddRecipientPhase {
     object Listening : AddRecipientPhase
     object Found : AddRecipientPhase
     object Done : AddRecipientPhase
+    /** [title] and [detailRes] are string resources; [detail] is text from the failure itself. */
     data class Failed(
-        val title: String,
-        val detail: String,
+        @androidx.annotation.StringRes val title: Int,
+        val titleArgs: List<String> = emptyList(),
+        @androidx.annotation.StringRes val detailRes: Int? = null,
+        val detail: String = "",
         val recoverable: Boolean,
     ) : AddRecipientPhase
 }
@@ -87,12 +93,22 @@ data class AddRecipientUiState(
     val pickedKind: EnrollKind? = null,
     val pinPromptOpen: Boolean = false,
     val retryNonce: Int = 0,
+    /**
+     * The phone has no screen lock or biometric, so a Keystore key cannot be
+     * bound to user authentication: nothing is generated until the user picks
+     * "Set a screen lock" or "Enrol without confirmation".
+     */
+    val unboundKeyConsentOpen: Boolean = false,
 )
 
 sealed interface AddRecipientAction {
     data class PickKind(val kind: EnrollKind, val activity: FragmentActivity) : AddRecipientAction
     data class SubmitPin(val pin: CharArray, val activity: FragmentActivity) : AddRecipientAction
     object CancelEnrollment : AddRecipientAction
+    /** Generate the Keystore key without user authentication, after [AddRecipientUiState.unboundKeyConsentOpen]. */
+    object ConfirmUnboundKey : AddRecipientAction
+    /** The user went to set a screen lock instead; back to the picker. */
+    object DeclineUnboundKey : AddRecipientAction
     object Retry : AddRecipientAction
     object Back : AddRecipientAction
 }
@@ -126,8 +142,21 @@ class AddRecipientViewModel @Inject constructor(
             AddRecipientAction.CancelEnrollment -> handleCancel()
             AddRecipientAction.Retry -> handleRetry()
             AddRecipientAction.Back -> handleBack()
+            AddRecipientAction.ConfirmUnboundKey -> {
+                _state.value = _state.value.copy(unboundKeyConsentOpen = false, phase = AddRecipientPhase.Listening)
+                launchStrongBox(allowUnbound = true)
+            }
+            AddRecipientAction.DeclineUnboundKey ->
+                _state.value = _state.value.copy(unboundKeyConsentOpen = false, phase = AddRecipientPhase.Picker, pickedKind = null)
         }
     }
+
+    /** Whether a Keystore key can be bound to user authentication here; replaced in tests. */
+    internal var authBindable: () -> Boolean = { ragewarden.ragedroid.identities.isBiometricEnrollable(appContext) }
+
+    /** Generates the Keystore key; replaced in tests, which have no AndroidKeyStore. */
+    internal var keystoreEnroll: suspend (displayName: String, useStrongBox: Boolean, requireBiometric: Boolean) -> StoredRecipient =
+        { name, strongBox, biometric -> enrollKeystoreIdentity(displayName = name, useStrongBox = strongBox, requireBiometric = biometric).first }
 
     private fun handlePickKind(kind: EnrollKind, activity: FragmentActivity) {
         activityRef = WeakReference(activity)
@@ -158,13 +187,17 @@ class AddRecipientViewModel @Inject constructor(
 
     private fun startEnrollment(kind: EnrollKind, activityHint: FragmentActivity?) {
         when (kind) {
-            EnrollKind.StrongBox -> launchStrongBox()
+            EnrollKind.StrongBox -> if (authBindable()) {
+                launchStrongBox(allowUnbound = false)
+            } else {
+                _state.value = _state.value.copy(unboundKeyConsentOpen = true, phase = AddRecipientPhase.Picker)
+            }
             EnrollKind.YubiKey -> {
                 if (activityHint == null) {
                     _state.value = _state.value.copy(
                         phase = AddRecipientPhase.Failed(
-                            title = "YubiKey enrolment needs an Activity context.",
-                            detail = "Reopen this screen and try again.",
+                            title = R.string.yubikey_enrolment_needs_an_activity_context,
+                            detailRes = R.string.reopen_this_screen_and_try_again,
                             recoverable = false,
                         ),
                     )
@@ -179,8 +212,8 @@ class AddRecipientViewModel @Inject constructor(
                 if (activityHint == null) {
                     _state.value = _state.value.copy(
                         phase = AddRecipientPhase.Failed(
-                            title = "Passkey enrolment needs an Activity context.",
-                            detail = "Reopen this screen and try again.",
+                            title = R.string.passkey_enrolment_needs_an_activity_context,
+                            detailRes = R.string.reopen_this_screen_and_try_again,
                             recoverable = false,
                         ),
                     )
@@ -192,23 +225,22 @@ class AddRecipientViewModel @Inject constructor(
         }
     }
 
-    private fun launchStrongBox() {
+    private fun launchStrongBox(allowUnbound: Boolean) {
         enrollJob = viewModelScope.launch {
             val result = safeRun {
-                val useStrongBox = isStrongBoxAvailable(appContext)
-                val biometric = ragewarden.ragedroid.identities.isBiometricEnrollable(appContext)
+                val biometric = authBindable()
+                check(biometric || allowUnbound) { "an unbound Keystore key needs the user's consent first" }
+                val useStrongBox = runCatching { isStrongBoxAvailable(appContext) }.getOrDefault(false)
+                // Named for what protects it: a key with no user authentication
+                // is not "StrongBox" in any sense a user would rely on.
                 val displayName = when {
-                    useStrongBox -> "This phone (StrongBox)"
-                    biometric -> "This phone (TEE)"
-                    else -> "This phone (no biometric)"
+                    !biometric -> uiString(R.string.this_phone_no_confirmation)
+                    useStrongBox -> uiString(R.string.this_phone_strongbox)
+                    else -> uiString(R.string.this_phone_tee)
                 }
-                enrollKeystoreIdentity(
-                    displayName = displayName,
-                    useStrongBox = useStrongBox,
-                    requireBiometric = biometric,
-                )
+                keystoreEnroll(displayName, useStrongBox, biometric).copy(defaultEncrypt = biometric)
             }
-            result.onSuccess { (recipient, _) ->
+            result.onSuccess { recipient ->
                 try {
                     persist(recipient)
                     _state.value = _state.value.copy(phase = AddRecipientPhase.Done)
@@ -260,7 +292,7 @@ class AddRecipientViewModel @Inject constructor(
         )
         enrollJob = viewModelScope.launch {
             val result = try {
-                Result.success(enrollYubiKeyPivX25519(activity = activity, pin = pin))
+                Result.success(enrollYubiKeyPiv(activity = activity, pin = pin))
             } catch (ce: CancellationException) {
                 pin.fill(' ')
                 throw ce
@@ -334,10 +366,10 @@ class AddRecipientViewModel @Inject constructor(
         withContext(NonCancellable) {
             recipientStore.add(accountId, recipient)
             auditFeed.record(
-                action = AuditAction.Enroll,
+                action = AuditAction.EnrollIdentity,
                 item = recipient.displayName,
                 recipient = recipient.id,
-                reason = "${recipient.kind} recipient added",
+                reason = uiString(R.string.recipient_added_2, recipient.kind),
             )
             VaultBridge.repository()?.pushRecipientRegistry()
         }
@@ -361,18 +393,24 @@ class AddRecipientViewModel @Inject constructor(
         is UserNotAuthenticatedException,
         is KeyPermanentlyInvalidatedException,
         -> AddRecipientPhase.Failed(
-            title = "Biometric expired. Tap to retry.",
+            title = R.string.biometric_expired_tap_to_retry,
             detail = e.message.orEmpty(),
             recoverable = true,
         )
+        is ragewarden.ragedroid.data.StoreUnreadableException -> AddRecipientPhase.Failed(
+            title = ragewarden.ragedroid.R.string.key_list_unreadable_enrol,
+            detail = "",
+            recoverable = false,
+        )
         is YubiKeyX25519UnsupportedException -> AddRecipientPhase.Failed(
-            title = "YubiKey firmware too old (need 5.7+). Try a different identity.",
+            title = R.string.yubikey_firmware_too_old_need_5,
             detail = e.message.orEmpty(),
             recoverable = false,
         )
         else -> AddRecipientPhase.Failed(
-            title = "Enrolment failed: ${e.message ?: e::class.simpleName}",
-            detail = "${kind.title} enrolment did not complete.",
+            title = R.string.enrolment_failed,
+            titleArgs = listOf(e.message ?: e::class.simpleName.orEmpty()),
+            detailRes = R.string.the_enrolment_did_not_complete,
             recoverable = true,
         )
     }

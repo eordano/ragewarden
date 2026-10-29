@@ -1,9 +1,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
-use ragewarden_core::history::{record_revision, HistoryEntry};
-use ragewarden_core::sync::{self, Cipher, Vault};
 use ragewarden_core::Recipient;
+use ragewarden_core::history::{HistoryEntry, record_revision};
+use ragewarden_core::sync::{self, Cipher, Vault};
 
 use crate::http::ReqwestClient;
 use crate::recipients;
@@ -14,15 +14,24 @@ use crate::vault as vault_cache;
 /// rather than loaded here because the caller needs the very same set for its
 /// own write: loading it twice meant a second vault round trip, and a second
 /// copy of the coverage warning printed directly under the first.
+/// The history document is under the user key (core::history v2), so nothing
+/// is wrapped here and no tap is needed; `recipients_vec` only labels the entry.
 pub async fn record_prior_revision(cipher: &Cipher, recipients_vec: &[Recipient]) {
-    if let Err(e) = try_record_prior_revision(cipher, recipients_vec).await {
+    if let Err(e) = try_record(cipher, recipients_vec, false).await {
         eprintln!("rageterm: failed to record cipher history ({e}); continuing");
     }
 }
 
-async fn try_record_prior_revision(
+/// The item's last value goes into the history document before the cipher is
+/// deleted, so a delete is recoverable from `history` like an update.
+pub async fn record_deletion(cipher: &Cipher) -> Result<(), String> {
+    try_record(cipher, &[], true).await
+}
+
+async fn try_record(
     cipher: &Cipher,
     recipients_vec: &[Recipient],
+    deleted: bool,
 ) -> Result<(), String> {
     let open = match session::load().map_err(|e| e.to_string())? {
         Some(o) => o,
@@ -34,27 +43,25 @@ async fn try_record_prior_revision(
         _ => return Ok(()),
     };
 
-    let prior_armored = match sync::extract_rage_blob(&open.session, cipher)
-        .map_err(|e| e.to_string())?
-    {
-        Some(s) => s,
-        None => return Ok(()),
-    };
+    let prior_armored =
+        match sync::extract_rage_blob(&open.session, cipher).map_err(|e| e.to_string())? {
+            Some(s) => s,
+            None => return Ok(()),
+        };
 
-    if recipients_vec.is_empty() {
+    if recipients_vec.is_empty() && !deleted {
         return Ok(());
     }
 
     let summary = recipient_summary_labels(Some(&open.session), recipients_vec).await;
-
-    let entry = HistoryEntry {
-        recorded_at: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or_else(|_| Utc::now().timestamp_millis()),
-        cipher_id,
-        prior_payload_armored: prior_armored,
-        recipients_summary: summary,
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_else(|_| Utc::now().timestamp_millis());
+    let entry = if deleted {
+        HistoryEntry::deletion(cipher_id, prior_armored, summary, now)
+    } else {
+        HistoryEntry::revision(cipher_id, prior_armored, summary, now)
     };
 
     let identities = crate::commands::build_identity_list().map_err(|e| e.to_string())?;
@@ -63,43 +70,21 @@ async fn try_record_prior_revision(
         .map_err(|e| e.to_string())?
         .unwrap_or_default();
 
-    let client = ReqwestClient::new()
-        .map_err(|e| format!("http client: {e}"))?;
-
-    let recipients_no_prf: Vec<Recipient> = recipients_vec
-        .iter()
-        .cloned()
-        .filter(|r| {
-            !matches!(
-                r,
-                Recipient::Fido2HmacSecret { .. } | Recipient::PasskeyPrf { .. }
-            )
-        })
-        .collect();
-    if recipients_no_prf.is_empty() {
-        return Ok(());
-    }
+    let client = ReqwestClient::new().map_err(|e| format!("http client: {e}"))?;
 
     let saved = record_revision(
         &client,
         &open.server,
         &open.session,
         &vault,
-        &recipients_no_prf,
-        &[],
-        &identities,
+        Some(&identities),
         entry,
     )
     .await
     .map_err(|e| e.to_string())?;
 
     let mut updated = vault;
-    if let Some(id) = &saved.id {
-        updated
-            .ciphers
-            .retain(|c| c.id.as_deref() != Some(id.as_str()));
-    }
-    updated.ciphers.push(saved);
+    updated.upsert_cipher(saved);
     vault_cache::save(&updated).map_err(|e| e.to_string())?;
 
     Ok(())
@@ -156,26 +141,28 @@ fn recipients_match(a: &Recipient, b: &Recipient) -> bool {
     use Recipient::*;
     match (a, b) {
         (X25519 { public_key: x }, X25519 { public_key: y }) => x == y,
+        (YubiKeyPiv { public_key: x, .. }, YubiKeyPiv { public_key: y, .. }) => x == y,
+        (YubiKeyPivP256 { public_key: x, .. }, YubiKeyPivP256 { public_key: y, .. }) => x == y,
         (
-            YubiKeyPiv { public_key: x, .. },
-            YubiKeyPiv { public_key: y, .. },
+            Fido2HmacSecret {
+                credential_id: x, ..
+            },
+            Fido2HmacSecret {
+                credential_id: y, ..
+            },
         ) => x == y,
         (
-            Fido2HmacSecret { credential_id: x, .. },
-            Fido2HmacSecret { credential_id: y, .. },
+            PasskeyPrf {
+                credential_id: x, ..
+            },
+            PasskeyPrf {
+                credential_id: y, ..
+            },
         ) => x == y,
-        (
-            PasskeyPrf { credential_id: x, .. },
-            PasskeyPrf { credential_id: y, .. },
-        ) => x == y,
-        (
-            AndroidKeystore { public_key: x, .. },
-            AndroidKeystore { public_key: y, .. },
-        ) => x == y,
-        (
-            SoftwarePassphrase { armored_pubkey: x },
-            SoftwarePassphrase { armored_pubkey: y },
-        ) => x.as_str() == y.as_str(),
+        (AndroidKeystore { public_key: x, .. }, AndroidKeystore { public_key: y, .. }) => x == y,
+        (SoftwarePassphrase { armored_pubkey: x }, SoftwarePassphrase { armored_pubkey: y }) => {
+            x.as_str() == y.as_str()
+        }
         _ => false,
     }
 }
@@ -184,6 +171,7 @@ fn recipient_kind_label(r: &Recipient) -> &'static str {
     match r {
         Recipient::X25519 { .. } => "x25519",
         Recipient::YubiKeyPiv { .. } => "yubikey-piv",
+        Recipient::YubiKeyPivP256 { .. } => "yubikey-piv-p256",
         Recipient::Fido2HmacSecret { .. } => "fido2-hmac",
         Recipient::PasskeyPrf { .. } => "passkey-prf",
         Recipient::AndroidKeystore { .. } => "android-keystore",

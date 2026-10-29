@@ -36,20 +36,44 @@ interface KotlinIdentity {
         stanzaTag: String,
         stanzaArgs: Array<String>,
         stanzaBody: ByteArray,
-    ): ByteArray? = runBlocking(Dispatchers.IO) {
-        withContext(Dispatchers.IO) {
-            tryUnwrap(stanzaTag, stanzaArgs, stanzaBody)
+    ): ByteArray? = try {
+        runBlocking(Dispatchers.IO) {
+            withContext(Dispatchers.IO) {
+                tryUnwrap(stanzaTag, stanzaArgs, stanzaBody)
+            }
         }
+    } catch (t: HardwareTapException) {
+        HardwareFailures.record(t)
+        throw t
     }
+}
+
+/**
+ * The JNI layer clears a Kotlin exception thrown inside an identity callback
+ * and reports a generic decrypt failure, so the typed hardware error (wrong
+ * key, timeout, cancel) is recorded here, on the decrypting thread -- the JNI
+ * calls back on the thread that called decrypt -- for the caller to rethrow.
+ */
+object HardwareFailures {
+    private val last = ThreadLocal<HardwareTapException?>()
+
+    fun record(t: HardwareTapException) = last.set(t)
+
+    fun clear() = last.remove()
+
+    /** The typed failure behind [decryptFailure], if an identity recorded one; else [decryptFailure]. */
+    fun rethrowable(decryptFailure: Throwable): Throwable = (last.get() ?: decryptFailure).also { last.remove() }
 }
 
 object StanzaTags {
     const val X25519: String = "X25519"
     const val SCRYPT: String = "scrypt"
     const val PIV_P256: String = "piv-p256"
+    const val PIV_X25519_V2: String = "piv-x25519-v2"
     const val FIDO2_HMAC: String = "fido2-hmac"
     const val WEBAUTHN_PRF_V1: String = "webauthn-prf-v1"
     const val RAGEDROID_KEYSTORE_V1: String = "ragedroid-keystore-v1"
+    const val RAGEDROID_KEYSTORE_V2: String = "ragedroid-keystore-v2"
 
     /**
      * PRF-family stanzas (`fido2-hmac`, `webauthn-prf-v1`) carry 4 args in the

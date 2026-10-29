@@ -8,12 +8,12 @@ use std::thread;
 
 use zeroize::Zeroizing;
 
-use crate::agent_add::{add_to_agent, AddOptions, AgentAddError};
+use crate::agent_add::{AddOptions, AgentAddError, add_to_agent};
 use crate::tests_lock::ENV_LOCK;
 
-const ED25519_FIXTURE: &str = include_str!("agent_add_test_data/ed25519");
+pub(crate) const ED25519_FIXTURE: &str = include_str!("agent_add_test_data/ed25519");
 
-fn spawn_fake_agent(socket_path: PathBuf) -> mpsc::Receiver<Vec<u8>> {
+pub(crate) fn spawn_fake_agent(socket_path: PathBuf) -> mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = mpsc::channel();
     let listener = UnixListener::bind(&socket_path).expect("bind unix listener");
     thread::spawn(move || {
@@ -38,7 +38,7 @@ fn add_to_agent_round_trips_ed25519_via_fake_agent() {
 
     let rx = spawn_fake_agent(socket_path.clone());
     let prev = std::env::var_os("SSH_AUTH_SOCK");
-    std::env::set_var("SSH_AUTH_SOCK", &socket_path);
+    crate::tests_lock::set_var("SSH_AUTH_SOCK", &socket_path);
 
     let plaintext = Zeroizing::new(ED25519_FIXTURE.as_bytes().to_vec());
     let outcome = add_to_agent(AddOptions {
@@ -49,9 +49,9 @@ fn add_to_agent_round_trips_ed25519_via_fake_agent() {
     .expect("add succeeded");
 
     if let Some(p) = prev {
-        std::env::set_var("SSH_AUTH_SOCK", p);
+        crate::tests_lock::set_var("SSH_AUTH_SOCK", p);
     } else {
-        std::env::remove_var("SSH_AUTH_SOCK");
+        crate::tests_lock::remove_var("SSH_AUTH_SOCK");
     }
 
     assert_eq!(outcome.algorithm, "ssh-ed25519");
@@ -78,7 +78,7 @@ fn add_to_agent_with_lifetime_uses_constrained_opcode() {
 
     let rx = spawn_fake_agent(socket_path.clone());
     let prev = std::env::var_os("SSH_AUTH_SOCK");
-    std::env::set_var("SSH_AUTH_SOCK", &socket_path);
+    crate::tests_lock::set_var("SSH_AUTH_SOCK", &socket_path);
 
     let plaintext = Zeroizing::new(ED25519_FIXTURE.as_bytes().to_vec());
     let outcome = add_to_agent(AddOptions {
@@ -89,9 +89,9 @@ fn add_to_agent_with_lifetime_uses_constrained_opcode() {
     .expect("add succeeded");
 
     if let Some(p) = prev {
-        std::env::set_var("SSH_AUTH_SOCK", p);
+        crate::tests_lock::set_var("SSH_AUTH_SOCK", p);
     } else {
-        std::env::remove_var("SSH_AUTH_SOCK");
+        crate::tests_lock::remove_var("SSH_AUTH_SOCK");
     }
 
     assert_eq!(outcome.lifetime_secs, Some(120));
@@ -109,7 +109,7 @@ fn add_to_agent_with_lifetime_uses_constrained_opcode() {
 fn add_to_agent_errors_when_no_auth_sock() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let prev = std::env::var_os("SSH_AUTH_SOCK");
-    std::env::remove_var("SSH_AUTH_SOCK");
+    crate::tests_lock::remove_var("SSH_AUTH_SOCK");
 
     let plaintext = Zeroizing::new(ED25519_FIXTURE.as_bytes().to_vec());
     let res = add_to_agent(AddOptions {
@@ -119,7 +119,7 @@ fn add_to_agent_errors_when_no_auth_sock() {
     });
 
     if let Some(p) = prev {
-        std::env::set_var("SSH_AUTH_SOCK", p);
+        crate::tests_lock::set_var("SSH_AUTH_SOCK", p);
     }
     assert!(matches!(res, Err(AgentAddError::NoAuthSock)));
 }

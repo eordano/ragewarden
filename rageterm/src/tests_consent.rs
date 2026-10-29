@@ -7,7 +7,7 @@
 
 use tempfile::TempDir;
 
-use ragewarden_core::{decrypt, encrypt, AgeBlob, DecryptError, Plaintext, Recipient};
+use ragewarden_core::{AgeBlob, DecryptError, Plaintext, Recipient, decrypt, encrypt};
 
 use crate::commands::{self, CmdError};
 use crate::consent::{self, HardwareState, IdentityPolicy};
@@ -30,8 +30,8 @@ impl Drop for Isolated {
     fn drop(&mut self) {
         consent::set_test_tty_answer(None);
         match self.prev_config.take() {
-            Some(p) => std::env::set_var("RAGEWARDEN_CONFIG_DIR", p),
-            None => std::env::remove_var("RAGEWARDEN_CONFIG_DIR"),
+            Some(p) => crate::tests_lock::set_var("RAGEWARDEN_CONFIG_DIR", p),
+            None => crate::tests_lock::remove_var("RAGEWARDEN_CONFIG_DIR"),
         }
     }
 }
@@ -40,7 +40,7 @@ fn isolated() -> Isolated {
     let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = TempDir::new().expect("tempdir");
     let prev_config = std::env::var_os("RAGEWARDEN_CONFIG_DIR");
-    std::env::set_var("RAGEWARDEN_CONFIG_DIR", dir.path());
+    crate::tests_lock::set_var("RAGEWARDEN_CONFIG_DIR", dir.path());
     consent::set_test_tty_answer(None);
     Isolated {
         _guard: guard,
@@ -50,7 +50,7 @@ fn isolated() -> Isolated {
 }
 
 fn enroll_software_key() -> Recipient {
-    commands::cmd_enroll_software_identity().expect("enroll software identity");
+    commands::cmd_enroll_software_identity(true).expect("enroll software identity");
     let id = crate::idfile::read(&crate::config::identity_path().unwrap()).expect("read identity");
     Recipient::SoftwarePassphrase {
         armored_pubkey: ragewarden_core::ArmoredAgeRecipient::from_trusted(
@@ -86,6 +86,7 @@ fn enroll_real_piv(label: &str) -> Recipient {
         public_key,
         serial: PIV_SERIAL,
         slot: PIV_SLOT,
+        stanza_version: 1,
     }
 }
 
@@ -122,7 +123,14 @@ fn store_item(name: &str, plaintext: &[u8], recipients: &[Recipient]) {
 fn stored_blob(name: &str) -> AgeBlob {
     let store_path = crate::config::store_path().unwrap();
     let store = crate::store::Store::load(&store_path).unwrap();
-    AgeBlob::from_bytes(store.get(name).expect("item").rage_blob.clone().into_bytes())
+    AgeBlob::from_bytes(
+        store
+            .get(name)
+            .expect("item")
+            .rage_blob
+            .clone()
+            .into_bytes(),
+    )
 }
 
 /// Fails the test if `result` carries plaintext, without printing the plaintext.
@@ -145,8 +153,6 @@ fn a_secret_the_device_protects_is_not_revealed_when_the_device_is_absent() {
     const SECRET: &[u8] = b"plaintext-that-must-not-appear";
     store_item("db-password", SECRET, &[software, piv]);
 
-    // Control: the software key really can open this blob, so the refusal below
-    // is the gate doing its job and not a fixture that never decrypted.
     let everything = commands::build_identity_list().expect("identity list");
     let control = decrypt(&stored_blob("db-password"), &everything).expect("software key opens it");
     assert_eq!(control.as_slice(), SECRET);
@@ -215,7 +221,13 @@ fn the_tui_confirmation_does_not_stand_in_for_a_tap() {
     let piv = enroll_real_piv("YubiKey #0a0b0c0d slot 0x9d");
     store_item("ssh-key", b"id_ed25519-body", &[software, piv]);
 
-    let guard = consent::require_after_confirm("Copy", "ssh-key", "clipboard").expect("guard");
+    let guard = consent::require_after_confirm(
+        "Copy",
+        "ssh-key",
+        "clipboard",
+        crate::tui::UiConfirmed::for_test(),
+    )
+    .expect("guard");
     expect_no_plaintext(
         commands::decrypt_named("ssh-key", &guard),
         "TUI confirm, device absent",
@@ -281,7 +293,6 @@ fn the_hardware_only_list_holds_no_key_that_lives_on_disk() {
         "the software key and the stand-in must exist, just not in the gated list"
     );
 
-    // And the list it produces cannot open a blob wrapped to the software key.
     store_item("sw-only", b"sw-only-secret", &[software]);
     assert!(
         matches!(
@@ -298,7 +309,7 @@ fn the_hardware_only_list_holds_no_key_that_lives_on_disk() {
 fn a_guard_only_opens_the_item_it_was_taken_for() {
     let _iso = isolated();
     let software = enroll_software_key();
-    store_item("decoy", b"decoy-value", &[software.clone()]);
+    store_item("decoy", b"decoy-value", std::slice::from_ref(&software));
     store_item("real-secret", b"the-real-secret", &[software]);
 
     consent::set_test_tty_answer(None);

@@ -2,14 +2,14 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use ragemanifest::snapshot::{
-    build_snapshot, build_snapshot_with_identities, LocalIdentityInventory, WireSession,
+    LocalIdentityInventory, WireSession, build_snapshot, build_snapshot_with_identities,
 };
 use ragewarden_core::bitwarden::{encrypt_type2, make_user_key};
 use ragewarden_core::sync::{
-    self, build_rage_cipher, encrypt_string, Cipher, CipherLogin, CipherUri, Folder, HttpBody,
-    HttpClient, HttpError, HttpResponse, Server, Session, Vault,
+    self, Cipher, CipherLogin, CipherUri, Folder, HttpBody, HttpClient, HttpError, HttpResponse,
+    Server, Session, Vault, build_rage_cipher, encrypt_string,
 };
-use ragewarden_core::{encrypt as core_encrypt, Recipient, Type2EncString};
+use ragewarden_core::{Recipient, Type2EncString, encrypt as core_encrypt};
 
 struct RecordingClient {
     log: Mutex<Vec<String>>,
@@ -79,14 +79,8 @@ impl HttpClient for RecordingClient {
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake};
-    struct Noop;
-    impl Wake for Noop {
-        fn wake(self: Arc<Self>) {}
-    }
-    let waker = Arc::new(Noop).into();
-    let mut cx = Context::from_waker(&waker);
+    use std::task::{Context, Poll, Waker};
+    let mut cx = Context::from_waker(Waker::noop());
     let mut fut = Box::pin(fut);
     loop {
         match Pin::new(&mut fut).as_mut().poll(&mut cx) {
@@ -106,7 +100,7 @@ fn make_session() -> Session {
         email: "test@example.com".into(),
         user_enc_key: user_key.enc_key.to_vec().into(),
         user_mac_key: user_key.mac_key.to_vec().into(),
-        kdf_iterations: 100,
+        kdf: ragewarden_core::sync::KdfParams::pbkdf2(100),
         device_id: "test-device".into(),
     }
 }
@@ -141,22 +135,24 @@ fn build_snapshot_decrypts_metadata_and_flags_rage() {
     let mut rage_cipher: Cipher = {
         let cipher_in = build_rage_cipher(&session, "GitHub", "armored age blob ----")
             .expect("build_rage_cipher");
-        let mut c = Cipher::default();
-        c.id = Some("rage-1".into());
-        c.cipher_type = cipher_in.cipher_type;
-        c.name = cipher_in.name;
-        c.notes = cipher_in.notes;
-        c.fields = cipher_in.fields.map(|fs| {
-            fs.into_iter()
-                .map(|f| sync::CipherField {
-                    name: f.name,
-                    value: f.value,
-                    field_type: f.field_type,
-                })
-                .collect()
-        });
-        c.secure_note = cipher_in.secure_note;
-        c
+        Cipher {
+            id: Some("rage-1".into()),
+            cipher_type: cipher_in.cipher_type,
+            name: cipher_in.name,
+            notes: cipher_in.notes,
+            fields: cipher_in.fields.map(|fs| {
+                fs.into_iter()
+                    .map(|f| sync::CipherField {
+                        name: f.name,
+                        value: f.value,
+                        field_type: f.field_type,
+                        extra: f.extra,
+                    })
+                    .collect()
+            }),
+            secure_note: cipher_in.secure_note,
+            ..Default::default()
+        }
     };
 
     let plain_cipher = Cipher {
@@ -170,7 +166,9 @@ fn build_snapshot_decrypts_metadata_and_flags_rage() {
             uris: Some(vec![CipherUri {
                 uri: type2("https://spotify.com", &session),
                 match_type: None,
+                extra: Default::default(),
             }]),
+            extra: Default::default(),
         }),
         ..Default::default()
     };
@@ -233,6 +231,7 @@ fn cipher_from_in(id: &str, cipher_in: sync::CipherIn) -> Cipher {
                     name: f.name,
                     value: f.value,
                     field_type: f.field_type,
+                    extra: f.extra,
                 })
                 .collect()
         }),
@@ -248,8 +247,11 @@ fn snapshot_flags_decryptability_and_hides_internal_items() {
     let identity = age::x25519::Identity::generate();
     let local_pubkey = identity.to_public().to_string();
     let armored_pubkey = ragewarden_core::ArmoredAgeRecipient::from_trusted(local_pubkey.clone());
-    let blob = core_encrypt(b"payload", &[Recipient::SoftwarePassphrase { armored_pubkey }])
-        .expect("encrypt");
+    let blob = core_encrypt(
+        b"payload",
+        &[Recipient::SoftwarePassphrase { armored_pubkey }],
+    )
+    .expect("encrypt");
     let armored = String::from_utf8(blob.0).expect("utf-8");
 
     let hardware_only = core_encrypt(
@@ -258,6 +260,7 @@ fn snapshot_flags_decryptability_and_hides_internal_items() {
             public_key: [9u8; 32],
             serial: 1,
             slot: 0x9a,
+            stanza_version: 1,
         }],
     )
     .expect("encrypt");
@@ -305,11 +308,13 @@ fn snapshot_flags_decryptability_and_hides_internal_items() {
     assert_eq!(hard.recipient_count, 1);
 
     let registry = by_id.get("reg-1").expect("present");
-    assert!(registry.internal, "registry marker must be flagged internal");
+    assert!(
+        registry.internal,
+        "registry marker must be flagged internal"
+    );
     let history = by_id.get("hist-1").expect("present");
     assert!(history.internal, "history marker must be flagged internal");
 
-    // Same vault, no local identities: fail closed on both rage items.
     let bare = build_snapshot(&session, &vault);
     for c in bare.ciphers.iter().filter(|c| c.rage) {
         assert!(!c.decryptable, "{} should be undecryptable", c.id);
@@ -332,7 +337,7 @@ fn wire_session_round_trips_through_json() {
     assert_eq!(session2.email, session.email);
     assert_eq!(session2.user_enc_key, session.user_enc_key);
     assert_eq!(session2.user_mac_key, session.user_mac_key);
-    assert_eq!(session2.kdf_iterations, session.kdf_iterations);
+    assert_eq!(session2.kdf, session.kdf);
 }
 
 #[test]
@@ -341,9 +346,8 @@ fn snapshot_carries_raw_cipher_for_round_trip_to_decrypt() {
 
     let plaintext = b"correct-horse-battery-staple";
     let identity = age::x25519::Identity::generate();
-    let armored_pubkey = ragewarden_core::ArmoredAgeRecipient::from_trusted(
-        identity.to_public().to_string(),
-    );
+    let armored_pubkey =
+        ragewarden_core::ArmoredAgeRecipient::from_trusted(identity.to_public().to_string());
     let blob = core_encrypt(
         plaintext,
         &[Recipient::SoftwarePassphrase { armored_pubkey }],
@@ -363,6 +367,7 @@ fn snapshot_carries_raw_cipher_for_round_trip_to_decrypt() {
                     name: f.name,
                     value: f.value,
                     field_type: f.field_type,
+                    extra: f.extra,
                 })
                 .collect()
         }),

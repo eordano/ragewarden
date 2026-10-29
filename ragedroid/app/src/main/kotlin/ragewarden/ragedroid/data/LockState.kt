@@ -36,20 +36,21 @@ import kotlinx.coroutines.flow.asStateFlow
  *   persisted;
  * - otherwise the persisted flag wins, and its default when absent is `true`.
  *
- * What this still does *not* do, unchanged from before: `BitwardenVaultRepository`
- * keeps its decrypted cache and the session blob stays on disk while locked.
- * Locking gates every *reader* of that material (that is what the IME and
- * autofill guards are for); it is not a key-zeroisation boundary.
+ * Locking also drops the keys: `BitwardenVaultRepository` listens here, strips
+ * the user key out of its in-memory session blob and clears the decrypted
+ * vault cache. The blob on disk never holds the user key (see [SessionStore]);
+ * unlock re-derives it and decrypts the sealed offline copy of the vault.
  */
 class LockState internal constructor(
     context: Context,
     private val policy: LockPolicy,
+    sessionNeedsUnlock: () -> Boolean = { false },
     hasSession: () -> Boolean,
 ) {
     private val prefs = context.applicationContext
         .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
-    private val _locked = MutableStateFlow(initialLocked(hasSession))
+    private val _locked = MutableStateFlow(initialLocked(hasSession) || (hasSession() && sessionNeedsUnlock()))
 
     val locked: StateFlow<Boolean> = _locked.asStateFlow()
 
@@ -59,8 +60,15 @@ class LockState internal constructor(
      */
     val isLocked: Boolean get() = _locked.value
 
+    private val onLock = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+
+    fun addOnLockListener(listener: () -> Unit) {
+        onLock += listener
+    }
+
     fun lock() {
         set(true)
+        onLock.forEach { runCatching(it) }
     }
 
     /**

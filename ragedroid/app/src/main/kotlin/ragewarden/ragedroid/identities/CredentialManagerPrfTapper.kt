@@ -4,6 +4,7 @@ import androidx.fragment.app.FragmentActivity
 import ragewarden.ragedroid.data.PrfRequest
 import ragewarden.ragedroid.data.PrfTapper
 import ragewarden.ragedroid.data.RecipientStore
+import ragewarden.ragedroid.data.StoredRecipient
 import ragewarden.ragedroid.data.WirePrfInput
 import ragewarden.ragedroid.model.RecipientKind
 
@@ -31,13 +32,9 @@ class CredentialManagerPrfTapper(
     override suspend fun tap(requests: List<PrfRequest>): List<WirePrfInput> {
         if (requests.isEmpty()) return emptyList()
         val stored = recipientStore.forAccount(accountId)
-            .filter { it.kind == RecipientKind.Fido2 }
 
         return requests.map { request ->
-            val match = stored.firstOrNull { r ->
-                (r.fido2RpId == request.rpId && r.fido2Salt.contentEqualsOrNull(request.salt)) ||
-                    (r.passkeyRpId == request.rpId && r.passkeySalt.contentEqualsOrNull(request.salt))
-            } ?: throw HardwareTapUnavailableException(
+            val match = prfRecipientFor(stored, request) ?: throw HardwareTapUnavailableException(
                 "This item is being wrapped to a FIDO2 recipient on \"${request.rpId}\" that is " +
                     "not enrolled on this device. Enrol it here, or clear its default-encrypt flag " +
                     "on the device that owns it.",
@@ -61,12 +58,21 @@ class CredentialManagerPrfTapper(
 
             WirePrfInput(
                 rp_id = request.rpId,
+                credential_id = request.credentialId.copyOf(),
                 salt = request.salt.copyOf(),
                 prf_output = prf,
             )
         }
     }
 
-    private fun ByteArray?.contentEqualsOrNull(other: ByteArray): Boolean =
-        this != null && this.contentEquals(other)
 }
+
+/** The enrolled passkey, of either kind, a PRF request names by RP and credential id. */
+internal fun prfRecipientFor(stored: List<StoredRecipient>, request: PrfRequest): StoredRecipient? =
+    stored.filter { it.kind == RecipientKind.Fido2 || it.kind == RecipientKind.PasskeyPrf }.firstOrNull { r ->
+        (r.fido2RpId == request.rpId && r.fido2CredentialId.contentEqualsOrNull(request.credentialId)) ||
+            (r.passkeyRpId == request.rpId && r.passkeyCredentialId.contentEqualsOrNull(request.credentialId))
+    }
+
+private fun ByteArray?.contentEqualsOrNull(other: ByteArray): Boolean =
+    this != null && this.contentEquals(other)

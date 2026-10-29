@@ -1,31 +1,33 @@
 use super::http::JsHttpClient;
-use super::session::{jsvalue_to_session, session_to_jsvalue};
-use super::{js_err, js_err_with_code};
+use super::session::{jsvalue_to_session, session_to_jsvalue, update_handle};
+use super::{js_err, js_err_with_code, js_object};
 
-use crate::reveal::decrypt_non_rage_field;
-use crate::snapshot::{
-    assess_rage_header, build_snapshot_with_identities, is_internal_cipher_name, DisplayCipher,
-    LocalIdentityInventory, VaultSnapshot,
+use crate::decide::{self, PrfPair};
+use crate::prf_identity::{
+    SoftwareFirst, SpecificPasskeyPrfIdentity, decrypt_software_first, summarize_stanzas,
 };
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use ragewarden_core::policy as core_policy;
+use crate::reveal::{
+    decrypt_non_rage_field, protected_field, rage_protects_field, single_secret_overwrite_refusal,
+};
+use crate::snapshot::{
+    DisplayCipher, LocalIdentityInventory, VaultSnapshot, assess_rage_header,
+    build_snapshot_with_identities, is_internal_cipher_name,
+};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
+use ragewarden_core::kdf::KdfParams;
 use ragewarden_core::registry::{
-    self as core_registry, kinds as registry_kinds, WireDocument as RegistryDocument,
-    WireEntry as RegistryEntry, MARKER_NAME as REGISTRY_MARKER_NAME,
+    self as core_registry, MARKER_NAME as REGISTRY_MARKER_NAME, WireDocument as RegistryDocument,
+    WireEntry as RegistryEntry, kinds as registry_kinds,
 };
 use ragewarden_core::sync::{
-    self, build_meta_cipher, build_rage_cipher, cipher_name,
-    create_cipher as core_create_cipher, decrypt_string, extract_rage_blob, fetch_vault,
-    login_with_device, refresh_session, register, update_cipher as core_update_cipher, Cipher,
-    CipherIn, CipherLogin, Server, Session, SyncError,
+    self, Cipher, LoginOptions, Server, Session, SyncError, build_meta_cipher, cipher_name,
+    create_cipher as core_create_cipher, extract_rage_blob, fetch_vault, login_with_options,
+    refresh_session, register, update_cipher as core_update_cipher, upgrade_kdf,
 };
 use ragewarden_core::{
-    decrypt as core_decrypt, encrypt as core_encrypt,
-    stanza_format::{
-        decrypt_webauthn_prf_with_prf, webauthn_prf_credential_id, TAG_FIDO2_HMAC, TAG_PIV_P256,
-        TAG_WEBAUTHN_PRF_V1,
-    },
-    AgeBlob, FileKey, Identity, IdentityError, Recipient, Stanza,
+    AgeBlob, FileKey, Identity, IdentityError, Recipient, Stanza, decrypt as core_decrypt,
+    encrypt as core_encrypt,
+    stanza_format::{TAG_FIDO2_HMAC, TAG_PIV_P256, TAG_PIV_X25519_V2},
 };
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
@@ -56,22 +58,20 @@ pub async fn wasm_register(
     .await
     .map_err(|e| js_err(format!("register: {e}")))?;
 
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("email"),
-        &JsValue::from_str(&out.email),
-    )
-    .map_err(|e| js_err(format!("reflect: {e:?}")))?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("kdf_iterations"),
-        &JsValue::from_f64(out.kdf_iterations as f64),
-    )
-    .map_err(|e| js_err(format!("reflect: {e:?}")))?;
-    Ok(obj.into())
+    js_object(&[
+        ("email", JsValue::from_str(&out.email)),
+        (
+            "kdf_iterations",
+            JsValue::from_f64(out.kdf.iterations as f64),
+        ),
+    ])
 }
 
+/// `kdf_pin` is the account's KdfParams from its last successful login on this
+/// profile (or null); a server offering weaker ones is refused before the
+/// password is hashed. A PBKDF2 count below the minimum fails with code
+/// `legacy_kdf_needs_consent` unless `allow_legacy_kdf`; follow such a login
+/// with wasm_upgrade_kdf.
 #[wasm_bindgen(js_name = wasm_login)]
 pub async fn wasm_login(
     server_url: String,
@@ -79,53 +79,90 @@ pub async fn wasm_login(
     master_password: String,
     device_name: String,
     device_id: String,
+    kdf_pin: JsValue,
+    allow_legacy_kdf: bool,
 ) -> Result<JsValue, JsValue> {
     let server = Server::self_hosted(&server_url);
     server
         .require_secure()
         .map_err(|e| js_err(format!("insecure server: {e}")))?;
-
+    let opts = LoginOptions {
+        device_id: Some(device_id),
+        kdf_pin: parse_kdf(&kdf_pin)?,
+        allow_legacy_kdf,
+    };
     let client = JsHttpClient::new();
-    let session = login_with_device(
+    let session = login_with_options(
         &client,
         &server,
         &email,
         &master_password,
         &device_name,
-        &device_id,
+        &opts,
     )
     .await
-    .map_err(|e| js_err(format!("login: {e}")))?;
+    .map_err(login_err)?;
 
     session_to_jsvalue(&server, &session)
 }
 
-/*
- * Legacy entry point: no identity inventory, so every rage item is reported
- * `decryptable: false` (fail closed). UI code that gates on decryptability
- * must call wasm_fetch_vault_with_identities instead.
- */
+/// Re-derive the account's master key with `new_kdf` (null = the default for new
+/// accounts) and return the fresh session the server issues afterwards.
+#[wasm_bindgen(js_name = wasm_upgrade_kdf)]
+pub async fn wasm_upgrade_kdf(
+    session_value: JsValue,
+    master_password: String,
+    device_name: String,
+    new_kdf: JsValue,
+) -> Result<JsValue, JsValue> {
+    let (server, session) = jsvalue_to_session(&session_value)?;
+    let new = parse_kdf(&new_kdf)?.unwrap_or_default();
+    let client = JsHttpClient::new();
+    let upgraded = upgrade_kdf(
+        &client,
+        &server,
+        &session,
+        &master_password,
+        &device_name,
+        new,
+    )
+    .await
+    .map_err(|e| js_err(format!("upgrade kdf: {e}")))?;
+    session_to_jsvalue(&server, &upgraded)
+}
+
+fn parse_kdf(value: &JsValue) -> Result<Option<KdfParams>, JsValue> {
+    if value.is_null() || value.is_undefined() {
+        return Ok(None);
+    }
+    let s: String = js_sys::JSON::stringify(value)
+        .map_err(|e| js_err(format!("stringify kdf: {e:?}")))?
+        .into();
+    serde_json::from_str(&s)
+        .map(Some)
+        .map_err(|e| js_err(format!("parse kdf: {e}")))
+}
+
+fn login_err(e: SyncError) -> JsValue {
+    match &e {
+        SyncError::LegacyKdfNeedsConsent { got, min } => {
+            let err = js_err_with_code("legacy_kdf_needs_consent", format!("login: {e}"));
+            let _ = js_sys::Reflect::set(&err, &"got".into(), &JsValue::from(*got));
+            let _ = js_sys::Reflect::set(&err, &"min".into(), &JsValue::from(*min));
+            err
+        }
+        SyncError::KdfDowngraded { .. } => {
+            js_err_with_code("kdf_downgraded", format!("login: {e}"))
+        }
+        _ => js_err(format!("login: {e}")),
+    }
+}
+
 #[wasm_bindgen(js_name = wasm_fetch_vault)]
 pub async fn wasm_fetch_vault(session_value: JsValue) -> Result<JsValue, JsValue> {
     fetch_vault_snapshot(session_value, LocalIdentityInventory::default()).await
 }
 
-/*
- * Snapshot with per-item decryptability. `local_identities_value` is a plain
- * object naming what THIS profile holds:
- *
- *   {
- *     software_armored_pubkeys:   ["age1..."],       // software identity present
- *     passkey_credential_ids_b64: ["<b64>", ...],    // webauthn-prf-v1
- *     fido2_credential_ids_b64:   ["<b64>", ...],    // fido2-hmac via native host
- *     piv_pubkeys_hex:            ["<64 hex>", ...], // piv-p256 via native host
- *     keystore_handles:           ["...", ...],      // ragedroid-keystore-v1
- *   }
- *
- * Every field is optional; null/undefined means "nothing available here".
- * The check is header-stanza matching only -- nothing is decrypted and no
- * hardware is tapped.
- */
 #[wasm_bindgen(js_name = wasm_fetch_vault_with_identities)]
 pub async fn wasm_fetch_vault_with_identities(
     session_value: JsValue,
@@ -142,11 +179,6 @@ async fn fetch_vault_snapshot(
     let (server, mut session) = jsvalue_to_session(&session_value)?;
     let client = JsHttpClient::new();
 
-    // Access tokens expire while a persisted session lives on. On a 401,
-    // refresh once with the stored refresh token and retry rather than making
-    // the user re-enter their master password. If the refresh itself fails
-    // (refresh token also expired/revoked), surface the original error so the
-    // UI falls back to a full login.
     let mut refreshed = false;
     let vault = match fetch_vault(&client, &server, &session).await {
         Ok(v) => v,
@@ -164,15 +196,12 @@ async fn fetch_vault_snapshot(
 
     let snap = build_snapshot_with_identities(&session, &vault, &inventory);
     let value = snapshot_to_jsvalue(&snap)?;
-    // If we minted a new access token, hand the updated session back so the
-    // caller can persist it; otherwise the next fetch would 401 again.
     if refreshed {
-        if let Ok(sess_value) = session_to_jsvalue(&server, &session) {
-            let _ = js_sys::Reflect::set(
-                &value,
-                &JsValue::from_str("refreshed_session"),
-                &sess_value,
-            );
+        if update_handle(&session_value, &server, &session) {
+            let _ = js_sys::Reflect::set(&value, &JsValue::from_str("refreshed"), &JsValue::TRUE);
+        } else if let Ok(sess_value) = session_to_jsvalue(&server, &session) {
+            let _ =
+                js_sys::Reflect::set(&value, &JsValue::from_str("refreshed_session"), &sess_value);
         }
     }
     Ok(value)
@@ -226,55 +255,26 @@ pub async fn wasm_decrypt_cipher_field_with_secrets(
             .collect()
     };
 
-    if let Some(blob) = extract_rage_blob(&session, &cipher)
-        .map_err(|e| js_err(format!("extract rage blob: {e}")))?
-    {
-        let plaintext =
-            decrypt_rage_blob(blob.into_bytes(), prf_callback.as_ref(), &secrets).await?;
-        let _ = field_name;
-        return Ok(plaintext);
+    let protected = rage_protects_field(&session, &cipher, &field_name)
+        .map_err(|e| js_err_with_code(e.code(), format!("{e}")))?;
+    if protected {
+        if let Some(blob) = extract_rage_blob(&session, &cipher)
+            .map_err(|e| js_err(format!("extract rage blob: {e}")))?
+        {
+            let payload = zeroize::Zeroizing::new(
+                decrypt_rage_blob(blob.into_bytes(), prf_callback.as_ref(), &secrets).await?,
+            );
+            let value = protected_field(&cipher, &payload, &field_name)
+                .map_err(|e| js_err_with_code(e.code(), format!("{e}")))?;
+            return Ok(value.to_vec());
+        }
     }
 
     let bytes = decrypt_non_rage_field(&session, &cipher, &field_name)
         .map_err(|e| js_err_with_code(e.code(), format!("decrypt: {e}")))?;
-    Ok(bytes)
+    Ok(bytes.to_vec())
 }
 
-/*
- * The file-key seam: decrypt a rage-protected field with a file key the caller
- * obtained from somewhere this side cannot reach -- today, `rageterm` over native
- * messaging, which owns the PIV / FIDO2 devices the browser cannot talk to.
- *
- * `native_callback(stanzas)` is handed only the stanzas this side cannot open
- * itself, each as `{ index, tag, args, body }` with `body` base64 -- the exact
- * shape `rageterm`'s `WireStanza` deserialises, so a caller can forward one
- * straight down the `native.unwrap` path in ext/background.js without reshaping
- * it. It must resolve to `{ fileKeyB64, receipt }`, and may additionally name
- * which stanza it opened as `stanzaIndex` and/or `stanza`.
- *
- * Two refusals live here, and neither of them is the ceremony check:
- *
- *   - the returned key must actually open this blob. A key that does not is a
- *     plain error (age verifies the header MAC before any payload key is
- *     derived), never a panic and never an empty plaintext.
- *   - a `stanzaIndex` / `stanza` naming something outside the set handed to the
- *     callback is refused, and the identity built from the key answers *only*
- *     the stanzas that were handed out. This mirrors invoke_prf_callback_multi,
- *     which refuses a credentialId outside the pairs it supplied.
- *
- * The `receipt` is opaque here. Rust does not and cannot judge whether a
- * physical touch happened -- glue/hardware-tap.js decides that, and it must be
- * the last thing to read the receipt. So this function releasing a plaintext is
- * NOT an assertion that a device was tapped; it asserts only that the key it was
- * handed opens the item.
- *
- * Returns the plaintext as a `Uint8Array`, the same shape
- * wasm_decrypt_cipher_field returns, so a caller can decode and zero it exactly
- * as before. The receipt it handed back is re-attached untouched as a `receipt`
- * property on that array rather than being swallowed here: whatever gates on it
- * should be able to reach it from the value this call produced, not only from
- * the closure that minted it.
- */
 #[wasm_bindgen(js_name = wasm_decrypt_cipher_field_with_native)]
 pub async fn wasm_decrypt_cipher_field_with_native(
     session_value: JsValue,
@@ -284,7 +284,17 @@ pub async fn wasm_decrypt_cipher_field_with_native(
 ) -> Result<JsValue, JsValue> {
     let (_server, session) = jsvalue_to_session(&session_value)?;
     let cipher = jsvalue_to_cipher(&cipher_value)?;
-    let _ = field_name;
+    let protected = rage_protects_field(&session, &cipher, &field_name)
+        .map_err(|e| js_err_with_code(e.code(), format!("{e}")))?;
+    if !protected {
+        return Err(js_err_with_code(
+            "missing_field",
+            format!(
+                "`{field_name}` is not sealed in this item's rage blob, so no native host \
+                 unwrap applies to it. Refusing to ask for a touch that could not reveal it.",
+            ),
+        ));
+    }
 
     let blob = extract_rage_blob(&session, &cipher)
         .map_err(|e| js_err(format!("extract rage blob: {e}")))?
@@ -300,8 +310,9 @@ pub async fn wasm_decrypt_cipher_field_with_native(
     let offered = native_unwrappable_stanzas(blob.as_bytes())?;
     if offered.is_empty() {
         return Err(js_err(format!(
-            "this item carries no stanza a native host can unwrap (looked for `{TAG_PIV_P256}` \
-             and `{TAG_FIDO2_HMAC}`). Refusing to ask for a touch that could not open it.",
+            "this item carries no stanza a native host can unwrap (looked for \
+             `{TAG_PIV_X25519_V2}`, `{TAG_PIV_P256}` and `{TAG_FIDO2_HMAC}`). Refusing to ask for \
+             a touch that could not open it.",
         )));
     }
 
@@ -321,10 +332,45 @@ pub async fn wasm_decrypt_cipher_field_with_native(
         )
     })?;
 
-    let out = js_sys::Uint8Array::from(&plaintext[..]);
+    let value = protected_field(&cipher, &plaintext, &field_name)
+        .map_err(|e| js_err_with_code(e.code(), format!("{e}")))?;
+    let out = js_sys::Uint8Array::from(&value[..]);
     js_sys::Reflect::set(&out, &JsValue::from_str("receipt"), &answer.receipt)
         .map_err(|e| js_err(format!("reflect receipt: {e:?}")))?;
     Ok(out.into())
+}
+
+#[wasm_bindgen(js_name = wasm_rage_stanza_summary)]
+pub fn wasm_rage_stanza_summary(
+    session_value: JsValue,
+    cipher_value: JsValue,
+    field_name: String,
+) -> Result<JsValue, JsValue> {
+    let (_server, session) = jsvalue_to_session(&session_value)?;
+    let cipher = jsvalue_to_cipher(&cipher_value)?;
+    let protected = rage_protects_field(&session, &cipher, &field_name)
+        .map_err(|e| js_err_with_code(e.code(), format!("{e}")))?;
+    let blob = if protected {
+        extract_rage_blob(&session, &cipher)
+            .map_err(|e| js_err(format!("extract rage blob: {e}")))?
+    } else {
+        None
+    };
+    let (rage, summary) = match blob {
+        Some(armored) => (
+            true,
+            summarize_stanzas(&collect_stanzas(armored.as_bytes())?),
+        ),
+        None => (false, Default::default()),
+    };
+    let summary = serde_json::to_value(&summary).map_err(|e| js_err(format!("summary: {e}")))?;
+    let mut map = match summary {
+        serde_json::Value::Object(m) => m,
+        _ => serde_json::Map::new(),
+    };
+    map.insert("rage".into(), serde_json::Value::Bool(rage));
+    js_sys::JSON::parse(&serde_json::Value::Object(map).to_string())
+        .map_err(|e| js_err(format!("JSON.parse: {e:?}")))
 }
 
 #[wasm_bindgen(js_name = wasm_create_cipher)]
@@ -333,7 +379,13 @@ pub async fn wasm_create_cipher(
     plaintext_field_map: JsValue,
     recipients_value: JsValue,
 ) -> Result<JsValue, JsValue> {
-    create_cipher_inner(session_value, plaintext_field_map, recipients_value, JsValue::NULL).await
+    create_cipher_inner(
+        session_value,
+        plaintext_field_map,
+        recipients_value,
+        JsValue::NULL,
+    )
+    .await
 }
 
 #[wasm_bindgen(js_name = wasm_create_cipher_with_prf)]
@@ -343,7 +395,81 @@ pub async fn wasm_create_cipher_with_prf(
     recipients_value: JsValue,
     prf_table_value: JsValue,
 ) -> Result<JsValue, JsValue> {
-    create_cipher_inner(session_value, plaintext_field_map, recipients_value, prf_table_value).await
+    create_cipher_inner(
+        session_value,
+        plaintext_field_map,
+        recipients_value,
+        prf_table_value,
+    )
+    .await
+}
+
+fn field<'a>(fields: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    fields
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+}
+
+fn seal_secret(
+    fields: &[(String, String)],
+    recipients: &[Recipient],
+    prf_entries: &[OwnedPrfEntry],
+) -> Result<String, JsValue> {
+    let secret_value =
+        field(fields, "rage").ok_or_else(|| js_err("plaintext_field_map.rage is required"))?;
+    encrypt_payload(secret_value.as_bytes(), recipients, prf_entries)
+}
+
+fn encrypt_payload(
+    payload: &[u8],
+    recipients: &[Recipient],
+    prf_entries: &[OwnedPrfEntry],
+) -> Result<String, JsValue> {
+    let blob = if prf_entries.is_empty() {
+        core_encrypt(payload, recipients).map_err(|e| js_err(format!("encrypt: {e}")))?
+    } else {
+        let table: Vec<ragewarden_core::PrfEntry<'_>> = prf_entries
+            .iter()
+            .map(|e| ragewarden_core::PrfEntry {
+                rp_id: &e.rp_id,
+                credential_id: &e.credential_id,
+                salt: &e.salt,
+                prf_output: &e.prf_output,
+            })
+            .collect();
+        ragewarden_core::encrypt_with_prf(payload, recipients, &table)
+            .map_err(|e| js_err(format!("encrypt: {e}")))?
+    };
+    String::from_utf8(blob.0).map_err(|e| js_err(format!("blob not utf-8: {e}")))
+}
+
+fn draft_from_fields(fields: &[(String, String)]) -> sync::CipherDraft {
+    let username = field(fields, "username").map(String::from);
+    let site = field(fields, "site").map(String::from);
+    let login = username.is_some()
+        || site.is_some()
+        || field(fields, "cipher_type").is_some_and(|t| t.eq_ignore_ascii_case("login"));
+    sync::CipherDraft {
+        login,
+        name: field(fields, "name").unwrap_or("Untitled").to_string(),
+        notes: field(fields, "notes").map(String::from),
+        username,
+        uris: site.into_iter().collect(),
+        totp: field(fields, "totp").map(String::from),
+        ..sync::CipherDraft::default()
+    }
+}
+
+fn edit_from_fields(fields: &[(String, String)]) -> sync::CipherEdit {
+    sync::CipherEdit {
+        name: field(fields, "name").map(String::from),
+        notes: field(fields, "notes").map(String::from),
+        username: field(fields, "username").map(String::from),
+        uris: field(fields, "site").map(|s| vec![s.to_string()]),
+        totp: field(fields, "totp").map(String::from),
+        ..sync::CipherEdit::default()
+    }
 }
 
 async fn create_cipher_inner(
@@ -357,38 +483,9 @@ async fn create_cipher_inner(
     let recipients = parse_recipients(&recipients_value)?;
     let prf_entries = parse_prf_table(&prf_table_value)?;
 
-    let primary_name = fields
-        .iter()
-        .find(|(k, _)| k == "name")
-        .map(|(_, v)| v.clone())
-        .unwrap_or_else(|| "Untitled".to_string());
-
-    let secret_value = fields
-        .iter()
-        .find(|(k, _)| k == "rage")
-        .map(|(_, v)| v.clone())
-        .ok_or_else(|| js_err("plaintext_field_map.rage is required"))?;
-
-    let blob = if prf_entries.is_empty() {
-        core_encrypt(secret_value.as_bytes(), &recipients)
-            .map_err(|e| js_err(format!("encrypt: {e}")))?
-    } else {
-        let table: Vec<ragewarden_core::PrfEntry<'_>> = prf_entries
-            .iter()
-            .map(|e| ragewarden_core::PrfEntry {
-                rp_id: &e.rp_id,
-                salt: &e.salt,
-                prf_output: &e.prf_output,
-            })
-            .collect();
-        ragewarden_core::encrypt_with_prf(secret_value.as_bytes(), &recipients, &table)
-            .map_err(|e| js_err(format!("encrypt: {e}")))?
-    };
-    let armored = String::from_utf8(blob.0).map_err(|e| js_err(format!("blob not utf-8: {e}")))?;
-
-    let mut cipher_in = build_rage_cipher(&session, &primary_name, &armored)
-        .map_err(|e| js_err(format!("build_rage_cipher: {e}")))?;
-    augment_with_login(&mut cipher_in, &fields, &session)?;
+    let armored = seal_secret(&fields, &recipients, &prf_entries)?;
+    let cipher_in = sync::build_cipher(&session, &draft_from_fields(&fields), Some(&armored))
+        .map_err(|e| js_err(format!("build_cipher: {e}")))?;
 
     let client = JsHttpClient::new();
     let saved = core_create_cipher(&client, &server, &session, &cipher_in)
@@ -448,44 +545,173 @@ async fn update_cipher_inner(
     let recipients = parse_recipients(&recipients_value)?;
     let prf_entries = parse_prf_table(&prf_table_value)?;
 
-    let primary_name = fields
-        .iter()
-        .find(|(k, _)| k == "name")
-        .map(|(_, v)| v.clone())
-        .unwrap_or_else(|| "Untitled".to_string());
-
-    let secret_value = fields
-        .iter()
-        .find(|(k, _)| k == "rage")
-        .map(|(_, v)| v.clone())
-        .ok_or_else(|| js_err("plaintext_field_map.rage is required"))?;
-
-    let blob = if prf_entries.is_empty() {
-        core_encrypt(secret_value.as_bytes(), &recipients)
-            .map_err(|e| js_err(format!("encrypt: {e}")))?
-    } else {
-        let table: Vec<ragewarden_core::PrfEntry<'_>> = prf_entries
-            .iter()
-            .map(|e| ragewarden_core::PrfEntry {
-                rp_id: &e.rp_id,
-                salt: &e.salt,
-                prf_output: &e.prf_output,
-            })
-            .collect();
-        ragewarden_core::encrypt_with_prf(secret_value.as_bytes(), &recipients, &table)
-            .map_err(|e| js_err(format!("encrypt: {e}")))?
-    };
-    let armored = String::from_utf8(blob.0).map_err(|e| js_err(format!("blob not utf-8: {e}")))?;
-
-    let mut cipher_in = build_rage_cipher(&session, &primary_name, &armored)
-        .map_err(|e| js_err(format!("build_rage_cipher: {e}")))?;
-    augment_with_login(&mut cipher_in, &fields, &session)?;
-
     let client = JsHttpClient::new();
-    let saved = sync::update_cipher(&client, &server, &session, &cipher_id, &cipher_in)
+    let existing = sync::get_cipher(&client, &server, &session, &cipher_id)
+        .await
+        .map_err(|e| js_err(format!("get_cipher: {e}")))?;
+    let protected = sync::protected_field_names(&session, &existing)
+        .map_err(|e| js_err(format!("protected fields: {e}")))?;
+    let replacement = field(&fields, "rage").unwrap_or_default().as_bytes();
+    if let Some(why) =
+        single_secret_overwrite_refusal(existing.cipher_type, &protected, replacement)
+    {
+        return Err(js_err_with_code("multi_field", why));
+    }
+    record_prior(&client, &server, &session, &cipher_id, false).await?;
+    let armored = seal_secret(&fields, &recipients, &prf_entries)?;
+    let cipher_in = sync::edit_preserving(
+        &session,
+        &existing,
+        Some(&armored),
+        &edit_from_fields(&fields),
+    )
+    .map_err(|e| js_err(format!("edit: {e}")))?;
+    let saved = core_update_cipher(&client, &server, &session, &cipher_id, &cipher_in)
         .await
         .map_err(|e| js_err(format!("update_cipher: {e}")))?;
 
+    cipher_to_jsvalue(&session, &saved)
+}
+
+fn parse_json<T: serde::de::DeserializeOwned>(value: &JsValue, what: &str) -> Result<T, JsValue> {
+    let s: String = js_sys::JSON::stringify(value)
+        .map_err(|e| js_err(format!("stringify {what}: {e:?}")))?
+        .into();
+    serde_json::from_str(&s).map_err(|e| js_err(format!("parse {what}: {e}")))
+}
+
+/// Creates (`cipher_id` null) or updates any item -- login, note, card,
+/// identity, SSH key -- with several protected fields at once.
+///
+/// `item` is a core `CipherDraft` for a create and a `CipherEdit` for an
+/// update (camelCase; card/identity/sshKey blocks map Bitwarden field names
+/// to plaintext). `protected_fields` maps the names of the fields to seal to
+/// their values (`null` keeps the item's current blob on an update, and makes
+/// an unprotected item on a create); they are sealed into one rage blob -- v1
+/// for the primary field alone, a v2 field map otherwise -- and left out of
+/// the Type-2 layer. An update merges against the server's current copy.
+#[wasm_bindgen(js_name = wasm_save_item)]
+pub async fn wasm_save_item(
+    session_value: JsValue,
+    cipher_id: Option<String>,
+    item: JsValue,
+    protected_fields: JsValue,
+    recipients_value: JsValue,
+    prf_table_value: JsValue,
+) -> Result<JsValue, JsValue> {
+    let (server, session) = jsvalue_to_session(&session_value)?;
+    let secrets: Option<std::collections::BTreeMap<String, String>> =
+        if protected_fields.is_null() || protected_fields.is_undefined() {
+            None
+        } else {
+            Some(parse_json(&protected_fields, "protected fields")?)
+        };
+    let seal = |cipher_type: u8| -> Result<Option<(String, Vec<String>)>, JsValue> {
+        let Some(secrets) = &secrets else {
+            return Ok(None);
+        };
+        let recipients = parse_recipients(&recipients_value)?;
+        let prf_entries = parse_prf_table(&prf_table_value)?;
+        let fields = secrets
+            .iter()
+            .map(|(k, v)| (k.clone(), zeroize::Zeroizing::new(v.as_bytes().to_vec())))
+            .collect();
+        let payload = ragewarden_core::protected::seal(cipher_type, &fields)
+            .map_err(|e| js_err(format!("seal: {e}")))?;
+        let armored = encrypt_payload(&payload, &recipients, &prf_entries)?;
+        Ok(Some((armored, secrets.keys().cloned().collect())))
+    };
+
+    let client = JsHttpClient::new();
+    let saved = match cipher_id.filter(|id| !id.is_empty()) {
+        None => {
+            let mut draft: sync::CipherDraft = parse_json(&item, "item")?;
+            let sealed = seal(draft.cipher_type())?;
+            if let Some((_, names)) = &sealed {
+                draft.protected_fields = names.clone();
+            }
+            let cipher_in =
+                sync::build_cipher(&session, &draft, sealed.as_ref().map(|(a, _)| a.as_str()))
+                    .map_err(|e| js_err(format!("build_cipher: {e}")))?;
+            core_create_cipher(&client, &server, &session, &cipher_in)
+                .await
+                .map_err(|e| js_err(format!("create_cipher: {e}")))?
+        }
+        Some(id) => {
+            let mut edit: sync::CipherEdit = parse_json(&item, "item")?;
+            let existing = sync::get_cipher(&client, &server, &session, &id)
+                .await
+                .map_err(|e| js_err(format!("get_cipher: {e}")))?;
+            let cipher_type = sync::edit_preserving(&session, &existing, None, &edit)
+                .map_err(|e| js_err(format!("edit: {e}")))?
+                .cipher_type;
+            let sealed = seal(cipher_type)?;
+            if let Some((_, names)) = &sealed {
+                edit.protected_fields = Some(names.clone());
+                record_prior(&client, &server, &session, &id, false).await?;
+            }
+            let cipher_in = sync::edit_preserving(
+                &session,
+                &existing,
+                sealed.as_ref().map(|(a, _)| a.as_str()),
+                &edit,
+            )
+            .map_err(|e| js_err(format!("edit: {e}")))?;
+            core_update_cipher(&client, &server, &session, &id, &cipher_in)
+                .await
+                .map_err(|e| js_err(format!("update_cipher: {e}")))?
+        }
+    };
+    cipher_to_jsvalue(&session, &saved)
+}
+
+/// The protected fields in `payload` -- what a `*` read of `cipher` returned --
+/// by name, so an editor can change some of them and seal all of them again.
+#[wasm_bindgen(js_name = wasm_open_payload)]
+pub fn wasm_open_payload(cipher_value: JsValue, payload: String) -> Result<JsValue, JsValue> {
+    let cipher = jsvalue_to_cipher(&cipher_value)?;
+    let opened = ragewarden_core::protected::open(cipher.cipher_type, payload.as_bytes())
+        .map_err(|e| js_err(format!("open payload: {e}")))?;
+    let map = js_sys::Object::new();
+    for (name, value) in opened.iter() {
+        let text = std::str::from_utf8(value)
+            .map_err(|_| js_err(format!("protected field `{name}` is not text")))?;
+        js_sys::Reflect::set(&map, &JsValue::from_str(name), &JsValue::from_str(text))
+            .map_err(|e| js_err(format!("reflect: {e:?}")))?;
+    }
+    Ok(map.into())
+}
+
+/// The fields `cipher`'s rage blob holds, read with no tap.
+#[wasm_bindgen(js_name = wasm_protected_field_names)]
+pub fn wasm_protected_field_names(
+    session_value: JsValue,
+    cipher_value: JsValue,
+) -> Result<JsValue, JsValue> {
+    let (_server, session) = jsvalue_to_session(&session_value)?;
+    let cipher = jsvalue_to_cipher(&cipher_value)?;
+    let names = sync::protected_field_names(&session, &cipher)
+        .map_err(|e| js_err(format!("protected fields: {e}")))?;
+    let s = serde_json::to_string(&names).map_err(|e| js_err(format!("serialize: {e}")))?;
+    js_sys::JSON::parse(&s).map_err(|e| js_err(format!("JSON.parse: {e:?}")))
+}
+
+/// Moves an item to `folder_id` (`null` clears it) without re-encrypting
+/// anything: no tap is needed and no field can be lost.
+#[wasm_bindgen(js_name = wasm_set_folder)]
+pub async fn wasm_set_folder(
+    session_value: JsValue,
+    cipher_id: String,
+    folder_id: Option<String>,
+) -> Result<JsValue, JsValue> {
+    let (server, session) = jsvalue_to_session(&session_value)?;
+    if cipher_id.is_empty() {
+        return Err(js_err("cipher_id required"));
+    }
+    let client = JsHttpClient::new();
+    let saved = sync::set_folder_on(&client, &server, &session, &cipher_id, folder_id.as_deref())
+        .await
+        .map_err(|e| js_err(format!("set_folder: {e}")))?;
     cipher_to_jsvalue(&session, &saved)
 }
 
@@ -499,17 +725,79 @@ pub async fn wasm_delete_cipher(
         return Err(js_err("cipher_id required"));
     }
     let client = JsHttpClient::new();
+    record_prior(&client, &server, &session, &cipher_id, true).await?;
     sync::delete_cipher(&client, &server, &session, &cipher_id)
         .await
         .map_err(|e| js_err(format!("delete_cipher: {e}")))?;
     Ok(JsValue::from_str(&cipher_id))
 }
 
-#[wasm_bindgen(js_name = wasm_create_folder)]
-pub async fn wasm_create_folder(
+/// Field edits that leave the secret alone: name, username, site, notes,
+/// folder. Nothing is re-wrapped, so no tap and no history revision.
+#[wasm_bindgen(js_name = wasm_edit_cipher)]
+pub async fn wasm_edit_cipher(
     session_value: JsValue,
-    name: String,
+    cipher_id: String,
+    changed_fields: JsValue,
 ) -> Result<JsValue, JsValue> {
+    let (server, session) = jsvalue_to_session(&session_value)?;
+    if cipher_id.is_empty() {
+        return Err(js_err("cipher_id required"));
+    }
+    let fields = parse_field_map(&changed_fields)?;
+    let client = JsHttpClient::new();
+    let saved = sync::update_preserving(
+        &client,
+        &server,
+        &session,
+        &cipher_id,
+        None,
+        &edit_from_fields(&fields),
+    )
+    .await
+    .map_err(|e| js_err(format!("update_preserving: {e}")))?;
+    cipher_to_jsvalue(&session, &saved)
+}
+
+/// Before a write replaces an item's rage payload (or deletes the item), keep
+/// the payload in the account's history document as a revision (or a
+/// deletion). Items without a rage payload have nothing to keep.
+async fn record_prior(
+    client: &JsHttpClient,
+    server: &Server,
+    session: &Session,
+    cipher_id: &str,
+    deleted: bool,
+) -> Result<(), JsValue> {
+    let vault = fetch_vault(client, server, session)
+        .await
+        .map_err(|e| js_err(format!("fetch_vault: {e}")))?;
+    let Some(existing) = vault
+        .ciphers
+        .iter()
+        .find(|c| c.id.as_deref() == Some(cipher_id))
+    else {
+        return Ok(());
+    };
+    let Some(prior) =
+        extract_rage_blob(session, existing).map_err(|e| js_err(format!("history: {e}")))?
+    else {
+        return Ok(());
+    };
+    let now = (js_sys::Date::now() as i64).max(0);
+    let entry = if deleted {
+        ragewarden_core::history::HistoryEntry::deletion(cipher_id, prior, Vec::new(), now)
+    } else {
+        ragewarden_core::history::HistoryEntry::revision(cipher_id, prior, Vec::new(), now)
+    };
+    ragewarden_core::history::record_revision(client, server, session, &vault, None, entry)
+        .await
+        .map_err(|e| js_err(format!("record history: {e}")))?;
+    Ok(())
+}
+
+#[wasm_bindgen(js_name = wasm_create_folder)]
+pub async fn wasm_create_folder(session_value: JsValue, name: String) -> Result<JsValue, JsValue> {
     let (server, session) = jsvalue_to_session(&session_value)?;
     let client = JsHttpClient::new();
     let f = sync::create_folder(&client, &server, &session, &name)
@@ -549,6 +837,7 @@ pub async fn wasm_delete_folder(
 
 struct OwnedPrfEntry {
     rp_id: String,
+    credential_id: Vec<u8>,
     salt: [u8; 32],
     prf_output: [u8; 32],
 }
@@ -563,6 +852,8 @@ fn parse_prf_table(value: &JsValue) -> Result<Vec<OwnedPrfEntry>, JsValue> {
     #[derive(Deserialize)]
     struct WireEntry {
         rp_id: String,
+        #[serde(default)]
+        credential_id_b64: Option<String>,
         salt_b64: String,
         prf_output_b64: String,
     }
@@ -574,7 +865,10 @@ fn parse_prf_table(value: &JsValue) -> Result<Vec<OwnedPrfEntry>, JsValue> {
             .decode(w.salt_b64.as_bytes())
             .map_err(|e| js_err(format!("salt_b64: {e}")))?;
         if salt_v.len() != 32 {
-            return Err(js_err(format!("salt_b64 must be 32 bytes, got {}", salt_v.len())));
+            return Err(js_err(format!(
+                "salt_b64 must be 32 bytes, got {}",
+                salt_v.len()
+            )));
         }
         let mut salt = [0u8; 32];
         salt.copy_from_slice(&salt_v);
@@ -591,8 +885,16 @@ fn parse_prf_table(value: &JsValue) -> Result<Vec<OwnedPrfEntry>, JsValue> {
         let mut prf_output = [0u8; 32];
         prf_output.copy_from_slice(&prf_v);
 
+        let credential_id = match &w.credential_id_b64 {
+            None => Vec::new(),
+            Some(c) => B64
+                .decode(c.as_bytes())
+                .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(c.as_bytes()))
+                .map_err(|e| js_err(format!("credential_id_b64: {e}")))?,
+        };
         out.push(OwnedPrfEntry {
             rp_id: w.rp_id,
+            credential_id,
             salt,
             prf_output,
         });
@@ -619,24 +921,19 @@ fn cipher_to_jsvalue(session: &Session, cipher: &Cipher) -> Result<JsValue, JsVa
     let name = cipher_name(session, cipher).unwrap_or_else(|_| "(undecryptable)".into());
     let rage_blob = extract_rage_blob(session, cipher).ok().flatten();
     let rage = rage_blob.is_some();
-    /*
-     * This is a save echo, not a snapshot: no identity inventory is in scope
-     * here, so decryptability is assessed against an empty one (fail closed;
-     * always false for rage items). recipient_count and internal are real.
-     * The authoritative flags come from wasm_fetch_vault_with_identities.
-     */
-    let (decryptable, recipient_count) = match &rage_blob {
+    let (decryptable, recipient_count, legacy_wrap) = match &rage_blob {
         Some(armored) => {
             let a = assess_rage_header(armored, &LocalIdentityInventory::default());
-            (a.decryptable, a.recipient_count)
+            (a.decryptable, a.recipient_count, a.legacy_prf_wraps > 0)
         }
-        None => (true, 0),
+        None => (true, 0, false),
     };
     let kind = match cipher.cipher_type {
         1 => "login",
         2 => "note",
         3 => "card",
         4 => "identity",
+        5 => "ssh_key",
         _ => "other",
     };
     let internal = is_internal_cipher_name(&name);
@@ -649,6 +946,7 @@ fn cipher_to_jsvalue(session: &Session, cipher: &Cipher) -> Result<JsValue, JsVa
         rage,
         decryptable,
         recipient_count,
+        legacy_wrap,
         internal,
         favorite: cipher.favorite,
         folder_id: cipher.folder_id.clone(),
@@ -664,56 +962,18 @@ async fn decrypt_rage_blob(
     armored_secrets: &[String],
 ) -> Result<Vec<u8>, JsValue> {
     let blob = AgeBlob::from_bytes(blob);
-
     let prf_pairs = collect_webauthn_prf_pairs(blob.as_bytes())?;
 
-    let mut identities: Vec<Box<dyn Identity>> = Vec::new();
-    if !prf_pairs.is_empty() {
-        match prf_callback {
-            Some(callback) => {
-                let chosen = invoke_prf_callback_multi(callback, &prf_pairs).await?;
-                identities.push(Box::new(SpecificPasskeyPrfIdentity {
-                    credential_id: chosen.credential_id,
-                    prf_output: chosen.prf_output,
-                }));
-            }
-            None if armored_secrets.is_empty() => {
-                return Err(js_err_with_code(
-                    "tap_unavailable",
-                    "this item is protected by a hardware passkey (webauthn-prf-v1) but the \
-                     caller supplied no PRF callback, so no tap can be performed in this \
-                     context. Refusing to decrypt.",
-                ));
-            }
-            None => {}
-        }
-    }
-
+    let mut software: Vec<Box<dyn Identity>> = Vec::new();
     for armored in armored_secrets {
         let trusted = ragewarden_core::ArmoredAgeSecret::from_trusted(armored.clone());
         match ragewarden_core::software_passphrase_identity(&trusted) {
-            Ok(id) => identities.push(Box::new(id)),
+            Ok(id) => software.push(Box::new(id)),
             Err(e) => return Err(js_err(format!("software identity: {e}"))),
         }
     }
 
-    if identities.is_empty() {
-        return Err(js_err_with_code(
-            "no_identity_available",
-            "no identity available for this item: no hardware tap was performed and no \
-             software or recovery secret was supplied. Ragewarden does not release a secret \
-             without a deliberate physical action.",
-        ));
-    }
-
-    /*
-     * NoMatchingIdentity is the "wrapped to N recipients, none on this
-     * device" case. The snapshot's `decryptable: false` should keep the UI
-     * from ever reaching this point; when it is reached anyway (stale
-     * snapshot, X25519 stanza wrapped to some other software key), the code
-     * lets JS render its own explanation instead of the raw core message.
-     */
-    let plaintext = core_decrypt(&blob, &identities).map_err(|e| match e {
+    let no_match = |e: ragewarden_core::DecryptError| match e {
         ragewarden_core::DecryptError::NoMatchingIdentity => js_err_with_code(
             e.code(),
             "none of this device's identities can open this item; it is wrapped only to \
@@ -721,8 +981,39 @@ async fn decrypt_rage_blob(
              re-wrap it from there.",
         ),
         other => js_err_with_code(other.code(), format!("rage decrypt: {other}")),
-    })?;
-    Ok(plaintext.to_vec())
+    };
+
+    match decrypt_software_first(
+        &blob,
+        &software,
+        !prf_pairs.is_empty(),
+        prf_callback.is_some(),
+    ) {
+        SoftwareFirst::Opened(pt) => Ok(pt.to_vec()),
+        SoftwareFirst::Failed(e) => Err(no_match(e)),
+        SoftwareFirst::TapUnavailable => Err(js_err_with_code(
+            "tap_unavailable",
+            "this item is protected by a hardware passkey (webauthn-prf-v1) but the \
+             caller supplied no PRF callback, so no tap can be performed in this \
+             context. Refusing to decrypt.",
+        )),
+        SoftwareFirst::NoIdentity => Err(js_err_with_code(
+            "no_identity_available",
+            "no identity available for this item: no hardware tap was performed and no \
+             software or recovery secret was supplied. Ragewarden does not release a secret \
+             without a deliberate physical action.",
+        )),
+        SoftwareFirst::AskPrf => {
+            let callback = prf_callback.ok_or_else(|| js_err("internal: PRF callback vanished"))?;
+            let chosen = invoke_prf_callback_multi(callback, &prf_pairs).await?;
+            let identities: Vec<Box<dyn Identity>> = vec![Box::new(SpecificPasskeyPrfIdentity {
+                credential_id: chosen.credential_id,
+                prf_output: chosen.prf_output,
+            })];
+            let pt = core_decrypt(&blob, &identities).map_err(no_match)?;
+            Ok(pt.to_vec())
+        }
+    }
 }
 
 struct ChosenPrf {
@@ -732,7 +1023,7 @@ struct ChosenPrf {
 
 async fn invoke_prf_callback_multi(
     callback: &js_sys::Function,
-    pairs: &[(Vec<u8>, [u8; 32])],
+    pairs: &[PrfPair],
 ) -> Result<ChosenPrf, JsValue> {
     let arr = js_sys::Array::new();
     for (cred, salt) in pairs {
@@ -789,50 +1080,8 @@ async fn invoke_prf_callback_multi(
     })
 }
 
-struct SpecificPasskeyPrfIdentity {
-    credential_id: Vec<u8>,
-    prf_output: [u8; 32],
-}
-
-impl Identity for SpecificPasskeyPrfIdentity {
-    fn try_unwrap_stanza(&self, stanza: &Stanza) -> Result<Option<FileKey>, IdentityError> {
-        if stanza.tag != TAG_WEBAUTHN_PRF_V1 {
-            return Ok(None);
-        }
-        let stanza_cred = match webauthn_prf_credential_id(stanza) {
-            Ok(c) => c,
-            Err(_) => return Ok(None),
-        };
-        if stanza_cred != self.credential_id {
-            return Ok(None);
-        }
-        match decrypt_webauthn_prf_with_prf(stanza, &self.prf_output) {
-            Ok(key) => Ok(Some(key)),
-            Err(e) => Err(IdentityError::Crypto(format!("webauthn-prf-v1: {e}"))),
-        }
-    }
-
-    fn display(&self) -> &str {
-        "passkey-prf"
-    }
-}
-
-/*
- * The stanza set this side cannot open on its own.
- *
- * Deliberately an allow-list of the two device-backed tags rageterm will serve
- * without RAGEWARDEN_NATIVE_HOST_ALLOW_SOFTWARE=1 (it mirrors `tag_is_hardware_gated`
- * minus `webauthn-prf-v1`, which the browser opens itself with a real assertion).
- * A deny-list would quietly ship every future tag -- including software ones --
- * off to a host process; a new hardware tag not being offered here is a missing
- * feature, which is the direction this should fail in.
- */
 fn native_unwrappable_stanzas(blob: &[u8]) -> Result<Vec<Stanza>, JsValue> {
-    let recorded = collect_stanzas(blob)?;
-    Ok(recorded
-        .into_iter()
-        .filter(|s| s.tag == TAG_PIV_P256 || s.tag == TAG_FIDO2_HMAC)
-        .collect())
+    Ok(decide::native_unwrappable(collect_stanzas(blob)?))
 }
 
 struct NativeAnswer {
@@ -884,11 +1133,6 @@ async fn invoke_native_callback(
     let key_b64 = key_val.as_string().ok_or_else(|| {
         js_err("native callback must return { fileKeyB64, receipt }: fileKeyB64 is not a string")
     })?;
-    /*
-     * Rust cannot read the receipt, but it can insist one exists: a callback
-     * that returns key material with nothing attached leaves the JS gate with
-     * nothing to refuse, and "no receipt" would silently become "no ceremony".
-     */
     if receipt.is_undefined() || receipt.is_null() {
         return Err(js_err(
             "native callback returned a file key with no receipt. The receipt is not read \
@@ -916,46 +1160,26 @@ async fn invoke_native_callback(
     })
 }
 
-/*
- * Refuse an answer that names a stanza we never handed out.
- *
- * Same posture as invoke_prf_callback_multi's credentialId membership check.
- * Naming the stanza is optional -- the load-bearing check is that the key opens
- * the blob -- but if the callback does name one, it must be one of ours.
- */
 fn check_stanza_reference(resolved: &JsValue, offered: &[Stanza]) -> Result<(), JsValue> {
     let idx_val = js_sys::Reflect::get(resolved, &JsValue::from_str("stanzaIndex"))
         .map_err(|e| js_err(format!("reflect stanzaIndex: {e:?}")))?;
-    let mut index: Option<usize> = None;
-    if !idx_val.is_undefined() && !idx_val.is_null() {
-        let n = idx_val
-            .as_f64()
-            .ok_or_else(|| js_err("native callback returned a non-numeric stanzaIndex"))?;
-        if n.fract() != 0.0 || n < 0.0 || n >= offered.len() as f64 {
-            return Err(js_err(
-                "native callback returned a stanzaIndex outside the set of stanzas it was \
-                 handed",
-            ));
-        }
-        index = Some(n as usize);
-    }
-
+    let index = if idx_val.is_undefined() || idx_val.is_null() {
+        None
+    } else {
+        Some(
+            idx_val
+                .as_f64()
+                .ok_or_else(|| js_err("native callback returned a non-numeric stanzaIndex"))?,
+        )
+    };
     let stanza_val = js_sys::Reflect::get(resolved, &JsValue::from_str("stanza"))
         .map_err(|e| js_err(format!("reflect stanza: {e:?}")))?;
-    if stanza_val.is_undefined() || stanza_val.is_null() {
-        return Ok(());
-    }
-    let echoed = parse_wire_stanza(&stanza_val)?;
-    match index {
-        Some(i) if offered[i] != echoed => Err(js_err(
-            "native callback returned a stanza that disagrees with the stanzaIndex it also \
-             returned",
-        )),
-        _ if !offered.iter().any(|s| *s == echoed) => Err(js_err(
-            "native callback returned a stanza that was not in the set it was handed",
-        )),
-        _ => Ok(()),
-    }
+    let echoed = if stanza_val.is_undefined() || stanza_val.is_null() {
+        None
+    } else {
+        Some(parse_wire_stanza(&stanza_val)?)
+    };
+    decide::check_stanza_reference(index, echoed.as_ref(), offered).map_err(js_err)
 }
 
 fn parse_wire_stanza(value: &JsValue) -> Result<Stanza, JsValue> {
@@ -993,15 +1217,6 @@ fn set_str(obj: &js_sys::Object, key: &str, value: &str) -> Result<(), JsValue> 
         .map_err(|e| js_err(format!("reflect {key}: {e:?}")))
 }
 
-/*
- * An identity that answers with a file key someone else produced.
- *
- * It offers the key only for stanzas that were handed to the callback, so a
- * key obtained for one item cannot be spent against a stanza this call never
- * exposed. The key itself is still checked by age: `v1_payload_key` verifies
- * the header MAC before deriving a payload key, so a wrong key ends the
- * decrypt with an error rather than a bogus plaintext.
- */
 struct SuppliedFileKeyIdentity {
     offered: Vec<Stanza>,
     file_key: FileKey,
@@ -1025,189 +1240,25 @@ fn collect_stanzas(blob: &[u8]) -> Result<Vec<Stanza>, JsValue> {
         .map_err(|e| js_err_with_code(e.code(), format!("parse header: {e}")))
 }
 
-fn collect_webauthn_prf_pairs(blob: &[u8]) -> Result<Vec<(Vec<u8>, [u8; 32])>, JsValue> {
-    let recorded = collect_stanzas(blob)?;
-    let mut out = Vec::new();
-    for s in &recorded {
-        if s.tag != TAG_WEBAUTHN_PRF_V1 {
-            continue;
-        }
-        let cred = ragewarden_core::stanza_format::webauthn_prf_credential_id(s)
-            .map_err(|e| js_err(format!("webauthn-prf credential_id: {e}")))?;
-        let salt = ragewarden_core::stanza_format::webauthn_prf_salt(s)
-            .map_err(|e| js_err(format!("webauthn-prf salt: {e}")))?;
-        out.push((cred, salt));
-    }
-    Ok(out)
+fn collect_webauthn_prf_pairs(blob: &[u8]) -> Result<Vec<PrfPair>, JsValue> {
+    decide::webauthn_prf_pairs(&collect_stanzas(blob)?).map_err(js_err)
+}
+
+fn json_of(value: &JsValue, what: &str) -> Result<String, JsValue> {
+    Ok(js_sys::JSON::stringify(value)
+        .map_err(|e| js_err(format!("stringify {what}: {e:?}")))?
+        .into())
 }
 
 fn parse_field_map(value: &JsValue) -> Result<Vec<(String, String)>, JsValue> {
-    let s: String = js_sys::JSON::stringify(value)
-        .map_err(|e| js_err(format!("stringify fields: {e:?}")))?
-        .into();
-    let map: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(&s).map_err(|e| js_err(format!("parse fields: {e}")))?;
-    let mut out = Vec::with_capacity(map.len());
-    for (k, v) in map {
-        let v = v
-            .as_str()
-            .ok_or_else(|| js_err(format!("field `{k}` not a string")))?
-            .to_string();
-        out.push((k, v));
-    }
-    Ok(out)
+    decide::parse_field_map(&json_of(value, "fields")?).map_err(js_err)
 }
 
 fn parse_recipients(value: &JsValue) -> Result<Vec<Recipient>, JsValue> {
     if value.is_null() || value.is_undefined() {
         return Err(js_err("recipients required"));
     }
-    let s: String = js_sys::JSON::stringify(value)
-        .map_err(|e| js_err(format!("stringify recipients: {e:?}")))?
-        .into();
-
-    // Canonical form: exactly what `ragewarden_core::policy` emits and what
-    // `wasm_select_encrypt_recipients` hands back, tagged with `type`. This is
-    // the only form the vault glue produces; the `kind`-tagged form below is
-    // the pre-policy shape kept for callers that still build recipients by
-    // hand (enrollment flows, tests).
-    if let Ok(canonical) = serde_json::from_str::<Vec<Recipient>>(&s) {
-        if canonical.is_empty() {
-            return Err(js_err("recipients list empty"));
-        }
-        return Ok(canonical);
-    }
-
-    #[derive(Deserialize)]
-    struct Wire {
-        kind: String,
-        #[serde(default)]
-        armored_pubkey: Option<String>,
-        #[serde(default)]
-        public_key_b64: Option<String>,
-        #[serde(default)]
-        credential_id_b64: Option<String>,
-        #[serde(default)]
-        salt_b64: Option<String>,
-        #[serde(default)]
-        rp_id: Option<String>,
-        #[serde(default)]
-        label: Option<String>,
-    }
-    let wire: Vec<Wire> =
-        serde_json::from_str(&s).map_err(|e| js_err(format!("parse recipients: {e}")))?;
-    let mut out = Vec::with_capacity(wire.len());
-    for r in wire {
-        match r.kind.as_str() {
-            "software" => {
-                let armored = r
-                    .armored_pubkey
-                    .ok_or_else(|| js_err("software recipient needs armored_pubkey"))?;
-                out.push(Recipient::SoftwarePassphrase {
-                    armored_pubkey: ragewarden_core::ArmoredAgeRecipient::from_trusted(armored),
-                });
-            }
-            "x25519" => {
-                let pk_b64 = r
-                    .public_key_b64
-                    .ok_or_else(|| js_err("x25519 recipient needs public_key_b64"))?;
-                let pk = B64
-                    .decode(pk_b64.as_bytes())
-                    .map_err(|e| js_err(format!("public_key_b64: {e}")))?;
-                let pk: [u8; 32] = pk.try_into().map_err(|v: Vec<u8>| {
-                    js_err(format!("x25519 pubkey wrong length: {}", v.len()))
-                })?;
-                out.push(Recipient::X25519 { public_key: pk });
-            }
-            "passkey_prf" => {
-                let cred_b64 = r
-                    .credential_id_b64
-                    .ok_or_else(|| js_err("passkey_prf recipient needs credential_id_b64"))?;
-                let salt_b64 = r
-                    .salt_b64
-                    .ok_or_else(|| js_err("passkey_prf recipient needs salt_b64"))?;
-                let rp_id = r
-                    .rp_id
-                    .ok_or_else(|| js_err("passkey_prf recipient needs rp_id"))?;
-                let label = r.label.unwrap_or_else(|| "passkey".to_string());
-                let credential_id = B64
-                    .decode(cred_b64.as_bytes())
-                    .map_err(|e| js_err(format!("credential_id_b64: {e}")))?;
-                let salt_vec = B64
-                    .decode(salt_b64.as_bytes())
-                    .map_err(|e| js_err(format!("salt_b64: {e}")))?;
-                if salt_vec.len() != 32 {
-                    return Err(js_err(format!(
-                        "salt_b64 must be 32 bytes, got {}",
-                        salt_vec.len()
-                    )));
-                }
-                let mut salt = [0u8; 32];
-                salt.copy_from_slice(&salt_vec);
-                out.push(Recipient::PasskeyPrf {
-                    credential_id,
-                    salt,
-                    rp_id,
-                    label,
-                });
-            }
-            other => return Err(js_err(format!("unsupported recipient kind: {other}"))),
-        }
-    }
-    if out.is_empty() {
-        return Err(js_err("recipients list empty"));
-    }
-    Ok(out)
-}
-
-fn augment_with_login(
-    cipher: &mut CipherIn,
-    fields: &[(String, String)],
-    session: &Session,
-) -> Result<(), JsValue> {
-    let username = fields
-        .iter()
-        .find(|(k, _)| k == "username")
-        .map(|(_, v)| v.clone());
-    let site = fields
-        .iter()
-        .find(|(k, _)| k == "site")
-        .map(|(_, v)| v.clone());
-    let force_login = fields
-        .iter()
-        .any(|(k, v)| k == "cipher_type" && v.eq_ignore_ascii_case("login"));
-
-    if username.is_none() && site.is_none() && !force_login {
-        return Ok(());
-    }
-
-    cipher.cipher_type = 1;
-    cipher.secure_note = None;
-    let enc_username = match username {
-        Some(u) => Some(
-            sync::encrypt_string(session, &u)
-                .map_err(|e| js_err(format!("encrypt username: {e}")))?,
-        ),
-        None => None,
-    };
-    let uris = match site {
-        Some(s) => {
-            let enc = sync::encrypt_string(session, &s)
-                .map_err(|e| js_err(format!("encrypt uri: {e}")))?;
-            Some(vec![sync::CipherUri {
-                uri: enc,
-                match_type: None,
-            }])
-        }
-        None => None,
-    };
-    cipher.login = Some(CipherLogin {
-        username: enc_username,
-        password: None,
-        totp: None,
-        uris,
-    });
-    Ok(())
+    decide::parse_recipients(&json_of(value, "recipients")?).map_err(js_err)
 }
 
 #[wasm_bindgen(js_name = wasm_publish_recipient_to_registry)]
@@ -1312,10 +1363,8 @@ pub async fn wasm_fetch_registry(session_value: JsValue) -> Result<JsValue, JsVa
         .map_err(|e| js_err(format!("read registry: {e}")))?;
     match doc {
         Some(d) => {
-            let s =
-                serde_json::to_string(&d).map_err(|e| js_err(format!("serialize doc: {e}")))?;
-            js_sys::JSON::parse(&s)
-                .map_err(|e| js_err(format!("re-parse to JsValue: {e:?}")))
+            let s = serde_json::to_string(&d).map_err(|e| js_err(format!("serialize doc: {e}")))?;
+            js_sys::JSON::parse(&s).map_err(|e| js_err(format!("re-parse to JsValue: {e:?}")))
         }
         None => Ok(JsValue::NULL),
     }
@@ -1349,18 +1398,13 @@ pub async fn wasm_select_encrypt_recipients(
     let vault = fetch_vault(&client, &server, &session)
         .await
         .map_err(|e| js_err(format!("fetch_vault: {e}")))?;
-    let entries = core_registry::extract_document(&session, &vault)
-        .map_err(|e| js_err(format!("read registry: {e}")))?
-        .map(|d| d.entries)
-        .unwrap_or_default();
-
-    let local_auth = if local_prf_entry_ids.is_null() || local_prf_entry_ids.is_undefined() {
-        core_policy::LocalAuthenticators::none()
+    let local = if local_prf_entry_ids.is_null() || local_prf_entry_ids.is_undefined() {
+        None
     } else {
-        core_policy::LocalAuthenticators::from_ids(parse_string_array(&local_prf_entry_ids)?)
+        Some(parse_string_array(&local_prf_entry_ids)?)
     };
-
-    let selection = core_policy::select_for_encrypt(&entries, &[], &local_auth);
+    let selection = crate::recipient_select::select_encrypt_recipients(&session, &vault, local)
+        .map_err(|e| js_err(format!("read registry: {e}")))?;
     let s = serde_json::to_string(&selection)
         .map_err(|e| js_err(format!("serialize selection: {e}")))?;
     js_sys::JSON::parse(&s).map_err(|e| js_err(format!("re-parse selection: {e:?}")))
@@ -1372,40 +1416,9 @@ fn _registry_re_exports() {
     let _: RegistryDocument = RegistryDocument::default();
 }
 
-const HISTORY_MARKER_PREFIX: &str = "__ragewarden_history_v1__";
-const HISTORY_CAP: usize = 32;
-
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-struct HistoryEntry {
-    #[serde(rename = "recordedAt")]
-    recorded_at: i64,
-    #[serde(rename = "cipherId")]
-    cipher_id: String,
-    #[serde(rename = "priorPayload")]
-    prior_payload: String,
-    #[serde(rename = "recipientsSummary")]
-    recipients_summary: Vec<String>,
-}
-
-fn history_marker_name(cipher_id: &str) -> String {
-    format!("{HISTORY_MARKER_PREFIX}:{cipher_id}")
-}
-
-fn find_history_cipher(
-    session: &Session,
-    vault: &ragewarden_core::sync::Vault,
-    marker: &str,
-) -> Option<Cipher> {
-    for c in &vault.ciphers {
-        if let Ok(name) = cipher_name(session, c) {
-            if name == marker {
-                return Some(c.clone());
-            }
-        }
-    }
-    None
-}
-
+/// Records the revision an update is about to replace in the account's one
+/// history document (core::history), folding in this browser's older per-item
+/// documents on the way.
 #[wasm_bindgen(js_name = wasm_record_history_revision)]
 pub async fn wasm_record_history_revision(
     session_value: JsValue,
@@ -1415,53 +1428,24 @@ pub async fn wasm_record_history_revision(
 ) -> Result<JsValue, JsValue> {
     let (server, session) = jsvalue_to_session(&session_value)?;
     let summary = parse_string_array(&recipients_summary)?;
-
     let client = JsHttpClient::new();
     let vault = fetch_vault(&client, &server, &session)
         .await
         .map_err(|e| js_err(format!("fetch_vault: {e}")))?;
-
-    let marker = history_marker_name(&cipher_id);
-    let mut entries: Vec<HistoryEntry> = match find_history_cipher(&session, &vault, &marker) {
-        Some(ref c) => {
-            match decrypt_history_payload(&session, c) {
-                Ok(list) => list,
-                Err(_) => Vec::new(),
-            }
-        }
-        None => Vec::new(),
-    };
-
-    let now_ms = (js_sys::Date::now() as i64).max(0);
-    let entry = HistoryEntry {
-        recorded_at: now_ms,
-        cipher_id: cipher_id.clone(),
-        prior_payload: prior_payload_armored,
-        recipients_summary: summary,
-    };
-    entries.insert(0, entry);
-    if entries.len() > HISTORY_CAP {
-        entries.truncate(HISTORY_CAP);
-    }
-
-    let payload = serde_json::to_string(&entries)
-        .map_err(|e| js_err(format!("serialize history: {e}")))?;
-    let cipher_in = build_meta_cipher(&session, &marker, &payload)
-        .map_err(|e| js_err(format!("build_meta_cipher: {e}")))?;
-
-    let saved = match find_history_cipher(&session, &vault, &marker)
-        .and_then(|c| c.id.clone())
-    {
-        Some(id) => core_update_cipher(&client, &server, &session, &id, &cipher_in)
+    let entry = ragewarden_core::history::HistoryEntry::revision(
+        cipher_id,
+        prior_payload_armored,
+        summary,
+        (js_sys::Date::now() as i64).max(0),
+    );
+    let saved =
+        ragewarden_core::history::record_revision(&client, &server, &session, &vault, None, entry)
             .await
-            .map_err(|e| js_err(format!("update history: {e}")))?,
-        None => core_create_cipher(&client, &server, &session, &cipher_in)
-            .await
-            .map_err(|e| js_err(format!("create history: {e}")))?,
-    };
+            .map_err(|e| js_err(format!("record history: {e}")))?;
     Ok(JsValue::from_str(saved.id.as_deref().unwrap_or("")))
 }
 
+/// One item's revisions, newest first, as a JSON array.
 #[wasm_bindgen(js_name = wasm_load_history)]
 pub async fn wasm_load_history(
     session_value: JsValue,
@@ -1472,27 +1456,11 @@ pub async fn wasm_load_history(
     let vault = fetch_vault(&client, &server, &session)
         .await
         .map_err(|e| js_err(format!("fetch_vault: {e}")))?;
-    let marker = history_marker_name(&cipher_id);
-    let Some(c) = find_history_cipher(&session, &vault, &marker) else {
-        return Ok(JsValue::from_str("[]"));
-    };
-    let entries = decrypt_history_payload(&session, &c).unwrap_or_default();
-    let s = serde_json::to_string(&entries)
-        .map_err(|e| js_err(format!("serialize history: {e}")))?;
+    let entries = ragewarden_core::history::load_history(&session, &vault, &cipher_id)
+        .map_err(|e| js_err(format!("load history: {e}")))?;
+    let s =
+        serde_json::to_string(&entries).map_err(|e| js_err(format!("serialize history: {e}")))?;
     Ok(JsValue::from_str(&s))
-}
-
-fn decrypt_history_payload(
-    session: &Session,
-    cipher: &Cipher,
-) -> Result<Vec<HistoryEntry>, String> {
-    let notes = cipher
-        .notes
-        .as_ref()
-        .ok_or_else(|| "history cipher has no notes".to_string())?;
-    let plaintext =
-        decrypt_string(session, notes).map_err(|e| format!("decrypt history notes: {e}"))?;
-    serde_json::from_str(&plaintext).map_err(|e| format!("parse history payload: {e}"))
 }
 
 fn parse_string_array(value: &JsValue) -> Result<Vec<String>, JsValue> {

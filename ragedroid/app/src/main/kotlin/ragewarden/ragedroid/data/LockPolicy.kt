@@ -15,7 +15,15 @@ class LockPolicy @Inject constructor(@ApplicationContext context: Context) {
             prefs.edit().putBoolean(KEY_LOCK_ON_LAUNCH, value).apply()
         }
 
+    var idleTimeoutMs: Long
+        get() = prefs.getLong(KEY_IDLE_TIMEOUT, DEFAULT_IDLE_TIMEOUT_MS)
+        set(value) {
+            prefs.edit().putLong(KEY_IDLE_TIMEOUT, value).apply()
+        }
+
     private companion object {
         const val KEY_LOCK_ON_LAUNCH = "lock_on_launch"
+        const val KEY_IDLE_TIMEOUT = "idle_timeout_ms"
+        const val DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1000L
     }
 }

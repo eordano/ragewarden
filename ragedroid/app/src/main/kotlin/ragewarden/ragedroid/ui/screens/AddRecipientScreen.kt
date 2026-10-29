@@ -39,6 +39,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
@@ -46,6 +47,7 @@ import androidx.fragment.app.FragmentActivity
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.collections.immutable.ImmutableList
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.data.RecipientStore
 import ragewarden.ragedroid.model.Recipient
 import ragewarden.ragedroid.model.RecipientKind
@@ -59,6 +61,7 @@ import ragewarden.ragedroid.ui.components.rememberSecurePinFieldState
 import ragewarden.ragedroid.ui.findActivity
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
+import ragewarden.ragedroid.ui.uiString
 
 @Composable
 fun AddRecipientScreen(
@@ -92,6 +95,22 @@ fun AddRecipientScreen(
     val hasRecovery = RecipientKind.Recovery in enrolledKinds
     val hasStrongBox = RecipientKind.StrongBox in enrolledKinds
 
+    if (state.unboundKeyConsentOpen) {
+        UnboundKeyConsent(
+            onSetScreenLock = {
+                viewModel.onAction(AddRecipientAction.DeclineUnboundKey)
+                runCatching {
+                    context.startActivity(
+                        android.content.Intent(android.app.admin.DevicePolicyManager.ACTION_SET_NEW_PASSWORD)
+                            .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                    )
+                }
+            },
+            onEnrolAnyway = { viewModel.onAction(AddRecipientAction.ConfirmUnboundKey) },
+            onCancel = { viewModel.onAction(AddRecipientAction.DeclineUnboundKey) },
+        )
+    }
+
     if (state.pinPromptOpen && activity != null) {
         YubiKeyPinPrompt(
             onCancel = { viewModel.onAction(AddRecipientAction.CancelEnrollment) },
@@ -103,11 +122,11 @@ fun AddRecipientScreen(
 
     Column(modifier = Modifier.fillMaxSize().background(c.background)) {
         AppBar(
-            title = "Add recipient",
+            title = stringResource(R.string.add_recipient),
             leading = {
                 IconBtn(
                     icon = Icons.AutoMirrored.Outlined.ArrowBack,
-                    contentDescription = "Back",
+                    contentDescription = stringResource(R.string.back),
                     onClick = { viewModel.onAction(AddRecipientAction.Back) },
                 )
             },
@@ -138,7 +157,7 @@ fun AddRecipientScreen(
                     kind = pickedKind,
                     phase = state.phase,
                     onDone = {
-                        onToast("Recipient added")
+                        onToast(uiString(R.string.recipient_added))
                         viewModel.resetToPicker()
                         onBack()
                     },
@@ -161,7 +180,7 @@ private fun PickPhase(
 ) {
     val c = rageColors
     Text(
-        text = "A recipient is anything that can decrypt one of the age stanzas in your vault. Pick a kind.",
+        text = stringResource(R.string.a_recipient_is_anything_that_can),
         style = RageType.body.copy(fontSize = 16.sp, lineHeight = 24.sp),
         color = c.fgSecondary,
         modifier = Modifier.padding(start = 2.dp, end = 2.dp, top = 6.dp, bottom = 16.dp),
@@ -177,31 +196,31 @@ private fun PickPhase(
         when (kind) {
             EnrollKind.StrongBox -> {
                 if (hasStrongBox) {
-                    enrolled.add(kind to "Enrolled on this device")
+                    enrolled.add(kind to stringResource(R.string.enrolled_on_this_device))
                 } else {
-                    recommended.add(kind to "Convenience tier for everyday unlocks.")
+                    recommended.add(kind to stringResource(R.string.convenience_tier_for_everyday_unlocks))
                 }
             }
             EnrollKind.Recovery -> {
                 if (hasRecovery) {
                     enrolled.add(
-                        kind to "Recovery identity active -- re-print available in Settings",
+                        kind to stringResource(R.string.recovery_identity_active_re_print_available),
                     )
                 } else {
-                    recommended.add(kind to "Survives losing every device.")
+                    recommended.add(kind to stringResource(R.string.survives_losing_every_device))
                 }
             }
             EnrollKind.YubiKey -> {
                 val reason = when (yubiCount) {
-                    0 -> "Hardware-rooted protection."
-                    1 -> "A backup key prevents single-point-of-failure lockout."
+                    0 -> stringResource(R.string.hardware_rooted_protection)
+                    1 -> stringResource(R.string.a_backup_key_prevents_single_point)
                     else -> null
                 }
                 if (reason != null) recommended.add(kind to reason) else available.add(kind)
             }
             EnrollKind.Fido2 -> {
                 if (yubiCount == 0) {
-                    recommended.add(kind to "Use any passkey-capable authenticator.")
+                    recommended.add(kind to stringResource(R.string.use_any_passkey_capable_authenticator))
                 } else {
                     available.add(kind)
                 }
@@ -210,21 +229,21 @@ private fun PickPhase(
     }
 
     if (recommended.isNotEmpty()) {
-        SectionHeader("Recommended next")
+        SectionHeader(stringResource(R.string.recommended_next))
         recommended.forEach { (kind, reason) ->
             EnrollKindCard(kind = kind, recommended = true, reason = reason, onClick = { onSelect(kind) })
         }
     }
 
     if (available.isNotEmpty()) {
-        SectionHeader("Other options")
+        SectionHeader(stringResource(R.string.other_options))
         available.forEach { kind ->
             EnrollKindCard(kind = kind, recommended = false, reason = null, onClick = { onSelect(kind) })
         }
     }
 
     if (enrolled.isNotEmpty()) {
-        SectionHeader("Already enrolled")
+        SectionHeader(stringResource(R.string.already_enrolled))
         enrolled.forEach { (kind, note) ->
             EnrolledKindCard(kind = kind, note = note)
         }
@@ -283,7 +302,7 @@ private fun EnrollKindCard(
         Column(modifier = Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
-                    text = kind.title,
+                    text = stringResource(kind.title),
                     style = RageType.rowTitle.copy(fontSize = 15.sp),
                     color = c.fgEmphasis,
                 )
@@ -294,7 +313,7 @@ private fun EnrollKindCard(
                             .padding(horizontal = 6.dp, vertical = 2.dp),
                     ) {
                         Text(
-                            text = "RECOMMENDED",
+                            text = stringResource(R.string.recommended),
                             style = RageType.eyebrow.copy(fontSize = 10.sp),
                             color = c.accent,
                         )
@@ -302,7 +321,7 @@ private fun EnrollKindCard(
                 }
             }
             Text(
-                text = kind.desc,
+                text = stringResource(kind.desc),
                 style = RageType.body.copy(fontSize = 13.5.sp, lineHeight = 19.sp),
                 color = c.fgSecondary,
                 modifier = Modifier.padding(top = 2.dp),
@@ -359,7 +378,7 @@ private fun EnrolledKindCard(kind: EnrollKind, note: String) {
         }
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = kind.title,
+                text = stringResource(kind.title),
                 style = RageType.rowTitle.copy(fontSize = 14.sp),
                 color = c.fgEmphasis,
             )
@@ -419,14 +438,15 @@ private fun EnrollPhaseView(
                 }
                 Spacer(modifier = Modifier.height(10.dp))
                 Text(
-                    text = phase.title,
+                    text = stringResource(phase.title, *phase.titleArgs.toTypedArray()),
                     style = RageType.h2.copy(fontSize = 18.sp),
                     color = c.fgEmphasis,
                 )
-                if (phase.detail.isNotBlank()) {
+                val detail = phase.detailRes?.let { stringResource(it) } ?: phase.detail
+                if (detail.isNotBlank()) {
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = phase.detail,
+                        text = detail,
                         style = RageType.caption.copy(fontSize = 13.sp, lineHeight = 19.5.sp),
                         color = c.fgSecondary,
                     )
@@ -435,7 +455,7 @@ private fun EnrollPhaseView(
             Spacer(modifier = Modifier.height(18.dp))
             if (phase.recoverable) {
                 RageButton(
-                    label = "Try again",
+                    label = stringResource(R.string.try_again),
                     onClick = onRetry,
                     variant = ButtonVariant.Primary,
                     fullWidth = true,
@@ -443,7 +463,7 @@ private fun EnrollPhaseView(
                 Spacer(modifier = Modifier.height(8.dp))
             }
             RageButton(
-                label = "Pick a different kind",
+                label = stringResource(R.string.pick_a_different_kind),
                 onClick = onPickDifferent,
                 variant = ButtonVariant.Secondary,
                 fullWidth = true,
@@ -486,11 +506,11 @@ private fun EnrollPhaseView(
                 }
                 Spacer(modifier = Modifier.height(4.dp))
                 val title = when (phase) {
-                    AddRecipientPhase.Listening -> "Listening..."
-                    AddRecipientPhase.Found -> "Touch to confirm"
-                    AddRecipientPhase.Done -> "Recipient enrolled"
-                    AddRecipientPhase.Picker -> "Listening..."
-                    is AddRecipientPhase.Failed -> phase.title
+                    AddRecipientPhase.Listening -> stringResource(R.string.listening)
+                    AddRecipientPhase.Found -> stringResource(R.string.touch_to_confirm)
+                    AddRecipientPhase.Done -> stringResource(R.string.recipient_enrolled)
+                    AddRecipientPhase.Picker -> stringResource(R.string.listening)
+                    is AddRecipientPhase.Failed -> stringResource(phase.title, *phase.titleArgs.toTypedArray())
                 }
                 Text(
                     text = title,
@@ -500,9 +520,9 @@ private fun EnrollPhaseView(
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
                     text = if (phase is AddRecipientPhase.Done) {
-                        "Re-encrypting protected items in batch..."
+                        stringResource(R.string.re_encrypting_protected_items_in_batch)
                     } else {
-                        "Hold steady against the back of the phone."
+                        stringResource(R.string.hold_steady_against_the_back_of)
                     },
                     style = RageType.caption.copy(fontSize = 13.sp, lineHeight = 19.5.sp),
                     color = c.fgSecondary,
@@ -511,7 +531,7 @@ private fun EnrollPhaseView(
             if (phase is AddRecipientPhase.Done) {
                 Spacer(modifier = Modifier.height(18.dp))
                 RageButton(
-                    label = "Done",
+                    label = stringResource(R.string.done),
                     onClick = onDone,
                     variant = ButtonVariant.Primary,
                     fullWidth = true,
@@ -529,7 +549,7 @@ private fun enrollIcon(kind: EnrollKind): ImageVector = when (kind) {
 }
 
 @Composable
-private fun YubiKeyPinPrompt(
+internal fun YubiKeyPinPrompt(
     onCancel: () -> Unit,
     onSubmit: (CharArray) -> Unit,
 ) {
@@ -539,11 +559,11 @@ private fun YubiKeyPinPrompt(
             pinState.zero()
             onCancel()
         },
-        title = { Text("YubiKey PIN") },
+        title = { Text(stringResource(R.string.yubikey_pin)) },
         text = {
             Column {
                 Text(
-                    text = "Enter your YubiKey PIV PIN. The default is 123456 if you haven't set one.",
+                    text = stringResource(R.string.enter_your_yubikey_piv_pin_the),
                     style = RageType.body.copy(fontSize = 13.sp, lineHeight = 18.sp),
                 )
                 Spacer(modifier = Modifier.height(12.dp))
@@ -555,13 +575,37 @@ private fun YubiKeyPinPrompt(
                 val chars = pinState.submit()
                 pinState.zero()
                 onSubmit(chars)
-            }) { Text("Continue") }
+            }) { Text(stringResource(R.string.continue_)) }
         },
         dismissButton = {
             TextButton(onClick = {
                 pinState.zero()
                 onCancel()
-            }) { Text("Cancel") }
+            }) { Text(stringResource(R.string.cancel)) }
+        },
+    )
+}
+
+/**
+ * Asked before a Keystore key is generated on a phone with no screen lock or
+ * biometric: such a key opens items without any confirmation, so the user
+ * chooses it knowingly or sets a lock first.
+ */
+@Composable
+internal fun UnboundKeyConsent(onSetScreenLock: () -> Unit, onEnrolAnyway: () -> Unit, onCancel: () -> Unit) {
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onCancel,
+        title = { androidx.compose.material3.Text(stringResource(R.string.unbound_key_title)) },
+        text = { androidx.compose.material3.Text(stringResource(R.string.unbound_key_body)) },
+        confirmButton = {
+            androidx.compose.material3.TextButton(onClick = onSetScreenLock) {
+                androidx.compose.material3.Text(stringResource(R.string.set_a_screen_lock))
+            }
+        },
+        dismissButton = {
+            androidx.compose.material3.TextButton(onClick = onEnrolAnyway) {
+                androidx.compose.material3.Text(stringResource(R.string.enrol_without_confirmation))
+            }
         },
     )
 }

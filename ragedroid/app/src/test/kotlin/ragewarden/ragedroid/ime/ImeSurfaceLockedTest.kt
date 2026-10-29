@@ -58,7 +58,7 @@ class ImeSurfaceLockedTest {
 
         composeRule.onNodeWithText("VAULT LOCKED").assertIsDisplayed()
         composeRule.onNodeWithText("Bank of Example").assertDoesNotExist()
-        composeRule.onNodeWithText("UNPROTECTED CREDENTIALS ONLY").assertDoesNotExist()
+        composeRule.onNodeWithText("TYPE A CREDENTIAL").assertDoesNotExist()
         assertEquals(emptyList<String>(), delivered)
     }
 
@@ -76,7 +76,7 @@ class ImeSurfaceLockedTest {
             }
         }
 
-        composeRule.onNodeWithText("UNPROTECTED CREDENTIALS ONLY").assertIsDisplayed()
+        composeRule.onNodeWithText("TYPE A CREDENTIAL").assertIsDisplayed()
         composeRule.onNodeWithText("Bank of Example").assertIsDisplayed()
         composeRule.onNodeWithText("VAULT LOCKED").assertDoesNotExist()
     }

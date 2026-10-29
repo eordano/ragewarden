@@ -1,5 +1,7 @@
 package ragewarden.ragedroid.ui.screens
 
+import ragewarden.ragedroid.R
+import androidx.compose.ui.res.stringResource
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -16,7 +18,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Folder
@@ -40,6 +41,7 @@ import kotlinx.collections.immutable.toImmutableList
 import ragewarden.ragedroid.data.Folder
 import ragewarden.ragedroid.data.VaultBackend
 import ragewarden.ragedroid.ui.components.AppBar
+import ragewarden.ragedroid.ui.components.BackButton
 import ragewarden.ragedroid.ui.components.IconBtn
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
@@ -49,15 +51,6 @@ data class FolderEntry(
     val name: String,
     val color: Color,
     val itemCount: Int,
-)
-
-val DefaultFolderEntries: ImmutableList<FolderEntry> = persistentListOf(
-    FolderEntry("work", "Work", Color(0xFFC8552B), 12),
-    FolderEntry("personal", "Personal", Color(0xFF6B8E5A), 8),
-    FolderEntry("infrastructure", "Infrastructure", Color(0xFF3A6B8E), 7),
-    FolderEntry("family", "Family", Color(0xFFB57A2A), 4),
-    FolderEntry("archive", "Archive", Color(0xFF8C7B6B), 23),
-    FolderEntry("shared", "Shared", Color(0xFF7C5A8E), 0),
 )
 
 private val FoldersIntroStyle = RageType.body.copy(
@@ -119,18 +112,12 @@ fun FoldersScreen(
     }
     Column(modifier = Modifier.fillMaxSize().background(c.background)) {
         AppBar(
-            title = "Folders",
-            leading = {
-                IconBtn(
-                    icon = Icons.AutoMirrored.Outlined.ArrowBack,
-                    contentDescription = "Back",
-                    onClick = onBack,
-                )
-            },
+            title = stringResource(R.string.folders),
+            leading = { BackButton(onBack) },
             trailing = {
                 IconBtn(
                     icon = Icons.Outlined.Add,
-                    contentDescription = "New folder",
+                    contentDescription = stringResource(R.string.new_folder),
                     onClick = onNew,
                 )
             },
@@ -142,7 +129,7 @@ fun FoldersScreen(
                 .padding(top = 8.dp, bottom = 24.dp),
         ) {
             Text(
-                text = "Folders are decrypted client-side. Only you can see their names -- the server stores them as opaque ciphertext.",
+                text = stringResource(R.string.folders_are_decrypted_client_side_only),
                 style = FoldersIntroStyle,
                 color = c.fgSecondary,
                 modifier = Modifier.padding(start = 18.dp, end = 18.dp, bottom = 12.dp),
@@ -188,7 +175,7 @@ fun FoldersScreen(
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
-                                text = "${folder.itemCount} ${if (folder.itemCount == 1) "item" else "items"}",
+                                text = androidx.compose.ui.res.pluralStringResource(R.plurals.item_count, folder.itemCount, folder.itemCount),
                                 style = FolderRowMeta,
                                 color = c.fgSecondary,
                             )

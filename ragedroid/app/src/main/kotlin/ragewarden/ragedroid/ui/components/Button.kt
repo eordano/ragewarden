@@ -45,6 +45,7 @@ fun RageButton(
     icon: ImageVector? = null,
     fullWidth: Boolean = false,
     enabled: Boolean = true,
+    rejectObscured: Boolean = false,
 ) {
     val c = rageColors
     val (bg, fg, borderColor) = when (variant) {
@@ -71,7 +72,8 @@ fun RageButton(
             .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
             .background(bg.copy(alpha = bg.alpha * alpha), RoundedCornerShape(8.dp))
             .border(1.dp, borderColor.copy(alpha = borderColor.alpha * alpha), RoundedCornerShape(8.dp))
-            .clickable(enabled = enabled, onClick = onClick)
+            .then(if (rejectObscured) Modifier.rejectObscuredTouches() else Modifier)
+            .clickable(enabled = enabled, role = androidx.compose.ui.semantics.Role.Button, onClick = onClick)
             .padding(padding),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),

@@ -14,22 +14,47 @@ const AUDIT_CAP = 1000;
  * RevealPassword and DeleteCipher, which are the entries that screen exists to
  * show. Reads that do not decrypt anything do not belong here.
  */
+/*
+ * The names are core's shared audit vocabulary (core/tests/vectors/
+ * audit_vocabulary_v1.json), so rageterm, ragedroid and this log speak the same
+ * words; entries written under the older browser names are read back under
+ * the new ones.
+ */
 export const KINDS = Object.freeze({
-    SetCipher: 'SetCipher',
-    EditCipher: 'EditCipher',
-    RotateCipher: 'RotateCipher',
-    DeleteCipher: 'DeleteCipher',
+    Reveal: 'Reveal',
+    Copy: 'Copy',
+    Autofill: 'Autofill',
+    Totp: 'Totp',
+    Set: 'Set',
+    Update: 'Update',
+    Rotate: 'Rotate',
+    Delete: 'Delete',
     CreateFolder: 'CreateFolder',
     RenameFolder: 'RenameFolder',
     DeleteFolder: 'DeleteFolder',
-    EnrollRecovery: 'EnrollRecovery',
-    EnrollPasskey: 'EnrollPasskey',
+    EnrollIdentity: 'EnrollIdentity',
     RemoveRecipient: 'RemoveRecipient',
+    Recover: 'Recover',
+    BulkProtect: 'BulkProtect',
+    Login: 'Login',
     Logout: 'Logout',
-    RevealPassword: 'RevealPassword',
-    CopyPassword: 'CopyPassword',
-    AutofillPassword: 'AutofillPassword',
 });
+
+export const LEGACY_NAMES = Object.freeze({
+    AutofillPassword: 'Autofill',
+    CopyPassword: 'Copy',
+    DeleteCipher: 'Delete',
+    EditCipher: 'Update',
+    Enroll: 'EnrollIdentity',
+    EnrollPasskey: 'EnrollIdentity',
+    EnrollRecovery: 'EnrollIdentity',
+    RecoverFromPhrase: 'Recover',
+    RevealPassword: 'Reveal',
+    RotateCipher: 'Rotate',
+    SetCipher: 'Set',
+});
+
+export const RESULTS = Object.freeze({ ok: 'ok', declined: 'declined', failed: 'failed' });
 
 const VALID_KINDS = new Set(Object.values(KINDS));
 
@@ -80,49 +105,49 @@ async function writeAll(state) {
     });
 }
 
-export async function record(entry) {
-    try {
-        const kind = entry && entry.kind;
-        if (!kind || !VALID_KINDS.has(kind)) {
-            // eslint-disable-next-line no-console
-            console.warn('[ragewarden:audit] dropping entry with unknown kind:', kind);
-            return;
-        }
-        const recorded = {
-            recordedAt: Date.now(),
-            kind,
-            target: typeof entry.target === 'string' ? entry.target : '',
-            detail: typeof entry.detail === 'string' ? entry.detail : '',
-        };
+let writeChain = Promise.resolve();
+
+function str(v) {
+    return typeof v === 'string' ? v : '';
+}
+
+/*
+ * Writes are serialised through one chain: record() is a read-modify-write of a
+ * single storage key, and two unserialised records would each drop the other.
+ * Callers record the OUTCOME (ok / declined / failed, with the error code and
+ * which backend produced the tap), never the intent.
+ */
+export function record(entry) {
+    const kind = entry && entry.kind;
+    if (!kind || !VALID_KINDS.has(kind)) {
+        console.warn('[ragewarden:audit] dropping entry with unknown kind:', kind);
+        return writeChain;
+    }
+    const recorded = {
+        recordedAt: Date.now(),
+        kind,
+        target: str(entry.target),
+        detail: str(entry.detail),
+        result: Object.values(RESULTS).includes(entry.result) ? entry.result : RESULTS.ok,
+        ...(entry.error ? { error: str(entry.error).slice(0, 200) } : {}),
+        ...(entry.code ? { code: str(entry.code) } : {}),
+        ...(Array.isArray(entry.backends) && entry.backends.length
+            ? { backends: entry.backends.map(str) } : {}),
+        ...(entry.mock === true ? { mock: true } : {}),
+        ...(entry.destination ? { destination: str(entry.destination) } : {}),
+    };
+    writeChain = writeChain.then(async () => {
         const state = await readAll();
         state.entries.unshift(recorded);
-        if (state.entries.length > AUDIT_CAP) {
-            state.entries.length = AUDIT_CAP;
-        }
+        if (state.entries.length > AUDIT_CAP) state.entries.length = AUDIT_CAP;
         await writeAll(state);
-    } catch (e) {
-        // eslint-disable-next-line no-console
-        console.warn('[ragewarden:audit] record failed:', e);
-    }
+    }).catch(e => console.warn('[ragewarden:audit] record failed:', e));
+    return writeChain;
 }
 
 export async function tail(limit) {
     const state = await readAll();
     const n = (typeof limit === 'number' && limit > 0) ? Math.min(limit, state.entries.length) : state.entries.length;
-    return state.entries.slice(0, n);
-}
-
-export async function clear() {
-    const area = localArea();
-    if (!area || typeof area.remove !== 'function') {
-        memory.entries = [];
-        return;
-    }
-    return new Promise((resolve) => {
-        try {
-            area.remove([KEY], () => resolve());
-        } catch {
-            resolve();
-        }
-    });
+    return state.entries.slice(0, n)
+        .map(e => (e && LEGACY_NAMES[e.kind] ? { ...e, kind: LEGACY_NAMES[e.kind] } : e));
 }

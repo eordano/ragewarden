@@ -113,13 +113,13 @@ class RecipientDetailCoverageTest {
         elsewhere.forEach { composeRule.onNodeWithText(it.name).assertDoesNotExist() }
         composeRule.onNodeWithText("Family WiFi").assertDoesNotExist()
 
-        // Not "enrolled but never written to a cipher", which is what a screen
+        // Not "no item is protected for this key yet", which is what a screen
         // comparing ids against descriptors said about every key ever enrolled.
-        composeRule.onNodeWithText("Enrolled but never written to a cipher. Re-encrypt to add.")
+        composeRule.onNodeWithText("No item is protected for this key yet. Re-encrypt items to add it.")
             .assertDoesNotExist()
 
         openRevokeSheet()
-        assertSheetSays("The 7 items already wrapped to it")
+        assertSheetSays("The 7 items already protected with it")
     }
 
     /**
@@ -152,7 +152,7 @@ class RecipientDetailCoverageTest {
 
         composeRule.onNodeWithText("This recipient can decrypt every protected item.").assertExists()
         openRevokeSheet()
-        assertSheetSays("The 2 items already wrapped to it")
+        assertSheetSays("The 2 items already protected with it")
     }
 
     /**
@@ -171,16 +171,16 @@ class RecipientDetailCoverageTest {
         render(spare.ui, vault)
 
         composeRule
-            .onNodeWithText("No ciphers list this recipient yet. Add it during the next re-encrypt.")
+            .onNodeWithText("No items use this key yet. It is added the next time items are re-encrypted.")
             .assertExists()
-        composeRule.onNodeWithText("Enrolled but never written to a cipher. Re-encrypt to add.")
+        composeRule.onNodeWithText("No item is protected for this key yet. Re-encrypt items to add it.")
             .assertExists()
         composeRule.onNodeWithText(" of 3 protected items").assertExists()
         composeRule.onAllNodesWithText("SOLE").assertCountEquals(0)
         composeRule.onNodeWithText("Solo Cipher").assertDoesNotExist()
 
         openRevokeSheet()
-        assertSheetSays("The 0 items already wrapped to it")
+        assertSheetSays("The 0 items already protected with it")
     }
 
     /**
@@ -209,19 +209,19 @@ class RecipientDetailCoverageTest {
         composeRule.waitForIdle()
 
         composeRule.onNodeWithText(
-            "Items wrapped to this recipient can't be listed: its stanza carries no " +
-                "identifying argument, so no header names it.",
+            "Items protected with this key can't be listed: an item does not " +
+                "record which key of this kind can open it.",
         ).assertExists()
         composeRule.onNodeWithText(
-            "An age header cannot name this kind of key, so coverage can't be counted " +
+            "Items do not record this kind of key, so coverage can't be counted " +
                 "from here. It may well open every item.",
         ).assertExists()
-        composeRule.onNodeWithText("Enrolled but never written to a cipher. Re-encrypt to add.")
+        composeRule.onNodeWithText("No item is protected for this key yet. Re-encrypt items to add it.")
             .assertDoesNotExist()
 
         openRevokeSheet()
-        assertSheetSays("Items already wrapped to it keep their stanza")
-        composeRule.onNodeWithText("The 0 items already wrapped to it", substring = true)
+        assertSheetSays("Items already protected with it stay readable by it until each one is re-encrypted, so")
+        composeRule.onNodeWithText("The 0 items already protected with it", substring = true)
             .assertDoesNotExist()
     }
 }

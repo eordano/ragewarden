@@ -1,7 +1,6 @@
 package ragewarden.ragedroid.identities
 
 import android.app.Application
-import android.app.Activity
 import androidx.fragment.app.FragmentActivity
 import com.yubico.yubikit.android.YubiKitManager
 import com.yubico.yubikit.android.transport.nfc.NfcConfiguration
@@ -16,7 +15,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.async
-import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -31,8 +30,12 @@ object YubiKitTransport {
     @Volatile private var manager: YubiKitManager? = null
     @Volatile private var usbStarted: Boolean = false
 
-    private val usbDeviceEvents: MutableSharedFlow<YubiKeyDevice> =
-        MutableSharedFlow(replay = 0, extraBufferCapacity = 1)
+    /**
+     * The USB key plugged in right now, kept from its attach until it closes:
+     * a key that was already in the port when a prompt opened is used at once
+     * instead of being missed because no new attach event arrives.
+     */
+    internal val presentUsbKey = PresentKey()
 
     fun startUsbDiscovery(application: Application) {
         ensureManager(application)
@@ -41,7 +44,8 @@ object YubiKitTransport {
             if (usbStarted) return
             val mgr = manager ?: return
             mgr.startUsbDiscovery(UsbConfiguration().handlePermissions(true)) { device ->
-                usbDeviceEvents.tryEmit(device)
+                presentUsbKey.attached(device)
+                device.setOnClosed { presentUsbKey.detached(device) }
             }
             usbStarted = true
         }
@@ -80,14 +84,14 @@ object YubiKitTransport {
                             }
                         }
                     }
-                    val usbDeferred = async { usbDeviceEvents.first() }
+                    val usbDeferred = async { presentUsbKey.next() }
                     val device = select<YubiKeyDevice?> {
                         nfcDeferred.onAwait { it }
                         usbDeferred.onAwait { it }
                     }
                     nfcDeferred.cancel()
                     usbDeferred.cancel()
-                    device ?: usbDeviceEvents.first()
+                    device ?: presentUsbKey.next()
                 }
             }
         } finally {
@@ -134,8 +138,20 @@ object YubiKitTransport {
             }
         }
     }
+}
 
-    @Suppress("unused")
-    private fun activityContext(activity: Activity): Application =
-        activity.applicationContext as Application
+/** The one USB YubiKey currently attached, if any. */
+internal class PresentKey {
+    private val current = kotlinx.coroutines.flow.MutableStateFlow<YubiKeyDevice?>(null)
+
+    fun attached(device: YubiKeyDevice) {
+        current.value = device
+    }
+
+    fun detached(device: YubiKeyDevice) {
+        current.compareAndSet(device, null)
+    }
+
+    /** The attached key now, or the next one plugged in. */
+    suspend fun next(): YubiKeyDevice = current.filterNotNull().first()
 }

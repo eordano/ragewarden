@@ -1,15 +1,7 @@
 package ragewarden.ragedroid.identities
 
-import android.util.Base64
 import android.util.Log
-import androidx.credentials.CredentialManager
-import androidx.credentials.GetCredentialRequest
-import androidx.credentials.GetPublicKeyCredentialOption
-import androidx.credentials.PublicKeyCredential
-import androidx.credentials.exceptions.GetCredentialCancellationException
-import androidx.credentials.exceptions.GetCredentialException
 import androidx.fragment.app.FragmentActivity
-import org.json.JSONObject
 import ragewarden.ragedroid.jni.RageNative
 
 /**
@@ -80,39 +72,12 @@ class Fido2HmacIdentity(
         return invokeRealCredentialManager(salt)
     }
 
-    /**
-     * THE DEVICE CALL. Requires a real authenticator (or a platform one) behind
-     * Credential Manager. Failures are raised, never nulled -- see
-     * HardwareTapErrors.kt for why.
-     */
-    private suspend fun invokeRealCredentialManager(salt: ByteArray): ByteArray {
-        val act = activity ?: throw HardwareTapUnavailableException(
-            "$displayLabel cannot be used from this surface: Credential Manager needs an Activity.",
-        )
-        val requestJson = buildAssertionJson(rpId, salt, credentialId)
-        val option = GetPublicKeyCredentialOption(requestJson)
-        val request = GetCredentialRequest(listOf(option))
-        val response = try {
-            CredentialManager.create(act).getCredential(act, request)
-        } catch (e: GetCredentialCancellationException) {
-            throw HardwareTapCancelledException("Authenticator prompt dismissed.", e)
-        } catch (e: GetCredentialException) {
-            Log.w(TAG, "Fido2HmacIdentity: getCredential failed", e)
-            throw HardwareTapFailedException(
-                "$displayLabel did not produce an assertion: ${e.type}",
-                e,
-            )
-        }
-        val credential = response.credential as? PublicKeyCredential
-            ?: throw HardwareTapFailedException(
-                "Credential Manager returned a ${response.credential.type} credential, not a passkey.",
-            )
-        return parsePrfFirstFromAssertion(credential.authenticationResponseJson)
-            ?: throw HardwareTapFailedException(
-                "$displayLabel completed the assertion but returned no PRF output. " +
-                    "The authenticator or the credential does not support the hmac-secret/PRF extension.",
-            )
-    }
+    /** THE DEVICE CALL; see [PrfAssertion]. */
+    private suspend fun invokeRealCredentialManager(salt: ByteArray): ByteArray = PrfAssertion.first(
+        activity, rpId, salt, credentialId, displayLabel, TAG,
+        dismissed = "Authenticator prompt dismissed.",
+        noPrfHint = "The authenticator or the credential does not support the hmac-secret/PRF extension.",
+    )
 
     companion object {
         private const val TAG = "Fido2HmacIdentity"
@@ -124,49 +89,5 @@ class Fido2HmacIdentity(
             val key = ByteArray(32).also { rng.nextBytes(it) }
             return Fido2HmacIdentity(mockHmacKey = key, credentialId = cid, rpId = rpId)
         }
-
-        internal fun buildAssertionJson(
-            rpId: String,
-            salt: ByteArray,
-            credentialId: ByteArray,
-        ): String {
-            val challenge = ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
-            val allowed = JSONObject()
-                .put("type", "public-key")
-                .put("id", b64Url(credentialId))
-            val prfFirst = JSONObject().put("first", b64Url(salt))
-            val prfEval = JSONObject().put("eval", prfFirst)
-            val extensions = JSONObject().put("prf", prfEval)
-            return JSONObject()
-                .put("challenge", b64Url(challenge))
-                .put("rpId", rpId)
-                .put("userVerification", "required")
-                .put("allowCredentials", org.json.JSONArray().put(allowed))
-                .put("extensions", extensions)
-                .toString()
-        }
-
-        internal fun parsePrfFirstFromAssertion(authenticationResponseJson: String): ByteArray? {
-            return runCatching {
-                val root = JSONObject(authenticationResponseJson)
-                val ext = root.optJSONObject("clientExtensionResults") ?: return@runCatching null
-                val prf = ext.optJSONObject("prf") ?: return@runCatching null
-                val results = prf.optJSONObject("results") ?: return@runCatching null
-                val first = results.optString("first", "")
-                if (first.isEmpty()) null else b64UrlDecode(first)
-            }.onFailure {
-                Log.w(TAG, "Fido2HmacIdentity: failed to parse PRF result", it)
-            }.getOrNull().also {
-                if (it == null) {
-                    Log.w(TAG, "Fido2HmacIdentity: assertion response missing prf.results.first")
-                }
-            }
-        }
-
-        private fun b64Url(bytes: ByteArray): String =
-            Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
-
-        private fun b64UrlDecode(s: String): ByteArray =
-            Base64.decode(s, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
     }
 }

@@ -1,6 +1,6 @@
 use zeroize::Zeroizing;
 
-use crate::fill::{parse_window_spec, AutotypeBackend, FillError, WindowSpec};
+use crate::fill::{AutotypeBackend, FillError, WindowSpec, parse_window_spec};
 
 struct RecordingBackend {
     calls: std::sync::Mutex<Vec<(WindowSpec, Vec<u8>)>>,

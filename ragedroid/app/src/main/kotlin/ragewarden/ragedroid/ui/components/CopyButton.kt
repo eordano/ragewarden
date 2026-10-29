@@ -1,5 +1,6 @@
 package ragewarden.ragedroid.ui.components
 
+import ragewarden.ragedroid.ui.uiString
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -23,9 +24,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.ui.theme.RageTheme
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
@@ -34,7 +37,7 @@ import ragewarden.ragedroid.ui.theme.rageColors
 fun CopyButton(
     onCopy: () -> Unit,
     modifier: Modifier = Modifier,
-    label: String = "Copy",
+    label: String = uiString(R.string.copy),
     // compact now only trims padding; it can no longer shrink the button below
     // the 48dp touch floor enforced below. Kept because CardBody / NoteBody /
     // SshBody / IdentityBody / ItemDetailScreen still ask for it.
@@ -88,7 +91,7 @@ fun CopyButton(
             modifier = Modifier.size(13.dp),
         )
         Text(
-            text = if (copied) "Cleared in ${secs}s" else label,
+            text = if (copied) stringResource(R.string.cleared_in_s, secs) else label,
             style = RageType.button,
             color = fg,
         )

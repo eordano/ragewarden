@@ -1,148 +1,102 @@
 # End-to-end test harness
 
-Layered harness so we can verify the ecosystem works without manual user testing.
+Three tiers verify the ecosystem without manual testing; the hardware a person still has to
+touch is listed at the end.
 
----
+## Tier 1 -- Rust against a real Vaultwarden
 
-## Tier 1 -- Rust <-> real Vaultwarden ✅ ready
+Files: `rageterm/tests/e2e_vaultwarden.rs`, `rageterm/tests/e2e_protocol.rs`,
+`rageterm/tests/support/`.
 
-Spins up `vaultwarden/server` via [`testcontainers`](https://docs.rs/testcontainers/),
-registers a fresh user, posts a `rage:v1` cipher, re-fetches it, and decrypts the round-
-trip.
+- `e2e_vaultwarden.rs` -- register, login, encrypt, POST, fetch, `extract_rage_blob`,
+  decrypt; and the same vault driven through `ragemanifest::snapshot::build_snapshot`, so
+  the browser's code path flags the cipher as protected.
+- `e2e_protocol.rs` -- core's account protocol against the real server: KDF upgrade
+  (PBKDF2 100k -> 600k -> Argon2id), Argon2id registration and login, the downgrade pin,
+  token refresh, field-preserving protect and rotate of a full login, typed items (card,
+  identity, SSH key) with protected fields, folder moves, the history document and its
+  migration, wrong-key detection.
 
-**Files**: `rageterm/tests/e2e_vaultwarden.rs`.
-
-**Tests**:
-
-- `round_trip_via_real_vaultwarden` -- register -> login -> encrypt -> POST -> fetch ->
-  `extract_rage_blob` -> decrypt. Verifies the full `core::sync` HTTP path against an
-  unmodified Vaultwarden image.
-- `cross_frontend_interop_via_ragemanifest_snapshot` -- same setup, but after fetch we
-  drive `ragemanifest::snapshot::build_snapshot` over the same `Vault` and assert the
-  cipher is correctly flagged `rage = true` from the browser-extension code path.
-
-**Run locally**:
+Run inside `nix develop <nixos-config>#ragewarden`, which exports `RAGEWARDEN_VAULTWARDEN_BIN`:
 
 ```bash
-RAGEWARDEN_E2E=1 cargo test -p rageterm --test e2e_vaultwarden -- --ignored --nocapture --test-threads=1
+cargo test -p rageterm --test e2e_vaultwarden --test e2e_protocol -- --test-threads=1
 ```
 
-Requires Docker running locally (the harness pulls `vaultwarden/server:1.32.7` once and
-caches it). Each test starts and tears down its own container.
+Each test starts its own Vaultwarden on a free loopback port with a throwaway data
+directory: the binary named by `RAGEWARDEN_VAULTWARDEN_BIN`, or `vaultwarden/server:1.32.7`
+in Docker when `RAGEWARDEN_E2E=1`; with neither, the tests print a note and skip.
 
-**CI**: the `e2e-vaultwarden` job in `.github/workflows/ci.yml` runs on every push.
+The NixOS-config checks run the rest of rageterm against `services.vaultwarden`:
+`ragewarden-e2e` (about 40 CLI subtests, the clipboard and the Secret Service keyring under
+Xvfb with a session bus), `ragewarden-canokey` and `ragewarden-canokey-touch` (PIV and FIDO2
+against a virtual CanoKey with a touch sensor, the native-messaging host and its signed
+proofs, `migrate-piv`, `attest-fido2`).
 
----
+CI: the `e2e-vaultwarden` job in `.github/workflows/ci.yml` runs on every push.
 
-## Tier 2 -- Browser extension via Playwright + virtual WebAuthn ✅ ready
+## Tier 2 -- the browser extension
 
-Headless Chromium is launched (Playwright-pinned 1.49.1) with the unpacked extension;
-Chrome DevTools Protocol's
+Playwright 1.63.0 launches Chromium with the unpacked `--test-hooks` build. Chrome DevTools
+Protocol's
 [`WebAuthn.addVirtualAuthenticator`](https://chromedevtools.github.io/devtools-protocol/tot/WebAuthn/)
-seeds a virtual platform authenticator with `protocol: "ctap2"`, `transport: "internal"`,
-`hasUserVerification: true`, `hasResidentKey: true`, and **`hasPrf: true`**. The PRF
-capability is the whole point -- without it, `navigator.credentials.get` won't return
-a 32-byte derivation we can use as a wrapping key. Each test stands up its own real
-Vaultwarden via `docker run vaultwarden/server:1.32.7` (same image, env vars, and
-`/alive` healthcheck as Tier 1).
+seeds a CTAP2 platform authenticator with user verification, resident keys and PRF. One
+Vaultwarden is shared by the run: `VAULTWARDEN_URL`, `RAGEWARDEN_VAULTWARDEN_BIN`, docker or
+podman (`docker.io/vaultwarden/server:1.37.3`), or a cargo-built binary. The real rageterm
+plays the other client.
 
-**Files**: `ragemanifest/tests/playwright/`.
-
-**Tests**:
-
-- `tests/onboarding.spec.ts` -- opens the popup, fills the onboarding overlay
-  (server URL + email + master password), clicks "Create account", waits for
-  `vault.bootstrap()` to expose `window.RagewardenVault.bootstrapResult`, and
-  asserts the popup dispatched `ragewarden:vault-updated`.
-- `tests/passkey-prf-roundtrip.spec.ts` -- same bootstrap, plus:
-  1. Attaches the virtual PRF authenticator via CDP.
-  2. `navigator.credentials.create(...)` enrols a passkey; an immediate
-     `navigator.credentials.get(...)` returns 32 PRF bytes used as an AES-GCM
-     wrapping key. Production ragemanifest will eventually run this through the
-     `webauthn-prf-v1` recipient stanza in `ragewarden-core`; until that path
-     lands, the harness drives the WASM directly via
-     `window.RagewardenVault.crypto`.
-  3. `wasm_software_keygen` mints an age identity; the secret is AES-GCM-wrapped
-     under the PRF-derived key and stashed in `chrome.storage.local`. The
-     pubkey becomes an `x25519` recipient and `wasm_create_cipher` posts a
-     rage-protected cipher to Vaultwarden (rage blob in the `rage:v1` HIDDEN
-     custom field, both layers Type-2-wrapped).
-  4. The popup is "closed" (page navigated to `about:blank` and back to the
-     popup URL -- the JS context resets, `chrome.storage.*` persists, the CDP
-     virtual authenticator survives because the target stays alive).
-  5. A second PRF eval reproduces the wrapping key, unwraps the age secret,
-     and `wasm_decrypt_with_software` recovers the plaintext.
-
-**Principles verified** (per `DESIGN.md` §0):
-
-- §0a -- the popup renders the destination string (`Reveal github.com password?`)
-  *before* `navigator.credentials.get` fires; the test asserts both the prompt
-  element is in the DOM at the moment of the PRF call and that its text
-  contains the destination.
-- §0b -- counters bump in lockstep: each `revealOnce` increments
-  `counters.prf`, `counters.decrypt`, and `counters.wasmDecryptCalls`. After
-  two reveals all three are 2.
-- §0c -- after the reveal Promise resolves, `window.RagewardenVault` is walked
-  and asserted to contain no string field equal to the plaintext.
-- §0d -- the test fetches the cipher directly from `${VAULTWARDEN_URL}/api/sync`
-  with the bearer token and asserts the JSON contains Type-2 EncString markers
-  (`"2."`) and **does not** contain the plaintext. Both layers (master-key
-  Type-2 + rage age) are opaque to the server.
-
-**Run locally**:
+Files: `ragemanifest/tests/playwright/`. The specs and the cross-client actions they cover
+are listed in
+[`CROSS-CLIENT-ACTIONS.md`](ragemanifest/tests/playwright/tests/CROSS-CLIENT-ACTIONS.md):
+onboarding, the shipped PRF write/read path with an authenticator-refused control,
+lock and origin-pinned fill, the content-script chip in frames, popup UX, typed items,
+legacy-KDF upgrade, the passkey relay, the rageterm cross-client fuzz, and the journey's
+browser half.
 
 ```bash
 cd ragemanifest/tests/playwright
-npm ci
-npx playwright install --with-deps chromium
-( cd ../../.. && wasm-pack build --target web ragemanifest )   # global-setup does this too
-npx playwright test
+pnpm install --frozen-lockfile
+pnpm exec playwright test
 ```
 
-Requires Docker running locally (the harness pulls `vaultwarden/server:1.32.7`
-once and caches it). `global-setup.ts` builds WASM if `pkg/` is stale, stages
-`ext/` -> `dist/extension/` (with `wasm/` dropped under it), boots one
-Vaultwarden container shared across all tests, and polls `/alive` until 2xx
-with a 60s deadline. `global-teardown.ts` stops + removes the container.
+`global-setup.ts` builds the wasm if `pkg/` is stale, the extension and its mock-tap
+variant, and rageterm unless `RAGETERM_BIN` is set.
 
-**CI**: the `e2e-playwright` job in `.github/workflows/ci.yml` runs on every
-push (Linux runner; Node 20 + cargo + wasm-pack + Docker; Playwright HTML
-report uploaded on failure).
+Around Playwright:
 
-**Gaps / punted**:
+- `pnpm run test:unit` -- the glue under node with a fake extension API.
+- `tests/firefox-bidi.mjs` -- real headless Firefox over WebDriver BiDi: install, popup,
+  event page, tap window.
+- The NixOS-config check `ragemanifest` -- wasm, the three zipped builds, smoke, unit, store
+  package, Firefox and the host cargo tests, hermetically.
 
-- **Firefox / Safari**. CDP virtual authenticators with `hasPrf` are a
-  Chromium-only capability; Firefox's WebDriver BiDi `webauthn` module exposes
-  similar primitives but Playwright's adapter doesn't surface PRF yet. We keep
-  Tier 2 Chromium-only and rely on manual testing on Firefox/Safari at release
-  time. Documented in `ragemanifest/DESIGN.md` §6a.
-- **Native messaging path** (`NativeMessagingPivIdentity` from
-  `ragemanifest/DESIGN.md` §3b) is post-MVP and not in Tier 2.
-- **Copy with auto-clear** is not exercised yet -- the harness focuses on the
-  PRF roundtrip; clipboard auto-clear is design-doc level until the popup glue
-  exposes a `copy` action.
+PRF on Firefox and Safari and the Safari app are signed off by hand
+([`firefox-checklist.md`](ragemanifest/tests/manual/firefox-checklist.md)): no virtual
+authenticator on those browsers exposes PRF.
 
----
+CI: the `e2e-playwright` job runs on every push and uploads the HTML report on failure.
 
-## Tier 3 -- Android instrumented tests ✅ ready
+## Tier 3 -- Android
 
-Two routes onto a device, covering different halves of the tree:
+The Robolectric/Roborazzi suite runs on every build (`gradle :app:testStandardDebugUnitTest
+:app:testFdroidDebugUnitTest`). On a device:
 
-- **Gradle Managed Device** -- a Pixel 6 API 34 (`aosp` system image, no Play services)
-  provisioned by AGP's
-  [Gradle Managed Devices](https://developer.android.com/studio/test/gradle-managed-devices)
-  DSL runs the self-contained instrumented tests.
-- **`tests/journey/run.sh`** -- a host-side runner that stands up a throwaway
-  Vaultwarden, builds a fixture with rageterm, `adb reverse`s the loopback port (the app
-  itself refuses any non-loopback server), and drives the two server-backed tests
-  against a persistent attached emulator. Those tests require instrumentation arguments
+- Instrumented tests -- CI runs them on a Gradle Managed Device (Pixel 6 API 34, `aosp`
+  image); locally, boot the dev shell's AVD (`ragedroid-avd`, `ragedroid-emulator`,
+  `ragedroid-wait-boot`) and run `gradle :app:connectedStandardDebugAndroidTest`.
+- `tests/journey/run.sh` -- a host-side runner that stands up a throwaway Vaultwarden,
+  builds a fixture with rageterm, `adb reverse`s the loopback port (the app refuses any
+  non-loopback server), drives the server-backed tests against the attached emulator, then
+  runs the extension's Playwright `android-recovery.spec.ts` against the same server (it
+  needs the #ragewarden dev shell's Chromium and wasm toolchain as well as adb). With
+  `JOURNEY_BENCH=1` it also runs the macrobenchmarks and writes the baseline profile. Those tests require instrumentation arguments
   only the runner supplies, so the journey package is filtered out of unarmed runs via a
   `notPackage` argument in `ragedroid/app/build.gradle.kts` -- a bare
   `connectedAndroidTest` neither runs nor fails them.
 
-**Files**: `ragedroid/app/src/androidTest/kotlin/ragewarden/ragedroid/`.
+Files: `ragedroid/app/src/androidTest/kotlin/ragewarden/ragedroid/`.
 
-**Tests**:
+Tests:
 
 - `journey/JourneyTest` (run.sh only) -- the end-to-end journey through the shipped
   debug APK, driven by the Compose test rule, with the Compose semantics tree captured
@@ -158,6 +112,11 @@ Two routes onto a device, covering different halves of the tree:
   number of recipients rageterm actually wrapped to (the age GREASE stanza must not be
   counted), and that saving an item wrapped only to foreign recipients is gated behind
   an explicit "Save anyway" confirmation -- Cancel must leave the server untouched.
+- `journey/DeliveryFlowsTest` (run.sh only) -- against a third-party login form
+  (`LoginFixtureActivity`): autofill after the Authorize tap, the keyboard typing an
+  unprotected password, the keyboard sending a protected item to the tap sheet and typing
+  nothing when declined, the RFC 6238 code on the detail screen, a protected card and SSH
+  key round-tripping through Vaultwarden, and the shared history through JNI.
 - `registry/RegistryPushInstrumentedTest` (run.sh only; self-skips without its
   arguments) -- reproduces the cold-cache `pushRecipientRegistry` bug against a vault
   another client already published into: run.sh seeds a browser registry by running the
@@ -170,47 +129,43 @@ Two routes onto a device, covering different halves of the tree:
   `libragedroid_jni.so` error surface: malformed recipients JSON, malformed PRF-inputs
   JSON, an unknown recipient kind, a garbage armored age secret, and a bad decrypt
   secret must each throw `RageNativeException.MalformedStanza` (naming the offending
-  argument in the message) rather than succeeding or crashing.
+  argument in the message) rather than succeeding or crashing, and a Rust panic in an
+  export throws `RageNativeException.Internal` instead of killing the app.
+- `identities/KeystoreMockRoundTripTest` -- a real P-256 key opening real
+  `ragedroid-keystore` stanzas through the packaged library.
 - `data/RecipientStoreInstrumentedTest` (managed device) -- `RecipientStore` against
   real SharedPreferences: add/load round-trip fidelity, per-account isolation, removal,
   `defaultEncrypt` persistence, per-account clear, blank account-id as a no-op, and
   that the raw prefs payload contains no plaintext display name or keystore handle.
 
-**Run locally**:
+Run locally:
 
 ```bash
+nix develop <nixos-config>#android       # JDK 21, SDK 37, NDK 26.3, gradle 9.7.1, cargo-ndk, the AVD helpers
 cd ragedroid
-export JAVA_HOME=/path/to/zulu-17
-export PATH=$JAVA_HOME/bin:$PATH
-export ANDROID_HOME=/path/to/android-sdk
-export ANDROID_SDK_ROOT=$ANDROID_HOME
-export ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.3.11579264
-
-./gradlew :app:compileStandardDebugAndroidTestKotlin     # fast compile-only check
-./gradlew :app:pixel6Api34StandardDebugAndroidTest       # managed-device tests -- boots emulator
-bash ../tests/journey/run.sh                             # journey + registry push -- needs an attached device
+gradle :app:compileStandardDebugAndroidTestKotlin      # fast compile-only check
+ragedroid-avd; ragedroid-emulator & ragedroid-wait-boot
+gradle :app:connectedStandardDebugAndroidTest           # instrumented tests
+bash ../tests/journey/run.sh                            # journey, delivery flows, registry push, browser half
 ```
 
-The managed-device run requires KVM (Linux) or HAXM/HVF (mac/Windows). On Apple Silicon
-the `x86_64` AOSP image is slow without nested virt; CI is the canonical path.
+The emulator needs KVM (Linux) or HVF (macOS).
 
-**Limitations**:
+Coverage notes:
 
-- Real hardware paths (NFC / USB-OTG YubiKey, biometric Keystore) are out of scope here;
-  see "What we don't simulate" below.
-- The journey proves the rageterm -> ragedroid direction only; a phrase generated ON the
-  phone and consumed by another client is not covered (step 5 of `tests/journey/run.sh`
-  says so explicitly rather than pretending).
+- Real NFC / USB-OTG YubiKeys and the biometric Keystore are signed off by hand (below).
+- The journey carries a secret rageterm -> ragedroid and an item the phone wrote on to the
+  browser (`ragemanifest/tests/playwright/tests/android-recovery.spec.ts`, opened with the
+  same paper phrase). A phrase generated ON the phone and consumed by another client is
+  not covered.
 - No pixels: `FLAG_SECURE` blanks every capture of the app, host-side `screencap`
   included. The per-step Compose semantics tree is the artifact instead.
 
-**CI**: the `e2e-android` job in `.github/workflows/ci.yml` runs the managed-device task
+CI: the `e2e-android` job in `.github/workflows/ci.yml` runs the managed-device task
 on every push (ubuntu-latest, KVM enabled). The journey itself does NOT run in CI -- the
 comment block above `e2e-android` in `ci.yml` records why -- but the `journey-contract`
 job asserts on every push that `run.sh`, `JourneyTest` and `app/build.gradle.kts` stay
 wired together (instrumentation-argument names and the like) without executing anything.
-
----
 
 ## Vaultwarden test-harness conventions
 
@@ -236,17 +191,15 @@ live in `ragemanifest/tests/playwright/global-setup.ts` (both `startContainer`
 and `startNativeBinary`) and `rageterm/tests/e2e_vaultwarden.rs` (the
 `RELAXED_*_RATELIMIT_*` constants); keep new sites in lockstep with those.
 
----
-
 ## What we don't simulate
 
 Hardware ceremonies that actually need a person:
 
-- **Real YubiKey** (NFC tap, USB-OTG insertion). Mock-mode covers the trait callbacks;
-  the real-hardware path runs on a tagged release-candidate before signing.
-- **Real Touch ID / Windows Hello / iCloud Keychain**. The CDP virtual authenticator
+- Real YubiKey (NFC tap, USB-OTG insertion). The virtual CanoKey and the mock identities
+  cover the protocol; the physical path runs on a tagged release candidate before signing.
+- Real Touch ID / Windows Hello / iCloud Keychain. The CDP virtual authenticator
   approximates the protocol surface but not the OS UI; we accept that gap.
-- **Real Play Store / F-Droid / Chrome Web Store submission**. CI verifies the build
+- Real Play Store / F-Droid / Chrome Web Store submission. CI verifies the build
   artifact is well-formed; submission is operator-driven.
 
 These are listed as release-gate items in `SECURITY.md` so a human signs them off

@@ -1,3 +1,5 @@
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -11,17 +13,19 @@ mod consent;
 mod fido;
 mod fido_ctap;
 mod fill;
-mod hw;
 mod history_helper;
 mod http;
+mod hw;
 mod identities;
 mod idfile;
 mod install_native_host;
 mod keyring_id;
 mod lock;
 mod native_host;
+mod native_proof;
 mod output;
 mod pass_import;
+mod pin;
 mod piv;
 mod piv_apdu;
 mod piv_pcsc;
@@ -31,6 +35,10 @@ mod session;
 mod store;
 mod tui;
 mod vault;
+mod zalloc;
+
+#[global_allocator]
+static ALLOCATOR: zalloc::WipeOnFree<std::alloc::System> = zalloc::WipeOnFree(std::alloc::System);
 
 #[cfg(test)]
 mod tests;
@@ -90,8 +98,18 @@ enum Command {
         #[arg(long, default_value = "Ragewarden user")]
         name: String,
 
+        /// Key derivation for the new account: `pbkdf2` (with
+        /// `--kdf-iterations`) or `argon2id`.
+        #[arg(long, default_value = "pbkdf2", value_parser = ["pbkdf2", "argon2id"])]
+        kdf: String,
+
         #[arg(long, default_value_t = 600_000)]
         kdf_iterations: u32,
+
+        /// Read the master password from the first line of stdin instead of
+        /// prompting on the terminal.
+        #[arg(long)]
+        password_stdin: bool,
     },
 
     /// Unlock a server session and cache it for later commands.
@@ -101,6 +119,65 @@ enum Command {
 
         #[arg(long)]
         email: String,
+
+        /// Read the master password from the first line of stdin instead of
+        /// prompting on the terminal.
+        #[arg(long)]
+        password_stdin: bool,
+
+        /// Accept an account whose PBKDF2 count is below the minimum, then
+        /// raise it to the current default on the server.
+        #[arg(long)]
+        allow_weak_kdf: bool,
+    },
+
+    /// Move every item from an X25519 PIV slot to a P-256 slot (which also
+    /// signs the browser's per-unwrap proof) and retire the X25519 one. Without
+    /// --public-key it prints the steps.
+    MigratePiv {
+        /// The P-256 slot to move to, e.g. 0x9d.
+        #[arg(long, value_parser = parse_piv_slot)]
+        slot: Option<u8>,
+
+        /// That slot's public key (PEM, hex or a file), as for enroll-yubikey.
+        #[arg(long)]
+        public_key: Option<String>,
+
+        #[arg(long)]
+        label: Option<String>,
+
+        /// The X25519 identity to migrate when more than one is enrolled.
+        #[arg(long)]
+        from: Option<String>,
+
+        /// As for enroll-yubikey: record a slot that needs no touch.
+        #[arg(long = "i-accept-this-slot-needs-no-touch")]
+        allow_untouched_slot: bool,
+    },
+
+    /// Recover a FIDO2 credential's public key with one touch, for a credential
+    /// enrolled before rageterm kept it, so the browser can verify its
+    /// native-host unwraps. Without an id: every credential missing one.
+    AttestFido2 { id: Option<String> },
+
+    /// Print a new random password (or a BIP39 passphrase with --words).
+    Generate {
+        #[command(flatten)]
+        gen_args: GenerateArgs,
+    },
+
+    /// Move an item into a folder; without `--folder` it leaves every folder.
+    Mv {
+        name: String,
+
+        #[arg(long)]
+        folder: Option<String>,
+    },
+
+    /// Show the newest audit events (and how many log lines were unreadable).
+    Audit {
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
     },
 
     /// Drop the cached session and vault.
@@ -110,21 +187,67 @@ enum Command {
     Sync,
 
     /// Generate this machine's software identity (identity.age).
-    EnrollSoftwareIdentity,
+    EnrollSoftwareIdentity {
+        /// Keep identity.age as a bare secret key instead of protecting it
+        /// with a passphrase. Implied when there is no terminal to ask on.
+        #[arg(long)]
+        plaintext: bool,
+    },
+
+    /// Put a passphrase on an existing plaintext identity.age.
+    ProtectIdentity,
 
     /// Store or replace an item, wrapped to every recipient this machine covers.
     #[command(alias = "insert")]
     Set {
         name: String,
 
-        #[arg(long, default_value = "secure-note", value_parser = parse_set_type)]
-        r#type: SetType,
+        #[arg(long, value_parser = parse_set_type)]
+        r#type: Option<SetType>,
 
         #[arg(long)]
         from_stdin: bool,
 
         #[arg(long)]
         folder: Option<String>,
+
+        /// Keep the item in this machine's local store instead of the server.
+        /// Required when not logged in; `login` uploads local items.
+        #[arg(long)]
+        offline: bool,
+
+        /// Store a newly generated password instead of reading one (see
+        /// `rageterm generate` for the options); `copy` it afterwards.
+        #[arg(long)]
+        generate: bool,
+
+        #[command(flatten)]
+        gen_args: GenerateArgs,
+
+        /// With `--type login`: the login's username.
+        #[arg(long)]
+        username: Option<String>,
+
+        /// With `--type login`: a site the login belongs to (repeatable). This is
+        /// what browser and Android autofill match on.
+        #[arg(long = "url", value_name = "URL")]
+        urls: Vec<String>,
+
+        /// Write one protected field of an existing item (`code`, `notes`,
+        /// `passphrase`, ...) and keep its others; default: the primary secret.
+        #[arg(long, value_name = "FIELD")]
+        field: Option<String>,
+
+        /// For a new item: the fields the blob holds (default: the type's
+        /// primary one). With more than one, each is prompted for, or stdin is
+        /// a JSON object of them.
+        #[arg(long, value_name = "FIELD,...", value_delimiter = ',')]
+        protect: Vec<String>,
+
+        /// An unprotected card, identity or SSH key field (repeatable), e.g.
+        /// `--with brand=Visa --with expMonth=12`.
+        #[arg(long = "with", value_name = "FIELD=VALUE", value_parser = parse_field_value)]
+        with: Vec<(String, String)>,
     },
 
     /// List item names (never their contents).
@@ -140,6 +263,11 @@ enum Command {
     #[command(alias = "pipe")]
     Get {
         name: String,
+
+        /// A field of a multi-field item (`notes`, `code`, `passphrase`, ...);
+        /// default: the item's primary secret.
+        #[arg(long)]
+        field: Option<String>,
 
         #[arg(long)]
         newline: bool,
@@ -182,6 +310,15 @@ enum Command {
         #[arg(long)]
         via_env: bool,
 
+        /// Start the child with only PATH, HOME, USER, LOGNAME, SHELL, TERM,
+        /// LANG and LC_* (plus `--keep`) instead of rageterm's environment.
+        #[arg(long)]
+        clean_env: bool,
+
+        /// With `--clean-env`, also pass this variable through (repeatable).
+        #[arg(long, value_name = "VAR", requires = "clean_env")]
+        keep: Vec<String>,
+
         #[arg(trailing_var_arg = true, required = true)]
         argv: Vec<String>,
     },
@@ -194,9 +331,9 @@ enum Command {
         #[arg(long)]
         label: Option<String>,
 
-        /// The slot's X25519 public key, as a PEM file path, a literal PEM, or
-        /// 64 hex characters. Produce it with
-        /// `ykman piv keys generate --algorithm X25519 <slot> pub.pem`.
+        /// The slot's public key, as a PEM file path, a literal PEM, or hex (66
+        /// or 130 characters for P-256, 64 for X25519). Produce it with
+        /// `ykman piv keys generate --algorithm ECCP256 <slot> pub.pem`.
         /// Enrollment runs one live ECDH against the card to prove it holds the
         /// matching private key before recording anything.
         #[arg(long, value_name = "PEM|HEX|PATH")]
@@ -212,6 +349,18 @@ enum Command {
         /// the resulting recipient is protected by the PIN alone.
         #[arg(long = "i-accept-this-slot-needs-no-touch")]
         allow_untouched_slot: bool,
+
+        /// Publish this X25519 slot with `stanzaVersion: 2` (the
+        /// recipient-bound `piv-x25519-v2` stanza). Only once every client
+        /// that opens your items reads v2; until then items stay v1.
+        #[arg(long)]
+        stanza_v2: bool,
+
+        /// Accept an X25519 slot (YubiKey firmware 5.7+). New slots are P-256,
+        /// which also sign the browser's per-unwrap proof; an X25519 slot
+        /// cannot, and `migrate-piv` later moves its items to a P-256 one.
+        #[arg(long)]
+        x25519: bool,
     },
 
     /// Enroll a FIDO2 authenticator (hmac-secret) as a recipient.
@@ -248,9 +397,7 @@ enum Command {
     },
 
     /// Delete an item from the server. There is no trash: this is permanent.
-    Delete {
-        name: String,
-    },
+    Delete { name: String },
 
     /// List, create, rename and remove folders.
     #[command(subcommand)]
@@ -263,6 +410,7 @@ enum Command {
     /// Re-encrypt items to your CURRENT recipient set -- the way to fold a
     /// newly-enrolled recipient into secrets that were stored before it
     /// existed. Name one item, or use --all (optionally --folder) or --only.
+    #[command(alias = "rotate")]
     Reencrypt {
         /// The item to re-encrypt. Omit and pass --all or --only for many.
         name: Option<String>,
@@ -270,6 +418,10 @@ enum Command {
         /// Re-encrypt every protected item to the current recipient set.
         #[arg(long)]
         all: bool,
+
+        /// Re-encrypt only the items `list` marks `[legacy-wrap]`.
+        #[arg(long)]
+        legacy: bool,
 
         /// With --all, limit to items in this folder.
         #[arg(long)]
@@ -307,29 +459,28 @@ enum Command {
         copy: bool,
     },
 
-    #[command(name = "__clipboard-clear-helper", hide = true)]
-    ClipboardClearHelper {
-        secs: u64,
-
-        expected_hash: String,
-    },
+    #[command(name = output::CLIPBOARD_SERVE_SUBCOMMAND, hide = true)]
+    ClipboardServe { secs: u64 },
 
     /// Install the browser native-messaging manifest for ragemanifest.
     InstallNativeHost {
         #[arg(long, default_value = "chromium")]
         browser: String,
 
-        #[arg(long, group = "scope")]
+        /// Per-user manifest (the default).
+        #[arg(long, conflicts_with = "system")]
         user: bool,
 
-        #[arg(long, group = "scope")]
+        /// System-wide manifest.
+        #[arg(long)]
         system: bool,
 
         /// The extension the manifest allows to start the host. For chromium
         /// this is the 32-character id (letters a-p) shown at
         /// chrome://extensions and is required -- prompted for at a terminal
         /// when omitted, never defaulted. Firefox defaults to
-        /// `ragewarden@ragewarden`, Safari to `com.ragewarden.safari`.
+        /// `ragewarden@ragewarden`. Safari has no manifest: `--browser safari`
+        /// reports which rageterm the Ragewarden Safari app will run.
         #[arg(long, value_name = "ID")]
         extension_id: Option<String>,
     },
@@ -339,10 +490,12 @@ enum Command {
         #[arg(long, default_value = "chromium")]
         browser: String,
 
-        #[arg(long, group = "scope")]
+        /// Per-user manifest (the default).
+        #[arg(long, conflicts_with = "system")]
         user: bool,
 
-        #[arg(long, group = "scope")]
+        /// System-wide manifest.
+        #[arg(long)]
         system: bool,
     },
 
@@ -396,16 +549,33 @@ enum FoldersCmd {
 enum SetType {
     SecureNote,
     Login,
+    Card,
+    Identity,
+    SshKey,
 }
 
 fn parse_set_type(s: &str) -> Result<SetType, String> {
     match s {
         "secure-note" | "secure_note" | "note" => Ok(SetType::SecureNote),
         "login" => Ok(SetType::Login),
+        "card" => Ok(SetType::Card),
+        "identity" => Ok(SetType::Identity),
+        "ssh-key" | "ssh_key" => Ok(SetType::SshKey),
         other => Err(format!(
-            "unknown --type `{other}`; expected `secure-note` or `login`"
+            "unknown --type `{other}`; expected `secure-note`, `login`, `card`, `identity` \
+             or `ssh-key`"
         )),
     }
+}
+
+fn parse_field_value(s: &str) -> Result<(String, String), String> {
+    let (k, v) = s
+        .split_once('=')
+        .ok_or_else(|| format!("`{s}` is not FIELD=VALUE"))?;
+    if k.is_empty() {
+        return Err(format!("`{s}` has no field name"));
+    }
+    Ok((k.to_string(), v.to_string()))
 }
 
 #[derive(Subcommand, Debug)]
@@ -419,8 +589,56 @@ enum AgentCmd {
     },
 }
 
+#[derive(clap::Args, Debug, Clone)]
+struct GenerateArgs {
+    /// Password length.
+    #[arg(long, default_value_t = 20)]
+    length: usize,
+
+    /// Letters and digits only.
+    #[arg(long)]
+    no_symbols: bool,
+
+    /// A passphrase of this many words instead of a password.
+    #[arg(long)]
+    words: Option<usize>,
+}
+
+impl GenerateArgs {
+    fn to_generate(&self) -> commands::Generate {
+        commands::Generate {
+            length: self.length,
+            no_symbols: self.no_symbols,
+            words: self.words,
+        }
+    }
+}
+
+/// Browsers start the host with their own argv and no subcommand: Chromium
+/// passes the caller origin (`chrome-extension://<id>/`, plus
+/// `--parent-window=<hwnd>` on Windows), Firefox the manifest path and the
+/// add-on id.
+fn launched_by_browser(args: &[std::ffi::OsString]) -> bool {
+    let Some(first) = args.get(1).and_then(|a| a.to_str()) else {
+        return false;
+    };
+    first.starts_with("chrome-extension://")
+        || first.starts_with("--parent-window=")
+        || (args.len() == 3 && first.ends_with(".json"))
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if launched_by_browser(&argv) {
+        return match commands::cmd_native_host() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("rageterm native-host: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
+    let cli = Cli::parse_from(argv);
 
     if hw::mock_requested_but_unavailable() {
         eprintln!(
@@ -471,18 +689,61 @@ fn run_command(cmd: Command, yes: bool, no_wait: bool) -> Result<i32, commands::
             server,
             email,
             name,
+            kdf,
             kdf_iterations,
+            password_stdin,
         } => {
-            run_async(commands::cmd_register(
-                &server,
-                &email,
-                &name,
-                kdf_iterations,
+            commands::set_password_stdin(password_stdin);
+            let kdf = if kdf == "argon2id" {
+                ragewarden_core::sync::KdfParams::argon2id_default()
+            } else {
+                ragewarden_core::sync::KdfParams::pbkdf2(kdf_iterations)
+            };
+            run_async(commands::cmd_register(&server, &email, &name, kdf))?;
+            Ok(0)
+        }
+        Command::Login {
+            server,
+            email,
+            password_stdin,
+            allow_weak_kdf,
+        } => {
+            commands::set_password_stdin(password_stdin);
+            run_async(commands::cmd_login(&server, &email, allow_weak_kdf))?;
+            Ok(0)
+        }
+        Command::MigratePiv {
+            slot,
+            public_key,
+            label,
+            from,
+            allow_untouched_slot,
+        } => {
+            run_async(commands::cmd_migrate_piv(
+                slot,
+                public_key.as_deref(),
+                label.as_deref(),
+                from.as_deref(),
+                allow_untouched_slot,
+                yes,
+                no_wait,
             ))?;
             Ok(0)
         }
-        Command::Login { server, email } => {
-            run_async(commands::cmd_login(&server, &email))?;
+        Command::AttestFido2 { id } => {
+            run_async(commands::cmd_attest_fido2(id.as_deref(), no_wait))?;
+            Ok(0)
+        }
+        Command::Generate { gen_args } => {
+            commands::cmd_generate(&gen_args.to_generate())?;
+            Ok(0)
+        }
+        Command::Mv { name, folder } => {
+            run_async(commands::cmd_mv(&name, folder.as_deref()))?;
+            Ok(0)
+        }
+        Command::Audit { limit } => {
+            commands::cmd_audit(limit)?;
             Ok(0)
         }
         Command::Logout => {
@@ -493,8 +754,12 @@ fn run_command(cmd: Command, yes: bool, no_wait: bool) -> Result<i32, commands::
             run_async(commands::cmd_sync())?;
             Ok(0)
         }
-        Command::EnrollSoftwareIdentity => {
-            commands::cmd_enroll_software_identity()?;
+        Command::EnrollSoftwareIdentity { plaintext } => {
+            commands::cmd_enroll_software_identity(plaintext)?;
+            Ok(0)
+        }
+        Command::ProtectIdentity => {
+            commands::cmd_protect_identity()?;
             Ok(0)
         }
         Command::Set {
@@ -502,25 +767,62 @@ fn run_command(cmd: Command, yes: bool, no_wait: bool) -> Result<i32, commands::
             r#type,
             from_stdin,
             folder,
+            offline,
+            username,
+            urls,
+            generate,
+            gen_args,
+            field,
+            protect,
+            with,
         } => {
+            let spec = generate.then(|| gen_args.to_generate());
+            let login_args = username.is_some() || !urls.is_empty();
             let cipher_type = match r#type {
-                SetType::SecureNote => commands::SetCipherType::SecureNote,
-                SetType::Login => commands::SetCipherType::Login,
+                Some(SetType::Login) => Some(commands::SetCipherType::Login { username, urls }),
+                None if login_args => Some(commands::SetCipherType::Login { username, urls }),
+                Some(_) if login_args => {
+                    return Err(commands::CmdError::InvalidArg(
+                        "--username and --url need `--type login`".into(),
+                    ));
+                }
+                Some(SetType::SecureNote) => Some(commands::SetCipherType::SecureNote),
+                Some(SetType::Card) => Some(commands::SetCipherType::Card),
+                Some(SetType::Identity) => Some(commands::SetCipherType::Identity),
+                Some(SetType::SshKey) => Some(commands::SetCipherType::SshKey),
+                None => None,
             };
-            run_async(commands::cmd_set(
-                &name,
+            run_async(commands::cmd_set(commands::SetArgs {
+                name: &name,
                 cipher_type,
                 from_stdin,
-                folder.as_deref(),
-            ))?;
+                folder: folder.as_deref(),
+                offline,
+                generate: spec.as_ref(),
+                field: field.as_deref(),
+                protect,
+                with,
+                yes,
+                no_wait,
+            }))?;
             Ok(0)
         }
         Command::List { filter, json } => {
             run_async(commands::cmd_list(filter.as_deref(), json))?;
             Ok(0)
         }
-        Command::Get { name, newline } => {
-            run_async(commands::cmd_get(&name, newline, yes, no_wait))?;
+        Command::Get {
+            name,
+            field,
+            newline,
+        } => {
+            run_async(commands::cmd_get(
+                &name,
+                field.as_deref(),
+                newline,
+                yes,
+                no_wait,
+            ))?;
             Ok(0)
         }
         Command::Copy { name, clear } => {
@@ -542,13 +844,25 @@ fn run_command(cmd: Command, yes: bool, no_wait: bool) -> Result<i32, commands::
         Command::Exec {
             name,
             via_env,
+            clean_env,
+            keep,
             argv,
-        } => run_async(commands::cmd_exec(&name, &argv, via_env, yes, no_wait)),
+        } => {
+            let env = output::ExecEnv {
+                clean: clean_env,
+                keep,
+            };
+            run_async(commands::cmd_exec(
+                &name, &argv, via_env, &env, yes, no_wait,
+            ))
+        }
         Command::EnrollYubikey {
             slot,
             label,
             public_key,
             allow_untouched_slot,
+            stanza_v2,
+            x25519,
         } => {
             run_async(commands::cmd_enroll_yubikey(
                 slot,
@@ -556,6 +870,8 @@ fn run_command(cmd: Command, yes: bool, no_wait: bool) -> Result<i32, commands::
                 public_key.as_deref(),
                 no_wait,
                 allow_untouched_slot,
+                stanza_v2,
+                x25519,
             ))?;
             Ok(0)
         }
@@ -609,6 +925,7 @@ fn run_command(cmd: Command, yes: bool, no_wait: bool) -> Result<i32, commands::
         Command::Reencrypt {
             name,
             all,
+            legacy,
             folder,
             only,
             allow_revoke,
@@ -616,6 +933,7 @@ fn run_command(cmd: Command, yes: bool, no_wait: bool) -> Result<i32, commands::
             run_async(commands::cmd_reencrypt(
                 name.as_deref(),
                 all,
+                legacy,
                 folder.as_deref(),
                 only.as_deref(),
                 allow_revoke,
@@ -632,27 +950,26 @@ fn run_command(cmd: Command, yes: bool, no_wait: bool) -> Result<i32, commands::
             run_async(commands::cmd_totp(&name, copy, yes, no_wait))?;
             Ok(0)
         }
-        Command::ClipboardClearHelper {
-            secs,
-            expected_hash,
-        } => {
-            output::run_clipboard_clear_helper(secs, &expected_hash)?;
+        Command::ClipboardServe { secs } => {
+            output::run_clipboard_serve(secs)?;
             Ok(0)
         }
         Command::InstallNativeHost {
             browser,
-            user: _,
+            user,
             system,
             extension_id,
         } => {
+            let system = system && !user;
             commands::cmd_install_native_host(&browser, system, extension_id.as_deref(), yes)?;
             Ok(0)
         }
         Command::UninstallNativeHost {
             browser,
-            user: _,
+            user,
             system,
         } => {
+            let system = system && !user;
             commands::cmd_uninstall_native_host(&browser, system)?;
             Ok(0)
         }

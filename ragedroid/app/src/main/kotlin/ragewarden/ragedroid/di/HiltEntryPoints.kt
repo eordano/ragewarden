@@ -23,6 +23,7 @@ interface AppEntryPoint {
     fun auditFeed(): AuditFeed
     fun rotationTracker(): RotationTracker
     fun historyStore(): HistoryStore
+    fun sessionKeyWrap(): ragewarden.ragedroid.data.SessionKeyWrap
 }
 
 fun Context.appEntryPoint(): AppEntryPoint =

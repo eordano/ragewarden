@@ -17,7 +17,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
 import androidx.compose.material.icons.outlined.CreditCard
 import androidx.compose.material.icons.outlined.Description
@@ -30,33 +29,35 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.ui.components.AppBar
-import ragewarden.ragedroid.ui.components.IconBtn
+import ragewarden.ragedroid.ui.components.BackButton
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
 
-enum class AddItemKind(val id: String, val label: String) {
-    Login("login", "Login"),
-    Card("card", "Card"),
-    Note("note", "Secure note"),
-    Identity("identity", "Identity"),
-    Ssh("ssh", "SSH key"),
+enum class AddItemKind(val id: String, @androidx.annotation.StringRes val label: Int) {
+    Login("login", R.string.login),
+    Card("card", R.string.card),
+    Note("note", R.string.secure_note),
+    Identity("identity", R.string.identity),
+    Ssh("ssh", R.string.ssh_key),
 }
 
 private data class TypeOption(
     val kind: AddItemKind,
     val icon: ImageVector,
-    val description: String,
+    @androidx.annotation.StringRes val description: Int,
 )
 
 private val TYPE_OPTIONS = listOf(
-    TypeOption(AddItemKind.Login, Icons.Outlined.Link, "Username + password, optionally with TOTP."),
-    TypeOption(AddItemKind.Card, Icons.Outlined.CreditCard, "Credit / debit card. Number and CVV are gated."),
-    TypeOption(AddItemKind.Note, Icons.Outlined.Description, "Free-form encrypted text. No structure."),
-    TypeOption(AddItemKind.Identity, Icons.Outlined.Person, "Name, address, ID numbers -- for autofill."),
-    TypeOption(AddItemKind.Ssh, Icons.Outlined.Terminal, "Private key gated; public key always shown."),
+    TypeOption(AddItemKind.Login, Icons.Outlined.Link, R.string.username_password_optionally_with_totp),
+    TypeOption(AddItemKind.Card, Icons.Outlined.CreditCard, R.string.credit_debit_card_number_and_cvv),
+    TypeOption(AddItemKind.Note, Icons.Outlined.Description, R.string.free_form_encrypted_text_no_structure),
+    TypeOption(AddItemKind.Identity, Icons.Outlined.Person, R.string.name_address_id_numbers_for_autofill),
+    TypeOption(AddItemKind.Ssh, Icons.Outlined.Terminal, R.string.private_key_gated_public_key_always),
 )
 
 @Composable
@@ -67,15 +68,9 @@ fun AddItemTypePickerScreen(
     val c = rageColors
     Column(modifier = Modifier.fillMaxSize().background(c.background)) {
         AppBar(
-            title = "New item",
-            subtitle = "Pick a type",
-            leading = {
-                IconBtn(
-                    icon = Icons.AutoMirrored.Outlined.ArrowBack,
-                    contentDescription = "Back",
-                    onClick = onBack,
-                )
-            },
+            title = stringResource(R.string.new_item),
+            subtitle = stringResource(R.string.pick_a_type),
+            leading = { BackButton(onBack) },
         )
         Column(
             modifier = Modifier
@@ -119,13 +114,13 @@ private fun TypeOptionRow(option: TypeOption, onClick: () -> Unit) {
         }
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = option.kind.label,
+                text = stringResource(option.kind.label),
                 style = RageType.rowTitle.copy(fontSize = 16.sp, lineHeight = 20.sp),
                 color = c.fgEmphasis,
             )
             Spacer(modifier = Modifier.height(2.dp))
             Text(
-                text = option.description,
+                text = stringResource(option.description),
                 style = RageType.body.copy(fontSize = 13.5.sp, lineHeight = 19.sp),
                 color = c.fgSecondary,
             )

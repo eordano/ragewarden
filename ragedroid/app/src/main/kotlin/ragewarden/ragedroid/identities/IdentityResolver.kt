@@ -27,7 +27,7 @@ data class IdentitySet(
      * be fresh.
      */
     val biometricRequired: Boolean get() =
-        identities.any { it is AndroidKeystoreIdentity && it.authBound }
+        identities.any { it is AndroidKeystoreIdentity && it.authBound && !it.perUse }
 
     val containsMock: Boolean get() = identities.any { it.isMock }
 
@@ -140,11 +140,13 @@ object IdentityResolver {
         val authBound = stored.keystoreAuthBound
             ?: (activity != null && BiometricGate.isEnrolled(activity))
         out += AndroidKeystoreIdentity(
-            mockSecret = null,
+            mockKey = null,
             expectedPublicKey = pub,
             keyHandle = handle,
             label = stored.displayName,
             authBound = authBound,
+            perUse = stored.keystorePerUse && android.os.Build.VERSION.SDK_INT >= 35,
+            activity = activity,
         )
     }
 
@@ -156,11 +158,11 @@ object IdentityResolver {
         skipped: MutableList<SkippedRecipient>,
     ) {
         val pub = stored.pivPubkey
-        if (pub == null || pub.size != PIV_PUBKEY_LEN) {
+        if (pub == null || (pub.size != PIV_X25519_LEN && !P256.isCompressedPoint(pub))) {
             skipped += SkippedRecipient(
                 stored.id,
                 stored.displayName,
-                "Stored PIV public key is ${pub?.size ?: 0} bytes; expected $PIV_PUBKEY_LEN.",
+                "Stored PIV public key is ${pub?.size ?: 0} bytes; expected a 32-byte X25519 or 33-byte P-256 key.",
             )
             return
         }
@@ -265,5 +267,5 @@ object IdentityResolver {
     }
 
     private const val KEYSTORE_PUBKEY_LEN = 33
-    private const val PIV_PUBKEY_LEN = 32
+    private const val PIV_X25519_LEN = 32
 }

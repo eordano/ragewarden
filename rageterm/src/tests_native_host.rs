@@ -1,7 +1,7 @@
 use std::io::Cursor;
 
-use crate::install_native_host::{self, build_manifest_json, manifest_path, Browser, Scope};
-use crate::native_host::{read_frame, write_frame, RequestContext};
+use crate::install_native_host::{self, Browser, Scope, build_manifest_json, manifest_path};
+use crate::native_host::{RequestContext, read_frame, write_frame};
 use crate::tests_lock::ENV_LOCK;
 
 #[test]
@@ -54,26 +54,30 @@ fn install_native_host_path_per_os() {
         assert!(s.ends_with("com.ragewarden.host.json"));
 
         let p = manifest_path(Browser::Firefox, Scope::User).unwrap();
-        assert!(p
-            .to_string_lossy()
-            .contains("Library/Application Support/Mozilla/NativeMessagingHosts"));
+        assert!(
+            p.to_string_lossy()
+                .contains("Library/Application Support/Mozilla/NativeMessagingHosts")
+        );
 
         let p = manifest_path(Browser::Safari, Scope::User).unwrap();
-        assert!(p
-            .to_string_lossy()
-            .contains("Library/Application Support/Ragewarden"));
+        assert!(
+            p.to_string_lossy()
+                .contains("Library/Application Support/Ragewarden")
+        );
 
         let p = manifest_path(Browser::Chromium, Scope::System).unwrap();
         assert!(p.starts_with("/Library/Google/Chrome"));
     } else if cfg!(target_os = "linux") {
         let p = manifest_path(Browser::Chromium, Scope::User).unwrap();
-        assert!(p
-            .to_string_lossy()
-            .contains(".config/google-chrome/NativeMessagingHosts"));
+        assert!(
+            p.to_string_lossy()
+                .contains(".config/google-chrome/NativeMessagingHosts")
+        );
         let p = manifest_path(Browser::Firefox, Scope::User).unwrap();
-        assert!(p
-            .to_string_lossy()
-            .contains(".mozilla/native-messaging-hosts"));
+        assert!(
+            p.to_string_lossy()
+                .contains(".mozilla/native-messaging-hosts")
+        );
         let p = manifest_path(Browser::Chromium, Scope::System).unwrap();
         assert!(p.starts_with("/etc/opt/chrome"));
         let p = manifest_path(Browser::Firefox, Scope::System).unwrap();
@@ -95,8 +99,8 @@ fn manifest_json_chromium_uses_allowed_origins_list() {
 #[test]
 fn manifest_json_chromium_refuses_non_extension_ids() {
     for bad in ["ragewardenchrome", "abcdef", ""] {
-        let err = build_manifest_json(Browser::Chromium, "/usr/local/bin/rageterm", bad)
-            .unwrap_err();
+        let err =
+            build_manifest_json(Browser::Chromium, "/usr/local/bin/rageterm", bad).unwrap_err();
         assert!(matches!(
             err,
             install_native_host::InstallError::InvalidExtensionId(_)
@@ -125,7 +129,7 @@ fn install_then_uninstall_round_trip_unix_isolated_home() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::TempDir::new().unwrap();
     let prev = std::env::var_os("HOME");
-    std::env::set_var("HOME", tmp.path());
+    crate::tests_lock::set_var("HOME", tmp.path());
 
     let res = install_native_host::install(
         Browser::Firefox,
@@ -156,9 +160,9 @@ fn install_then_uninstall_round_trip_unix_isolated_home() {
     ));
 
     if let Some(p) = prev {
-        std::env::set_var("HOME", p);
+        crate::tests_lock::set_var("HOME", p);
     } else {
-        std::env::remove_var("HOME");
+        crate::tests_lock::remove_var("HOME");
     }
 }
 
@@ -170,7 +174,7 @@ fn install_refuses_overwrite_without_yes() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::TempDir::new().unwrap();
     let prev = std::env::var_os("HOME");
-    std::env::set_var("HOME", tmp.path());
+    crate::tests_lock::set_var("HOME", tmp.path());
 
     let _first = install_native_host::install(
         Browser::Firefox,
@@ -187,9 +191,9 @@ fn install_refuses_overwrite_without_yes() {
     );
 
     if let Some(p) = prev {
-        std::env::set_var("HOME", p);
+        crate::tests_lock::set_var("HOME", p);
     } else {
-        std::env::remove_var("HOME");
+        crate::tests_lock::remove_var("HOME");
     }
     assert!(matches!(
         second.unwrap_err(),
@@ -202,6 +206,7 @@ fn action_prompt_includes_action_and_domain() {
     let ctx = RequestContext {
         action: "autofill".into(),
         domain: "github.com".into(),
+        destination: String::new(),
     };
     let prompt = crate::native_host::action_prompt(&ctx);
     assert!(prompt.contains("github.com"));

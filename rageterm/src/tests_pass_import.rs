@@ -2,8 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::pass_import::{
-    item_name_from_relative, plan_import, resolve_store_dir, split_password_and_notes,
-    PassImportError,
+    PassImportError, item_name_from_relative, plan_import, resolve_store_dir,
+    split_password_and_notes,
 };
 use crate::tests_lock::ENV_LOCK;
 use tempfile::TempDir;
@@ -132,7 +132,7 @@ fn split_password_with_carriage_returns_preserved() {
 fn resolve_store_dir_explicit_overrides_env() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let prev = std::env::var_os("PASSWORD_STORE_DIR");
-    std::env::set_var("PASSWORD_STORE_DIR", "/from/env");
+    crate::tests_lock::set_var("PASSWORD_STORE_DIR", "/from/env");
 
     let explicit = std::path::Path::new("/from/cli");
     assert_eq!(
@@ -141,9 +141,9 @@ fn resolve_store_dir_explicit_overrides_env() {
     );
 
     if let Some(p) = prev {
-        std::env::set_var("PASSWORD_STORE_DIR", p);
+        crate::tests_lock::set_var("PASSWORD_STORE_DIR", p);
     } else {
-        std::env::remove_var("PASSWORD_STORE_DIR");
+        crate::tests_lock::remove_var("PASSWORD_STORE_DIR");
     }
 }
 
@@ -152,19 +152,19 @@ fn resolve_store_dir_falls_back_to_home_default() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let prev_pw = std::env::var_os("PASSWORD_STORE_DIR");
     let prev_home = std::env::var_os("HOME");
-    std::env::remove_var("PASSWORD_STORE_DIR");
+    crate::tests_lock::remove_var("PASSWORD_STORE_DIR");
     let tmp = TempDir::new().unwrap();
-    std::env::set_var("HOME", tmp.path());
+    crate::tests_lock::set_var("HOME", tmp.path());
 
     let got = resolve_store_dir(None).unwrap();
     assert_eq!(got, PathBuf::from(tmp.path()).join(".password-store"));
 
     if let Some(p) = prev_pw {
-        std::env::set_var("PASSWORD_STORE_DIR", p);
+        crate::tests_lock::set_var("PASSWORD_STORE_DIR", p);
     }
     if let Some(p) = prev_home {
-        std::env::set_var("HOME", p);
+        crate::tests_lock::set_var("HOME", p);
     } else {
-        std::env::remove_var("HOME");
+        crate::tests_lock::remove_var("HOME");
     }
 }

@@ -57,15 +57,6 @@
 <body>
   <div id="mock-banner"></div>
   <h1 id="headline">Authorize this use</h1>
-  <!--
-    "Destination" and "Requested by" used to be two rows here, holding
-    "example.com" and "https://example.com". The only path that opens this
-    window is content.js -> vault.unlock, where the page that asked IS the page
-    that gets filled (content.js re-checks location.origin before typing), so
-    they were one fact printed twice, in mono, at the same size and weight as
-    every other row. One sentence now, with the hostname as the largest text in
-    the window: it is the only thing here that decides whether to tap at all.
-  -->
   <p id="target">
     <span id="destination">--</span>
     asked for this, and is the only page it can be released to.

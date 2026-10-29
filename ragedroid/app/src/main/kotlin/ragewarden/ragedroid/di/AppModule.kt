@@ -27,6 +27,11 @@ object AppModule {
     fun provideSessionStore(@ApplicationContext context: Context): SessionStore =
         SessionStore(context)
 
+    @Provides
+    @Singleton
+    fun provideKdfPinStore(@ApplicationContext context: Context): ragewarden.ragedroid.data.KdfPinStore =
+        ragewarden.ragedroid.data.KdfPinStore(context)
+
     /**
      * One lock per process, shared by the UI, the IME and the autofill service.
      * Bound here rather than with `@Inject constructor` so `hasSession` stays a
@@ -38,7 +43,12 @@ object AppModule {
         @ApplicationContext context: Context,
         policy: LockPolicy,
         sessionStore: SessionStore,
-    ): LockState = LockState(context, policy) { sessionStore.has() }
+    ): LockState = LockState(
+        context,
+        policy,
+        sessionNeedsUnlock = { !ragewarden.ragedroid.data.SessionBlobs.hasKeys(sessionStore.load()) },
+        hasSession = { sessionStore.has() },
+    )
 
     @Provides
     fun provideClock(): Clock = Clock.systemDefaultZone()

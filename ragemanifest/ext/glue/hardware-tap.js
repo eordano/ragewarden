@@ -1,10 +1,15 @@
 import { BUILD_FLAGS, mockTapAllowed } from './build-flags.js';
 import { passkeyEnroll, passkeyUnlockMulti, passkeyPresenceAssert } from './passkey.js';
+import { loadAllPasskeyRecipients } from './passkey-store.js';
+import { newPurpose } from './assertion.js';
+import { b64ToBytes, bytesToB64 } from './b64.js';
+import { RELAY_ORIGIN, sameCredentialId, verifyRelayAssertion } from './prf-relay.js';
+import {
+    BACKEND_MOCK, BACKEND_NATIVE_HOST, BACKEND_WEBAUTHN_PRF, NATIVE_HOST_TAP_BACKENDS,
+    checkReceiptShape, publicKeysFromRecords, verifyReceipt,
+} from './receipt-check.js';
 
-export { mockTapAllowed };
-
-export const BACKEND_WEBAUTHN_PRF = 'webauthn-prf';
-export const BACKEND_MOCK = 'MOCK-NO-DEVICE';
+export { mockTapAllowed, BACKEND_MOCK, BACKEND_NATIVE_HOST, BACKEND_WEBAUTHN_PRF, NATIVE_HOST_TAP_BACKENDS };
 
 /*
  * A ceremony performed by a device this browser cannot reach, narrated back by
@@ -16,7 +21,6 @@ export const BACKEND_MOCK = 'MOCK-NO-DEVICE';
  * flattering value, and is then put through the same sealReceipt()/
  * assertReceiptIsRealTap() gate as everything else.
  */
-export const BACKEND_NATIVE_HOST = 'native-host-rageterm';
 
 /*
  * `tap.backend` values a native-host reply may carry. These are the stanza
@@ -25,14 +29,7 @@ export const BACKEND_NATIVE_HOST = 'native-host-rageterm';
  * `webauthn-prf-v1`, which this browser opens itself with a real assertion -- is
  * a malformed reply, not a new backend to trust.
  */
-export const NATIVE_HOST_TAP_BACKENDS = Object.freeze(['piv-p256', 'fido2-hmac']);
 
-/*
- * Backends whose receipts assert a real ceremony. Membership here is the only
- * thing that gets a receipt past assertReceiptIsRealTap() without `mock: true`,
- * so adding a value is a security decision, not bookkeeping.
- */
-const REAL_BACKENDS = Object.freeze([BACKEND_WEBAUTHN_PRF, BACKEND_NATIVE_HOST]);
 
 export class NoHardwareError extends Error {
     constructor(message, detail = {}) {
@@ -55,13 +52,6 @@ export function isUserDecline(err) {
     const name = (err && err.name) || '';
     return name === 'NotAllowedError' || name === 'AbortError'
         || (err && err.code === 'tap_declined');
-}
-
-function bytesToB64(bytes) {
-    const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-    let s = '';
-    for (let i = 0; i < arr.length; i++) s += String.fromCharCode(arr[i]);
-    return btoa(s);
 }
 
 export function webauthnAvailable() {
@@ -141,13 +131,29 @@ function sealReceipt(receipt, expectMock) {
     return Object.freeze({ ...receipt });
 }
 
-export async function performPrfTap({ pairs, rpId, action, destination, origin }) {
+async function knownPublicKeys() {
+    try {
+        return publicKeysFromRecords(await loadAllPasskeyRecipients());
+    } catch {
+        return {};
+    }
+}
+
+async function sealVerified(receipt) {
+    const { signatureVerified } = await verifyReceipt(receipt, {
+        allowMock: false, publicKeys: await knownPublicKeys(),
+    });
+    return sealReceipt({ ...receipt, signatureVerified }, false);
+}
+
+export async function performPrfTap({ pairs, rpId, action, destination, origin, cipherId }) {
     if (!Array.isArray(pairs) || pairs.length === 0) {
         throw new NoHardwareError(
             'performPrfTap: this blob carries no webauthn-prf recipient stanza, '
             + 'so no hardware tap can open it',
         );
     }
+    const purpose = newPurpose({ action, destination, cipherId, origin });
     const backend = selectedBackend();
     if (backend === BACKEND_MOCK) {
         const mod = await loadMockBackend();
@@ -155,7 +161,7 @@ export async function performPrfTap({ pairs, rpId, action, destination, origin }
         return {
             credentialId: r.credentialId,
             prfOutput: r.prfOutput,
-            receipt: sealReceipt(r.receipt, true),
+            receipt: sealReceipt({ ...r.receipt, purpose }, true),
         };
     }
     if (!webauthnAvailable()) {
@@ -164,11 +170,11 @@ export async function performPrfTap({ pairs, rpId, action, destination, origin }
             + 'from a service worker or a page script -- it must run in an extension page.',
         );
     }
-    const r = await passkeyUnlockMulti({ pairs, rpId, action, destination });
+    const r = await passkeyUnlockMulti({ pairs, rpId, purpose });
     return {
         credentialId: r.credentialId,
         prfOutput: r.prfOutput,
-        receipt: sealReceipt({
+        receipt: await sealVerified({
             backend: BACKEND_WEBAUTHN_PRF,
             mock: false,
             label: 'WebAuthn PRF assertion',
@@ -179,11 +185,82 @@ export async function performPrfTap({ pairs, rpId, action, destination, origin }
             credentialIdB64: bytesToB64(r.credentialId),
             userPresent: !!(r.flags && r.flags.userPresent),
             userVerified: !!(r.flags && r.flags.userVerified),
-        }, false),
+            ...r.evidence,
+        }),
     };
 }
 
-export async function performPresenceTap({ credentialIds, rpId, action, destination, origin }) {
+function askWorker(message) {
+    const c = globalThis.chrome;
+    if (!c || !c.runtime || typeof c.runtime.sendMessage !== 'function') {
+        return Promise.reject(new NoHardwareError('the passkey relay needs the extension worker'));
+    }
+    return new Promise((resolve, reject) => {
+        c.runtime.sendMessage(message, (r) => {
+            const err = c.runtime.lastError;
+            if (err) reject(new Error(err.message || 'worker port error'));
+            else resolve(r);
+        });
+    });
+}
+
+/**
+ * A phone passkey (rp id ragewarden.decent.foundation) through the relay page:
+ * the worker opens it, checks the answer, and the answer is checked again here
+ * against the passkey's published key before its PRF output is used.
+ * `credentials` are the registry's phone passkeys (relayCredentialsFromRegistry).
+ */
+export async function performRelayPrfTap({ pairs, credentials, action, destination, origin, cipherId }) {
+    const asked = [];
+    for (const p of pairs || []) {
+        const id = bytesToB64(p.credentialId);
+        const c = (credentials || []).find(x => sameCredentialId(x.credentialIdB64, id));
+        if (c) asked.push({ ...c, credentialIdB64: id, saltB64: bytesToB64(p.salt) });
+    }
+    if (asked.length === 0) {
+        throw new NoHardwareError('this item names no phone passkey with a published key');
+    }
+    const purpose = newPurpose({ action, destination, cipherId, origin });
+    const resp = await askWorker({
+        kind: 'relay.prf', purpose, credentials: asked,
+        action: String(action || ''), destination: String(destination || ''),
+    });
+    if (!resp || !resp.ok) throw new Error((resp && resp.error) || 'the passkey relay failed');
+    const assertion = resp.assertion || {};
+    const checked = await verifyRelayAssertion({
+        result: { ...assertion, prfFirst: resp.prfOutputB64 }, purpose, credentials: asked,
+    });
+    const used = asked.find(c => sameCredentialId(c.credentialIdB64, checked.credentialIdB64));
+    const receipt = {
+        backend: BACKEND_WEBAUTHN_PRF,
+        mock: false,
+        label: 'WebAuthn PRF assertion through the passkey relay',
+        relay: RELAY_ORIGIN,
+        at: Date.now(),
+        action: String(action || ''),
+        destination: String(destination || ''),
+        origin: String(origin || ''),
+        credentialIdB64: used.credentialIdB64,
+        userPresent: checked.flags.userPresent,
+        userVerified: checked.flags.userVerified,
+        purpose,
+        clientDataJSON: assertion.clientDataJSON,
+        authenticatorData: assertion.authenticatorData,
+        signature: assertion.signature,
+    };
+    const { signatureVerified } = await verifyReceipt(receipt, {
+        allowMock: false,
+        publicKeys: { [used.credentialIdB64]: { spkiB64: used.spkiB64, alg: used.alg } },
+    });
+    if (!signatureVerified) throw new Error('the relayed assertion could not be verified -- refusing');
+    return {
+        credentialId: b64ToBytes(used.credentialIdB64),
+        prfOutput: checked.prfOutput,
+        receipt: sealReceipt({ ...receipt, signatureVerified }, false),
+    };
+}
+
+export async function performPresenceTap({ credentialIds, rpId, action, destination, origin, cipherId }) {
     if (!Array.isArray(credentialIds) || credentialIds.length === 0) {
         throw new NoHardwareError(
             'performPresenceTap: no passkey is enrolled in this browser profile, so there is '
@@ -191,11 +268,12 @@ export async function performPresenceTap({ credentialIds, rpId, action, destinat
             + 'any secret.',
         );
     }
+    const purpose = newPurpose({ action, destination, cipherId, origin });
     const backend = selectedBackend();
     if (backend === BACKEND_MOCK) {
         const mod = await loadMockBackend();
         const r = await mod.mockPresenceTap({ credentialIds, action, destination, origin });
-        return { receipt: sealReceipt(r.receipt, true) };
+        return { receipt: sealReceipt({ ...r.receipt, purpose }, true) };
     }
     if (!webauthnAvailable()) {
         throw new NoHardwareError(
@@ -203,9 +281,9 @@ export async function performPresenceTap({ credentialIds, rpId, action, destinat
             + 'from a service worker or a page script -- it must run in an extension page.',
         );
     }
-    const r = await passkeyPresenceAssert({ credentialIds, rpId });
+    const r = await passkeyPresenceAssert({ credentialIds, rpId, purpose });
     return {
-        receipt: sealReceipt({
+        receipt: await sealVerified({
             backend: BACKEND_WEBAUTHN_PRF,
             mock: false,
             label: 'WebAuthn presence assertion (item is NOT hardware-encrypted)',
@@ -216,7 +294,8 @@ export async function performPresenceTap({ credentialIds, rpId, action, destinat
             credentialIdB64: bytesToB64(r.credentialId),
             userPresent: !!(r.flags && r.flags.userPresent),
             userVerified: !!(r.flags && r.flags.userVerified),
-        }, false),
+            ...r.evidence,
+        }),
     };
 }
 
@@ -256,7 +335,7 @@ export class NativeTapRefusedError extends Error {
  * an audit can see which unlocks rested on it.
  */
 export function performNativeHostTap({
-    tap, host = '', action = '', destination = '', origin = '',
+    tap, attested = false, host = '', action = '', destination = '', origin = '', cipherId = '',
 } = {}) {
     if (!tap || typeof tap !== 'object') {
         throw new NativeTapRefusedError(
@@ -293,6 +372,8 @@ export function performNativeHostTap({
         device: String(tap.device || ''),
         slot: String(tap.slot || ''),
         hostAt: Number.isFinite(tap.at) ? tap.at : 0,
+        attested: attested === true,
+        purpose: newPurpose({ action, destination, cipherId, origin }),
         userPresent: tap.touched === true,
         userVerified: tap.verified === true,
     }, false);
@@ -354,36 +435,5 @@ export async function performPrfEnroll(opts = {}) {
 }
 
 export function assertReceiptIsRealTap(receipt) {
-    if (!receipt || typeof receipt !== 'object') {
-        throw new Error('no tap receipt: refusing to release plaintext');
-    }
-    if (receipt.mock === true) {
-        if (!mockTapAllowed()) {
-            throw new Error(
-                'tap receipt is marked mock:true but this build forbids mock taps -- '
-                + 'refusing to release plaintext',
-            );
-        }
-        return;
-    }
-    // Re-checked here rather than trusted from sealReceipt(): a receipt crosses
-    // a message port (tap page -> background) before it reaches this gate, so
-    // the last thing to read it must be the thing that decides.
-    if (!REAL_BACKENDS.includes(receipt.backend)
-        || receipt.userPresent !== true
-        || receipt.userVerified !== true) {
-        throw new Error(
-            'tap receipt does not evidence a real, user-verified presence check',
-        );
-    }
-    // A native-host receipt additionally has to name which hardware family
-    // answered. performNativeHostTap() already checked this, but that ran
-    // before the receipt crossed a port, and the whole point of this function
-    // is that the last reader decides.
-    if (receipt.backend === BACKEND_NATIVE_HOST
-        && !NATIVE_HOST_TAP_BACKENDS.includes(receipt.tapBackend)) {
-        throw new Error(
-            'native-host tap receipt names no hardware backend -- refusing to release plaintext',
-        );
-    }
+    checkReceiptShape(receipt, { allowMock: mockTapAllowed() });
 }

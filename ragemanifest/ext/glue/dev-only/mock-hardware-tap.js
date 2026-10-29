@@ -1,3 +1,4 @@
+import { bytesToB64 } from '../b64.js';
 /**
  * Software stand-in for a hardware authenticator.
  *
@@ -42,13 +43,6 @@ function subtle() {
         throw new Error('mock-hardware-tap: WebCrypto is unavailable in this context');
     }
     return c.subtle;
-}
-
-function bytesToB64(bytes) {
-    const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-    let s = '';
-    for (let i = 0; i < arr.length; i++) s += String.fromCharCode(arr[i]);
-    return btoa(s);
 }
 
 /**

@@ -1,7 +1,10 @@
 package ragewarden.ragedroid.ui
 
 import android.app.Activity
+import android.view.MotionEvent
+import android.view.Window
 import android.view.WindowManager
+import ragewarden.ragedroid.ui.components.logObscured
 
 /**
  * Marks this Activity's window as `FLAG_SECURE`.
@@ -29,10 +32,24 @@ import android.view.WindowManager
  * flows. For a password vault that is the correct trade. There is intentionally
  * no debug-build escape hatch -- a flag that is off in the build you test with is
  * a flag whose breakage you discover in release.
+ *
+ * The window also drops touches that pass through another app's window drawn
+ * over it (`filterTouchesWhenObscured`), and logs each one it drops, so a tap
+ * that "did nothing" can be told apart from a tap that was refused.
  */
 fun Activity.secureWindow() {
     window.setFlags(
         WindowManager.LayoutParams.FLAG_SECURE,
         WindowManager.LayoutParams.FLAG_SECURE,
     )
+    window.decorView.filterTouchesWhenObscured = true
+    val callback = window.callback
+    window.callback = object : Window.Callback by callback {
+        override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+            if (event.actionMasked == MotionEvent.ACTION_DOWN && event.flags and MotionEvent.FLAG_WINDOW_IS_OBSCURED != 0) {
+                logObscured(this@secureWindow.javaClass.simpleName, event)
+            }
+            return callback.dispatchTouchEvent(event)
+        }
+    }
 }

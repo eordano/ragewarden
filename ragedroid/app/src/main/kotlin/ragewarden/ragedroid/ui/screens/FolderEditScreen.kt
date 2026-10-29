@@ -18,7 +18,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material3.Icon
@@ -34,6 +33,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontStyle
@@ -46,16 +46,18 @@ import android.widget.Toast
 import kotlinx.collections.immutable.ImmutableList
 import kotlinx.collections.immutable.persistentListOf
 import kotlinx.coroutines.launch
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.data.VaultBackend
 import ragewarden.ragedroid.ui.components.AppBar
+import ragewarden.ragedroid.ui.components.BackButton
 import ragewarden.ragedroid.ui.components.ButtonSize
 import ragewarden.ragedroid.ui.components.ButtonVariant
 import ragewarden.ragedroid.ui.components.Field
-import ragewarden.ragedroid.ui.components.IconBtn
 import ragewarden.ragedroid.ui.components.RageButton
 import ragewarden.ragedroid.ui.components.TextInput
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
+import ragewarden.ragedroid.ui.uiString
 
 private val FOLDER_PALETTE: ImmutableList<Color> = persistentListOf(
     Color(0xFFC8552B),
@@ -95,17 +97,11 @@ fun FolderEditScreen(
 
     Column(modifier = Modifier.fillMaxSize().background(c.background)) {
         AppBar(
-            title = if (isNew) "New folder" else "Edit folder",
-            leading = {
-                IconBtn(
-                    icon = Icons.AutoMirrored.Outlined.ArrowBack,
-                    contentDescription = "Back",
-                    onClick = onBack,
-                )
-            },
+            title = if (isNew) stringResource(R.string.new_folder) else stringResource(R.string.edit_folder),
+            leading = { BackButton(onBack) },
             trailing = {
                 RageButton(
-                    label = "Save",
+                    label = stringResource(R.string.save),
                     onClick = {
                         if (repo != null && name.isNotBlank()) {
                             scope.launch {
@@ -117,9 +113,9 @@ fun FolderEditScreen(
                                     }
                                 }
                                 if (outcome.isSuccess) {
-                                    toast(if (existing != null) "Folder updated" else "Folder created")
+                                    toast(if (existing != null) uiString(R.string.folder_updated) else uiString(R.string.folder_created))
                                 } else {
-                                    toast("Save failed: ${outcome.exceptionOrNull()?.message ?: "unknown"}")
+                                    toast(uiString(R.string.save_failed, outcome.exceptionOrNull()?.message ?: "unknown"))
                                 }
                                 onSave(FolderDraft(name, color))
                             }
@@ -159,15 +155,15 @@ fun FolderEditScreen(
                 }
             }
 
-            Field(label = "Name") {
+            Field(label = stringResource(R.string.name)) {
                 TextInput(
                     value = name,
                     onValueChange = { name = it },
-                    placeholder = "e.g. Infrastructure",
+                    placeholder = stringResource(R.string.e_g_infrastructure),
                 )
             }
 
-            Field(label = "Colour") {
+            Field(label = stringResource(R.string.colour)) {
                 ColorSwatchGrid(
                     palette = FOLDER_PALETTE,
                     selected = color,
@@ -178,15 +174,15 @@ fun FolderEditScreen(
             if (existing != null && onDelete != null) {
                 Spacer(modifier = Modifier.height(24.dp))
                 RageButton(
-                    label = "Delete folder",
+                    label = stringResource(R.string.delete_folder),
                     onClick = {
                         if (repo != null) {
                             scope.launch {
                                 val outcome = runCatching { repo.deleteFolder(existing.id) }
                                 if (outcome.isSuccess) {
-                                    toast("Folder deleted")
+                                    toast(uiString(R.string.folder_deleted))
                                 } else {
-                                    toast("Delete failed: ${outcome.exceptionOrNull()?.message ?: "unknown"}")
+                                    toast(uiString(R.string.delete_failed, outcome.exceptionOrNull()?.message ?: "unknown"))
                                 }
                                 onDelete(existing)
                             }
@@ -199,16 +195,15 @@ fun FolderEditScreen(
                     fullWidth = true,
                 )
                 Spacer(modifier = Modifier.height(8.dp))
-                val countLabel = if (existing.itemCount == 1) "item" else "items"
                 val footerText = buildAnnotatedString {
-                    append("The ${existing.itemCount} $countLabel in this folder will move to ")
+                    append(stringResource(R.string.the_in_this_folder_will_move, androidx.compose.ui.res.pluralStringResource(R.plurals.item_count, existing.itemCount, existing.itemCount)))
                     withStyle(
                         SpanStyle(
                             fontStyle = FontStyle.Italic,
                             fontWeight = FontWeight.SemiBold,
                         ),
                     ) {
-                        append("Unfiled")
+                        append(stringResource(R.string.unfiled))
                     }
                     append(".")
                 }

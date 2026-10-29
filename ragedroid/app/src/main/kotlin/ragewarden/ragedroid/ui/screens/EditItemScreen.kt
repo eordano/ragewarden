@@ -1,9 +1,10 @@
 package ragewarden.ragedroid.ui.screens
 
-import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,7 +20,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
-import androidx.compose.material.icons.outlined.QrCodeScanner
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
@@ -35,14 +35,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
-import com.journeyapps.barcodescanner.ScanContract
-import com.journeyapps.barcodescanner.ScanOptions
 import kotlinx.coroutines.launch
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.identities.StanzaTags
 import ragewarden.ragedroid.model.VaultItem
+import ragewarden.ragedroid.ui.components.buttonTarget
 import ragewarden.ragedroid.ui.components.AppBar
 import ragewarden.ragedroid.ui.components.Field
 import ragewarden.ragedroid.ui.components.IconBtn
@@ -54,7 +55,7 @@ import ragewarden.ragedroid.ui.theme.rageColors
 fun EditItemScreen(
     item: VaultItem,
     onCancel: () -> Unit,
-    onSave: (ByteArray?) -> Unit,
+    onSave: (ragewarden.ragedroid.data.ItemEdit) -> Unit,
     decryptCurrent: suspend () -> ByteArray?,
 ) {
     val c = rageColors
@@ -79,17 +80,29 @@ fun EditItemScreen(
     var name by remember(item.id) { mutableStateOf(item.name) }
     var username by remember(item.id) { mutableStateOf(item.username) }
     var newPassword by remember(item.id) { mutableStateOf("") }
-    var totp by remember(item.id) { mutableStateOf(item.totpSeed ?: "") }
-    var notes by remember(item.id) { mutableStateOf(item.notes ?: "") }
+    // A login's TOTP seed and notes may be protected too: then the field is a
+    // "new value" (blank keeps it), like the password. An unprotected one can
+    // be moved behind the tap.
+    val loginProtected = remember(item.id) { ragewarden.ragedroid.data.ItemFields.protectedFields(item).toSet() }
+    val totpProtected = "totp" in loginProtected
+    val notesProtected = "notes" in loginProtected && item.kind == ragewarden.ragedroid.model.VaultItemKind.Login
+    var protectTotpNow by remember(item.id) { mutableStateOf(false) }
+    var protectNotesNow by remember(item.id) { mutableStateOf(false) }
+    var totp by remember(item.id) { mutableStateOf(if (totpProtected) "" else item.totpSeed ?: "") }
+    var notes by remember(item.id) { mutableStateOf(if ("notes" in ragewarden.ragedroid.data.ItemFields.protectedFields(item) && item.kind == ragewarden.ragedroid.model.VaultItemKind.Login) "" else item.notes ?: "") }
     var revealedCurrent by remember(item.id) { mutableStateOf<ByteArray?>(null) }
-    var showCurrent by remember(item.id) { mutableStateOf(false) }
-
-    val qrLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
-        val contents = result.contents
-        if (!contents.isNullOrBlank()) {
-            totp = contents
+    val revealedCurrentText = remember(revealedCurrent) { revealedCurrent?.let { String(it, Charsets.UTF_8) } }
+    val isProtectedNote = item.rage && item.kind == ragewarden.ragedroid.model.VaultItemKind.Note
+    var sshFromNote by remember(item.id) { mutableStateOf<ragewarden.ragedroid.data.OpenSshKeys.Public?>(null) }
+    var migrateNote by remember(item.id) { mutableStateOf(false) }
+    val protectedNames = remember(item.id) { ragewarden.ragedroid.data.ItemFields.protectedFields(item) }
+    val typedFieldNames = remember(item.id) { typedEditFields(item) }
+    val typedValues = remember(item.id) {
+        androidx.compose.runtime.mutableStateMapOf<String, String>().apply {
+            typedFieldNames.filter { it !in protectedNames }.forEach { put(it, item.block[it] ?: "") }
         }
     }
+    var showCurrent by remember(item.id) { mutableStateOf(false) }
 
     DisposableEffect(item.id) {
         onDispose {
@@ -99,12 +112,12 @@ fun EditItemScreen(
 
     Column(modifier = Modifier.fillMaxSize().background(c.background)) {
         AppBar(
-            title = "Edit",
+            title = stringResource(R.string.edit),
             subtitle = item.site.ifBlank { item.name },
             leading = {
                 IconBtn(
                     icon = Icons.AutoMirrored.Outlined.ArrowBack,
-                    contentDescription = "Cancel",
+                    contentDescription = stringResource(R.string.cancel),
                     onClick = onCancel,
                 )
             },
@@ -112,19 +125,38 @@ fun EditItemScreen(
                 Box(
                     modifier = Modifier
                         .background(c.accent, RoundedCornerShape(6.dp))
-                        .clickable {
-                            val pt = if (newPassword.isNotEmpty()) {
-                                newPassword.toByteArray(Charsets.UTF_8)
-                            } else {
-                                null
-                            }
-                            onSave(pt)
-                            pt?.fill(0)
+                        .buttonTarget {
+                            onSave(
+                                when {
+                                    item.kind == ragewarden.ragedroid.model.VaultItemKind.Login -> {
+                                        val sealTotp = totpProtected || protectTotpNow
+                                        val sealNotes = notesProtected || protectNotesNow
+                                        ragewarden.ragedroid.data.ItemEdit(
+                                            name = name,
+                                            username = username,
+                                            totp = totp.takeUnless { sealTotp },
+                                            notes = notes.takeUnless { sealNotes },
+                                            newSecret = newPassword.takeIf { it.isNotEmpty() }?.toByteArray(Charsets.UTF_8),
+                                            secretChanges = buildMap {
+                                                if (sealTotp && totp.isNotBlank()) put("totp", totp.trim())
+                                                if (sealNotes && notes.isNotBlank()) put("notes", notes)
+                                            }.takeIf { it.isNotEmpty() },
+                                        )
+                                    }
+                                    isProtectedNote -> ragewarden.ragedroid.data.ItemEdit(
+                                        name = name,
+                                        newSecret = newPassword.takeIf { it.isNotEmpty() && !migrateNote }?.toByteArray(Charsets.UTF_8),
+                                        migrateToSsh = sshFromNote.takeIf { migrateNote },
+                                    )
+                                    else -> typedEdit(item, name, notes, typedValues, protectedNames)
+                                },
+                            )
                         }
                         .padding(horizontal = 12.dp, vertical = 6.dp),
+                    contentAlignment = Alignment.Center,
                 ) {
                     Text(
-                        text = "Save",
+                        text = stringResource(R.string.save),
                         style = RageType.button,
                         color = c.background,
                     )
@@ -138,50 +170,42 @@ fun EditItemScreen(
                 .padding(horizontal = 16.dp, vertical = 12.dp),
         ) {
             item("name") {
-                Field(label = "Name") {
+                Field(label = stringResource(R.string.name)) {
                     EditTextField(value = name, onValueChange = { name = it })
                 }
             }
-            item("username") {
-                Field(label = "Username") {
-                    EditTextField(value = username, onValueChange = { username = it })
+            if (item.kind == ragewarden.ragedroid.model.VaultItemKind.Login) {
+                item("username") {
+                    Field(label = stringResource(R.string.username)) {
+                        EditTextField(value = username, onValueChange = { username = it })
+                    }
                 }
-            }
-            item("password-current") {
-                Field(
-                    label = "Current password",
-                    hint = "Tap to reveal. Hidden by default.",
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(c.surfaceSunken, RoundedCornerShape(8.dp))
-                            .border(1.dp, c.border, RoundedCornerShape(8.dp))
-                            .padding(horizontal = 12.dp, vertical = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween,
+                item("password-current") {
+                    Field(
+                        label = stringResource(R.string.current_password),
+                        hint = stringResource(R.string.tap_to_reveal_hidden_by_default),
                     ) {
-                        val display = if (showCurrent && revealedCurrent != null) {
-                            String(revealedCurrent!!, Charsets.UTF_8)
-                        } else {
-                            "••••••••••••"
-                        }
-                        Text(
-                            text = display,
-                            style = RageType.mono.copy(color = c.fgPrimary),
-                            modifier = Modifier.weight(1f),
-                        )
-                        Icon(
-                            imageVector = if (showCurrent) {
-                                Icons.Outlined.VisibilityOff
-                            } else {
-                                Icons.Outlined.Visibility
-                            },
-                            contentDescription = "Reveal",
-                            tint = c.fgPrimary,
+                        Row(
                             modifier = Modifier
-                                .size(18.dp)
-                                .clickable {
+                                .fillMaxWidth()
+                                .background(c.surfaceSunken, RoundedCornerShape(8.dp))
+                                .border(1.dp, c.border, RoundedCornerShape(8.dp))
+                                .padding(horizontal = 12.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            val display = if (showCurrent && revealedCurrentText != null) {
+                                revealedCurrentText
+                            } else {
+                                "••••••••••••"
+                            }
+                            Text(
+                                text = display,
+                                style = RageType.mono.copy(color = c.fgPrimary),
+                                modifier = Modifier.weight(1f),
+                            )
+                            Box(
+                                modifier = Modifier.buttonTarget {
                                     if (showCurrent) {
                                         revealedCurrent?.fill(0)
                                         revealedCurrent = null
@@ -197,101 +221,156 @@ fun EditItemScreen(
                                         }
                                     }
                                 },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    imageVector = if (showCurrent) {
+                                        Icons.Outlined.VisibilityOff
+                                    } else {
+                                        Icons.Outlined.Visibility
+                                    },
+                                    contentDescription = stringResource(R.string.reveal),
+                                    tint = c.fgPrimary,
+                                    modifier = Modifier.size(18.dp),
+                                )
+                            }
+                        }
+                    }
+                }
+                item("password-new") {
+                    Field(
+                        label = stringResource(R.string.new_password),
+                        hint = stringResource(R.string.leave_blank_to_keep_the_current),
+                    ) {
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Box(modifier = Modifier.weight(1f)) {
+                                EditTextField(
+                                    value = newPassword,
+                                    onValueChange = { newPassword = it },
+                                    password = true,
+                                    placeholder = stringResource(R.string.type_or_generate),
+                                )
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .background(c.surface, RoundedCornerShape(8.dp))
+                                    .border(1.dp, c.border, RoundedCornerShape(8.dp))
+                                    .buttonTarget {
+                                        newPassword = generateRandomPassword()
+                                    }
+                                    .padding(horizontal = 12.dp, vertical = 12.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Outlined.Refresh,
+                                        contentDescription = null,
+                                        tint = c.fgPrimary,
+                                        modifier = Modifier.size(14.dp),
+                                    )
+                                    Text(
+                                        text = stringResource(R.string.gen),
+                                        style = RageType.button,
+                                        color = c.fgPrimary,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+                item("totp") {
+                    Field(
+                        label = if (totpProtected) stringResource(R.string.new_totp_seed_protected) else stringResource(R.string.totp_seed),
+                        hint = if (totpProtected) stringResource(R.string.blank_keeps_it) else stringResource(R.string.optional_either_an_otpauth_uri_or),
+                    ) {
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Box(modifier = Modifier.weight(1f)) {
+                                EditTextField(value = totp, onValueChange = { totp = it }, mono = true)
+                            }
+                            ragewarden.ragedroid.ui.components.TotpScanButton(onScanned = { totp = it })
+                        }
+                    }
+                }
+            } else if (isProtectedNote) {
+                item("note-current") {
+                    Field(label = stringResource(R.string.current_note), hint = stringResource(R.string.opening_it_costs_a_tap)) {
+                        val shown = revealedCurrent
+                        if (shown == null) {
+                            ragewarden.ragedroid.ui.components.RageButton(
+                                label = stringResource(R.string.open_note),
+                                onClick = {
+                                    scope.launch {
+                                        val pt = decryptCurrent()
+                                        if (pt != null) {
+                                            revealedCurrent?.fill(0)
+                                            revealedCurrent = pt
+                                            sshFromNote = ragewarden.ragedroid.data.SecretText.withChars(pt) { ragewarden.ragedroid.data.OpenSshKeys.publicOf(it) }
+                                            migrateNote = sshFromNote != null
+                                        }
+                                    }
+                                },
+                                fullWidth = true,
+                            )
+                        } else {
+                            Text(text = revealedCurrentText.orEmpty(), style = RageType.mono.copy(color = c.fgPrimary))
+                        }
+                    }
+                }
+                if (sshFromNote != null) {
+                    item("note-migrate") {
+                        Field(
+                            label = stringResource(R.string.this_note_is_an_ssh_key),
+                            hint = stringResource(R.string.save_it_as_an_ssh_key),
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                androidx.compose.material3.Switch(checked = migrateNote, onCheckedChange = { migrateNote = it })
+                                Text(
+                                    text = if (migrateNote) stringResource(R.string.save_as_an_ssh_key) else stringResource(R.string.keep_as_a_note),
+                                    style = RageType.body,
+                                    color = c.fgPrimary,
+                                    modifier = Modifier.padding(start = 10.dp),
+                                )
+                            }
+                        }
+                    }
+                }
+                if (!migrateNote) {
+                    item("note-new") {
+                        Field(label = stringResource(R.string.new_note), hint = stringResource(R.string.leave_blank_to_keep_the_current_2)) {
+                            EditTextField(value = newPassword, onValueChange = { newPassword = it }, minLines = 3)
+                        }
+                    }
+                }
+            } else {
+                items(typedFieldNames, key = { "field-$it" }) { field ->
+                    val isProtected = field in protectedNames
+                    Field(
+                        label = if (isProtected) stringResource(R.string.new_, ragewarden.ragedroid.data.ItemFields.label(field).lowercase()) else ragewarden.ragedroid.data.ItemFields.label(field),
+                        hint = if (isProtected) stringResource(R.string.protected_leave_blank_to_keep_it) else null,
+                    ) {
+                        EditTextField(
+                            value = typedValues[field] ?: "",
+                            onValueChange = { typedValues[field] = it },
+                            password = isProtected,
+                            mono = field != "cardholderName",
+                            minLines = if (field == "privateKey") 4 else 1,
                         )
                     }
                 }
             }
-            item("password-new") {
-                Field(
-                    label = "New password",
-                    hint = "Leave blank to keep the current password.",
-                ) {
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Box(modifier = Modifier.weight(1f)) {
-                            EditTextField(
-                                value = newPassword,
-                                onValueChange = { newPassword = it },
-                                password = true,
-                                placeholder = "type or generate...",
-                            )
-                        }
-                        Box(
-                            modifier = Modifier
-                                .background(c.surface, RoundedCornerShape(8.dp))
-                                .border(1.dp, c.border, RoundedCornerShape(8.dp))
-                                .clickable {
-                                    newPassword = generateRandomPassword()
-                                }
-                                .padding(horizontal = 12.dp, vertical = 12.dp),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Outlined.Refresh,
-                                    contentDescription = null,
-                                    tint = c.fgPrimary,
-                                    modifier = Modifier.size(14.dp),
-                                )
-                                Text(
-                                    text = "Gen",
-                                    style = RageType.button,
-                                    color = c.fgPrimary,
-                                )
-                            }
-                        }
-                    }
+            if (item.rage && item.kind == ragewarden.ragedroid.model.VaultItemKind.Login && !totpProtected) {
+                item("protect-totp") {
+                    EditProtectRow(stringResource(R.string.protect_the_totp_seed), protectTotpNow) { protectTotpNow = it }
                 }
             }
-            item("totp") {
+            if (!isProtectedNote) item("notes") {
                 Field(
-                    label = "TOTP seed",
-                    hint = "Optional. Either an `otpauth://` URI or a base32 secret.",
+                    label = if (notesProtected) stringResource(R.string.new_notes_protected) else stringResource(R.string.notes),
+                    hint = if (notesProtected) stringResource(R.string.blank_keeps_it) else null,
                 ) {
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Box(modifier = Modifier.weight(1f)) {
-                            EditTextField(value = totp, onValueChange = { totp = it }, mono = true)
-                        }
-                        Box(
-                            modifier = Modifier
-                                .background(c.surface, RoundedCornerShape(8.dp))
-                                .border(1.dp, c.border, RoundedCornerShape(8.dp))
-                                .clickable {
-                                    val options = ScanOptions().apply {
-                                        setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-                                        setPrompt("Scan TOTP QR code")
-                                        setBeepEnabled(false)
-                                        setOrientationLocked(false)
-                                    }
-                                    qrLauncher.launch(options)
-                                }
-                                .padding(horizontal = 12.dp, vertical = 12.dp),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Outlined.QrCodeScanner,
-                                    contentDescription = null,
-                                    tint = c.fgPrimary,
-                                    modifier = Modifier.size(14.dp),
-                                )
-                                Text(
-                                    text = "Scan",
-                                    style = RageType.button,
-                                    color = c.fgPrimary,
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-            item("notes") {
-                Field(label = "Notes") {
                     EditTextField(
                         value = notes,
                         onValueChange = { notes = it },
@@ -299,17 +378,19 @@ fun EditItemScreen(
                     )
                 }
             }
+            if (item.rage && item.kind == ragewarden.ragedroid.model.VaultItemKind.Login && !notesProtected) {
+                item("protect-notes") {
+                    EditProtectRow(stringResource(R.string.protect_the_notes), protectNotesNow) { protectNotesNow = it }
+                }
+            }
             if (item.rage) {
                 item("recipients") {
                     Field(
-                        label = "Recipients · view only",
+                        label = stringResource(R.string.recipients_view_only),
                         hint = if (anonymousRecipientCount > 0) {
-                            "Any one of these can decrypt. $anonymousRecipientCount software or " +
-                                "paper recipient(s) are also wrapped in -- age headers do not name " +
-                                "those, so they cannot be listed. Editing the recipient set lands " +
-                                "with multi-recipient encrypt."
+                            stringResource(R.string.any_one_of_these_can_open, anonymousRecipientCount)
                         } else {
-                            "Any one of these can decrypt. Editing the recipient set lands with multi-recipient encrypt."
+                            stringResource(R.string.any_one_of_these_can_decrypt_2)
                         },
                     ) {
                         Column(
@@ -408,4 +489,54 @@ private fun generateRandomPassword(): String {
         "0123456789!@#$%^&*()-_=+").toCharArray()
     val rng = java.security.SecureRandom()
     return (1..24).map { charset[rng.nextInt(charset.size)] }.joinToString("")
+}
+
+
+/** The fields the edit form offers for a card, identity or SSH key. */
+internal fun typedEditFields(item: VaultItem): List<String> = when (item.kind) {
+    ragewarden.ragedroid.model.VaultItemKind.Card -> ragewarden.ragedroid.data.ItemFields.CARD
+    ragewarden.ragedroid.model.VaultItemKind.Identity -> listOf("firstName", "lastName", "email", "phone", "ssn", "passportNumber", "licenseNumber")
+    ragewarden.ragedroid.model.VaultItemKind.SshKey -> listOf("privateKey") +
+        listOf("passphrase").filter { it in ragewarden.ragedroid.data.ItemFields.protectedFields(item) }
+    else -> emptyList()
+}
+
+/**
+ * Splits the form into changed outer fields and new protected values. A new
+ * SSH private key brings its public key and fingerprint with it.
+ */
+internal fun typedEdit(
+    item: VaultItem,
+    name: String,
+    notes: String,
+    values: Map<String, String>,
+    protectedNames: List<String>,
+): ragewarden.ragedroid.data.ItemEdit {
+    val secrets = values.filterKeys { it in protectedNames }.filterValues { it.isNotEmpty() }
+    val outer = values.filterKeys { it !in protectedNames }.toMutableMap()
+    val newKey = secrets["privateKey"] ?: outer["privateKey"]?.takeIf { it != (item.block["privateKey"] ?: "") }
+    newKey?.let(ragewarden.ragedroid.data.OpenSshKeys::publicOf)?.let { pub ->
+        outer["publicKey"] = pub.publicKey
+        outer["keyFingerprint"] = pub.fingerprint
+    }
+    return ragewarden.ragedroid.data.ItemEdit(
+        name = name,
+        notes = notes,
+        block = outer,
+        secretChanges = secrets.takeIf { it.isNotEmpty() },
+    )
+}
+
+@Composable
+private fun EditProtectRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .toggleable(value = checked, role = androidx.compose.ui.semantics.Role.Checkbox, onValueChange = onChange),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        androidx.compose.material3.Checkbox(checked = checked, onCheckedChange = null)
+        Text(text = label, style = RageType.caption, color = rageColors.fgPrimary, modifier = Modifier.padding(start = 12.dp))
+    }
 }

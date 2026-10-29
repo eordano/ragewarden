@@ -2,8 +2,7 @@
  * The Ragewarden popup.
  *
  * Everything on screen here comes from `window.RagewardenVault` (the glue in
- * ../glue/) or from the snapshot the glue publishes on `window.VAULT`,
- * `window.ITEMS_BY_KIND` and `window.FOLDERS`. There is no sample data in this
+ * ../glue/), including the decrypted item list (`items()`, `folders()`). There is no sample data in this
  * directory and no code path that substitutes a placeholder when a bridge call
  * fails: a failure is shown as a failure.
  *
@@ -15,22 +14,11 @@ import {
     banner, button, clear, createToaster, errorText, eyebrow, field, h,
     initials, relTime, row, sheet, textInput,
 } from './ui.js';
-import { writeClipboard, clearClipboardSync } from '../glue/clipboard.js';
-
-/*
- * A pending clipboard wipe has to survive the screen that scheduled it, and
- * cannot survive the popup itself. Chromium builds open as a side panel and do
- * keep running; Firefox and Safari open a `default_popup` that closes on any
- * outside click, taking its timers with it. This flag lets the one `pagehide`
- * listener below make the last synchronous attempt available on the way out.
- */
-let clipboardHoldsSecret = false;
-
-window.addEventListener('pagehide', () => {
-    if (!clipboardHoldsSecret) return;
-    clipboardHoldsSecret = false;
-    try { clearClipboardSync(); } catch {}
-});
+import { writeClipboard } from '../glue/clipboard.js';
+import { siteMatchesOrigin } from '../glue/origin-match.js';
+import { pickDistinct } from './random.js';
+import { requestServerPermission } from '../glue/host-permission.js';
+import { ITEM_KINDS, fieldLabel, isTypedKind, primaryField } from '../glue/item-types.js';
 
 const screenEl = document.getElementById('screen');
 const toast = createToaster(document.getElementById('toasts'));
@@ -73,17 +61,13 @@ function go(route, payload = null) {
     render();
 }
 
-function logins() {
-    return Array.isArray(window.VAULT) ? window.VAULT : [];
-}
-function otherItems() {
-    return Array.isArray(window.ITEMS_BY_KIND) ? window.ITEMS_BY_KIND : [];
-}
 function allItems() {
-    return [...logins().map(i => ({ ...i, kind: 'login' })), ...otherItems()];
+    const b = bridge();
+    return (b && typeof b.items === 'function') ? b.items() : [];
 }
 function folders() {
-    return Array.isArray(window.FOLDERS) ? window.FOLDERS : [];
+    const b = bridge();
+    return (b && typeof b.folders === 'function') ? b.folders() : [];
 }
 function itemById(id) {
     return allItems().find(i => i.id === id) || null;
@@ -138,7 +122,7 @@ function requireMasterPassword({ title, body: prose, action = 'Confirm' }) {
             confirmBtn.textContent = 'Checking...';
             try {
                 const ok = await verify(input.value);
-                if (ok !== true) throw new Error('the server did not confirm this password');
+                if (ok !== true) throw new Error('wrong master password');
                 finish(true);
                 s.close();
             } catch (err) {
@@ -156,7 +140,7 @@ function requireMasterPassword({ title, body: prose, action = 'Confirm' }) {
                 prose ? h('p', { class: 'prose', text: prose }) : null,
                 field('Master password', input),
                 status,
-                h('div', { class: 'hint', text: 'Checked against your Bitwarden server. Requires connectivity.' })),
+                h('div', { class: 'hint', text: 'Checked on this device; no network needed.' })),
             actions: [
                 button('Cancel', () => { finish(false); s.close(); }, { variant: 'ghost' }),
                 confirmBtn,
@@ -216,27 +200,27 @@ function bootScreen() {
 
 function lockScreen() {
     const email = app.init.result?.email || bridge()?.status?.().email || '';
+    const legacy = !!app.init.result?.legacy;
     const input = textInput({ type: 'password', placeholder: 'Master password', mono: true });
     const status = h('div', { class: 'hint hint-danger' });
 
     const unlock = button('Unlock', async () => {
         status.textContent = '';
-        let verify;
+        let doUnlock;
         try {
-            verify = need('verifyMasterPassword');
+            doUnlock = need('unlock');
         } catch (err) {
             status.textContent = errorText(err);
-            toast.error(errorText(err));
             return;
         }
         if (!input.value) { status.textContent = 'Enter your master password.'; return; }
         unlock.disabled = true;
-        unlock.textContent = 'Checking...';
+        unlock.textContent = 'Unlocking...';
         try {
-            const ok = await verify(input.value);
-            if (ok !== true) throw new Error('the server did not confirm this password');
+            const r = await doUnlock(input.value);
             input.value = '';
             app.unlocked = true;
+            if (r && r.offline) toast.warn(`Unlocked, but the vault could not be fetched: ${r.offline}`);
             go('vault');
         } catch (err) {
             status.textContent = errorText(err);
@@ -255,9 +239,12 @@ function lockScreen() {
     const node = h('div', { class: 'centered' },
         mock,
         h('div', { class: 'brand', text: 'Ragewarden' }),
-        h('div', { class: 'muted', text: email ? `Signed in as ${email}` : 'Signed in' }),
+        h('div', { class: 'muted', text: email ? `Locked · ${email}` : 'Locked' }),
         field('Master password', input),
         status,
+        legacy
+            ? h('div', { class: 'hint', text: 'This one unlock is checked with your server; later unlocks work offline.' })
+            : h('div', { class: 'hint', text: 'Unlocks on this device; no network needed.' }),
         unlock,
         button('Sign out', async () => {
             try {
@@ -267,6 +254,20 @@ function lockScreen() {
         }, { variant: 'ghost', full: true }));
     setTimeout(() => input.focus(), 0);
     return node;
+}
+
+/**
+ * What the next tap authorizes, on screen before the authenticator is asked:
+ * the action, the item and where the secret goes. A mock build says so on the
+ * same line.
+ */
+function ceremonyBlock(action, item, destination) {
+    const mock = !!bridge()?.hardware?.isMock?.();
+    return h('div', { class: 'ceremony', role: 'status', 'aria-live': 'polite' },
+        h('div', { class: 'ceremony-action', text: `${action} ${item.name || '(unnamed)'}` }),
+        h('div', { class: 'ceremony-dest mono', text: `to ${destination}` }),
+        h('div', { class: 'muted', text: `${mock ? 'MOCK TAP -- no device is touched. ' : ''}`
+            + 'Tap your key to authorize exactly this.' }));
 }
 
 function vaultScreen() {
@@ -295,11 +296,29 @@ function vaultScreen() {
                 : 'No items match.' }));
             return;
         }
-        for (const it of rows) host.appendChild(vaultRow(it));
+        const scoped = !qq && !app.folder && app.tabOrigin
+            ? rows.filter(it => siteMatchesOrigin(it.site, app.tabOrigin)) : [];
+        if (scoped.length > 0) {
+            host.appendChild(eyebrow(`For this site · ${app.tabHost}`));
+            for (const it of scoped) host.appendChild(vaultRow(it));
+            host.appendChild(eyebrow('All items'));
+        }
+        for (const it of rows) if (!scoped.includes(it)) host.appendChild(vaultRow(it));
     }
 
     const list = h('div', { class: 'list', id: 'vault-list' });
     renderList(list);
+    if (app.tabOrigin === undefined) {
+        app.tabOrigin = null;
+        activeTab().then((tab) => {
+            if (!tab || !/^https?:/.test(tab.url || '')) return;
+            const url = new URL(tab.url);
+            app.tabOrigin = url.origin;
+            app.tabHost = url.hostname;
+            const host = document.getElementById('vault-list');
+            if (host) renderList(host);
+        }).catch(() => {});
+    }
 
     const chips = h('div', { class: 'chips' },
         chip('All', app.folder === null, () => { app.folder = null; render(); }),
@@ -320,6 +339,16 @@ function vaultScreen() {
                 button('⚙', () => go('settings'), { variant: 'icon', title: 'Settings' }),
             ],
         }),
+        app.init.hostPermissionMissing
+            ? h('div', { class: 'pad-x' }, banner('warning',
+                'Ragewarden cannot reach your server',
+                `Allow access to ${app.init.hostPermissionMissing} so the vault can sync.`,
+                { label: 'Allow', onClick: () => {
+                    requestServerPermission(app.init.hostPermissionMissing)
+                        .then(() => location.reload())
+                        .catch(err => toast.error(errorText(err)));
+                } }))
+            : null,
         h('div', { class: 'pad-x' }, search),
         chips,
         unprotected.length > 0
@@ -344,8 +373,10 @@ function vaultRow(it) {
         h('div', { class: 'avatar', text: initials(it.name) }),
         h('div', { class: 'vrow-main' },
             h('div', { class: 'vrow-name', text: it.name || '(unnamed)' }),
-            h('div', { class: 'vrow-sub', text: [it.username, it.site].filter(Boolean).join(' · ') || (it.kind || '') })),
-        it.rage ? null : h('span', { class: 'tag', text: 'plain' }));
+            h('div', { class: 'vrow-sub', text: [it.username, it.site].filter(Boolean).join(' · ')
+                || ((ITEM_KINDS[it.kind] && ITEM_KINDS[it.kind].label) || it.kind || '') })),
+        it.rage ? null : h('span', { class: 'tag', text: 'plain' }),
+        it.legacyWrap ? h('span', { class: 'tag', text: 're-save' }) : null);
 }
 
 function detailScreen(id) {
@@ -356,163 +387,252 @@ function detailScreen(id) {
             body(banner('danger', 'Gone', 'This item is no longer in the vault snapshot.')));
     }
 
-    const secretHost = h('div', { class: 'secret-host' });
-    let clearTimer = null;
-    let tickTimer = null;
+    const stoppers = [];
+    const stopAll = () => { for (const stop of stoppers) stop(); };
 
-    /**
-     * Stop the cosmetic countdown only.
-     *
-     * `clearTimer` is the 30-second clipboard wipe and is deliberately NOT
-     * cancelled here. Navigating away from the item does not un-copy the
-     * password, so the wipe has to outlive the screen that scheduled it; the
-     * old `stopTimers()` cancelled both, which meant leaving the detail screen
-     * after a Copy left the password on the clipboard indefinitely.
+    /*
+     * One secret field: Reveal, Copy (and Autofill for a login's password) each
+     * run their own ceremony for exactly this field, and a revealed value hides
+     * itself. A card or an SSH key has several of these on one screen.
      */
-    function stopTicker() {
-        if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
-    }
+    function secretField(fieldName, label, opts = {}) {
+        const secretHost = h('div', { class: 'secret-host' });
+        let tickTimer = null;
 
-    /** Both timers -- only for paths that have already wiped the clipboard. */
-    function stopTimers() {
-        if (clearTimer) { clearTimeout(clearTimer); clearTimer = null; }
-        stopTicker();
-    }
-
-    function idleSecret() {
-        stopTicker();
-        clear(secretHost);
-        secretHost.appendChild(h('div', { class: 'secret-idle' },
-            h('span', { class: 'mono dim', text: '••••••••••••' })));
-    }
-
-    async function doReveal() {
-        clear(secretHost);
-        secretHost.appendChild(h('div', { class: 'muted', text: 'Waiting for your hardware tap...' }));
-        let value;
-        try {
-            value = await need('revealPassword')(item.id, 'password');
-        } catch (err) {
-            toast.error(`Reveal: ${errorText(err)}`);
-            idleSecret();
-            return;
+        function stopTicker() {
+            if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
         }
-        let left = 10;
-        const countdown = h('span', { class: 'mono dim', text: `hides in ${left}s` });
-        const shown = h('div', { class: 'secret-value mono', text: value });
-        clear(secretHost);
-        secretHost.appendChild(h('div', { class: 'secret-open' },
-            shown,
-            row(
-                button('Copy', async () => {
-                    try {
-                        await writeClipboard(value);
-                        toast.ok('Copied to the clipboard.');
-                    } catch (err) { toast.error(`Copy: ${errorText(err)}`); }
-                }, {}),
-                button('Hide', () => { value = ''; idleSecret(); }, { variant: 'ghost' }),
-                countdown)));
-        tickTimer = setInterval(() => {
-            left -= 1;
-            countdown.textContent = `hides in ${left}s`;
-            if (left <= 0) { value = ''; idleSecret(); }
-        }, 1000);
-    }
 
-    async function doCopy() {
-        clear(secretHost);
-        secretHost.appendChild(h('div', { class: 'muted', text: 'Waiting for your hardware tap...' }));
-        let res;
-        try {
-            res = await need('copyPassword')(item.id);
-        } catch (err) {
-            toast.error(`Copy: ${errorText(err)}`);
-            idleSecret();
-            return;
+        function idleSecret() {
+            stopTicker();
+            clear(secretHost);
+            secretHost.appendChild(h('div', { class: 'secret-idle' },
+                h('span', { class: 'mono dim', text: '••••••••••••' })));
         }
-        toast.ok(`Copied ${res && res.chars ? `${res.chars} characters` : 'the password'} to the clipboard.`);
-        clipboardHoldsSecret = true;
-        let left = 30;
-        const label = h('span', { class: 'mono dim', text: `clipboard cleared in ${left}s` });
-        clear(secretHost);
-        secretHost.appendChild(h('div', { class: 'secret-open' },
-            h('div', { class: 'muted', text: 'The password is on your clipboard. It was never rendered here.' }),
-            row(button('Clear now', async () => {
-                stopTimers();
-                clipboardHoldsSecret = false;
-                await bridge()?.clearClipboard?.();
-                toast.info('Clipboard overwritten.');
+
+        async function doReveal() {
+            clear(secretHost);
+            secretHost.appendChild(ceremonyBlock('Reveal', item, 'this screen'));
+            let value;
+            try {
+                value = await need('revealPassword')(item.id, fieldName);
+            } catch (err) {
+                toast.error(`Reveal: ${errorText(err)}`);
                 idleSecret();
-            }, {}), label)));
-        tickTimer = setInterval(() => {
-            left -= 1;
-            label.textContent = `clipboard cleared in ${left}s`;
-        }, 1000);
-        clearTimer = setTimeout(async () => {
-            stopTimers();
-            clipboardHoldsSecret = false;
-            const ok = await bridge()?.clearClipboard?.();
-            if (ok) toast.info('Clipboard overwritten.');
-            else toast.warn('Could not overwrite the clipboard -- clear it yourself.');
-            idleSecret();
-        }, 30_000);
+                return;
+            }
+            let left = 10;
+            const countdown = h('span', { class: 'mono dim', text: `hides in ${left}s` });
+            const shown = h('div', { class: 'secret-value mono', text: value });
+            clear(secretHost);
+            secretHost.appendChild(h('div', { class: 'secret-open' },
+                shown,
+                row(
+                    button('Copy', async () => {
+                        try {
+                            await need('copySecret')(value);
+                            toast.ok('Copied. The clipboard is cleared in 30 seconds.');
+                        } catch (err) { toast.error(`Copy: ${errorText(err)}`); }
+                    }, {}),
+                    button('Hide', () => { value = ''; idleSecret(); }, { variant: 'ghost' }),
+                    countdown)));
+            tickTimer = setInterval(() => {
+                left -= 1;
+                countdown.textContent = `hides in ${left}s`;
+                if (left <= 0) { value = ''; idleSecret(); }
+            }, 1000);
+        }
+
+        async function doCopy() {
+            clear(secretHost);
+            secretHost.appendChild(ceremonyBlock('Copy', item, 'the clipboard'));
+            let res;
+            try {
+                res = await need('copyPassword')(item.id, fieldName);
+            } catch (err) {
+                toast.error(`Copy: ${errorText(err)}`);
+                idleSecret();
+                return;
+            }
+            toast.ok(`Copied ${res && res.chars ? `${res.chars} characters` : `the ${label.toLowerCase()}`} to the clipboard.`);
+            const clearAt = (res && res.clearAt) || (Date.now() + 30_000);
+            const label = h('span', { class: 'mono dim' });
+            const paint = () => {
+                const left = Math.max(0, Math.round((clearAt - Date.now()) / 1000));
+                label.textContent = left > 0 ? `clipboard cleared in ${left}s` : 'clipboard cleared';
+                if (left <= 0) idleSecret();
+            };
+            clear(secretHost);
+            secretHost.appendChild(h('div', { class: 'secret-open' },
+                h('div', { class: 'muted', text: `The ${label.toLowerCase()} is on your clipboard. It was never rendered here.` }),
+                row(button('Clear now', async () => {
+                    stopTicker();
+                    await bridge()?.clearClipboard?.();
+                    toast.info('Clipboard overwritten.');
+                    idleSecret();
+                }, {}), label)));
+            paint();
+            tickTimer = setInterval(paint, 1000);
+        }
+
+        async function doAutofill() {
+            let tab = null;
+            try {
+                tab = await activeTab();
+            } catch (err) {
+                toast.error(`Autofill: ${errorText(err)}`);
+                return;
+            }
+            let origin = '';
+            try { origin = new URL(tab && tab.url).origin; } catch { origin = ''; }
+            if (!tab || !origin || origin === 'null') {
+                toast.error('Autofill: the active tab has no web origin to fill.');
+                return;
+            }
+            if (!siteMatchesOrigin(item.site, origin)) {
+                const ok = await confirmAction({
+                    title: 'Fill into a different site?',
+                    body: item.site
+                        ? `"${item.name}" is saved for ${item.site}. The active tab is ${origin}. `
+                          + 'Filling it there sends this password to a site it was not saved for.'
+                        : `"${item.name}" has no site saved. The active tab is ${origin}.`,
+                    action: `Fill ${new URL(origin).host}`,
+                });
+                if (!ok) return;
+            }
+            clear(secretHost);
+            secretHost.appendChild(ceremonyBlock('Autofill', item, origin));
+            let value;
+            try {
+                value = await need('autofillPassword')(item.id, origin);
+            } catch (err) {
+                toast.error(`Autofill: ${errorText(err)}`);
+                idleSecret();
+                return;
+            }
+            try {
+                const resp = await sendToTab(tab.id, {
+                    kind: 'ragewarden.fill',
+                    expectedOrigin: origin,
+                    username: item.username || '',
+                    password: value,
+                });
+                if (!resp || !resp.ok) throw new Error((resp && resp.error) || 'the page did not accept the fill');
+                toast.ok(`Filled ${resp.host || origin}.`);
+            } catch (err) {
+                toast.error(`Autofill: ${errorText(err)}`);
+            } finally {
+                value = '';
+                idleSecret();
+            }
+        }
+
+        idleSecret();
+        stoppers.push(stopTicker);
+        return field(label, h('div', { 'data-field': fieldName },
+            secretHost,
+            row(
+                opts.autofill ? button('Autofill', doAutofill, { variant: 'primary' }) : null,
+                button('Copy', doCopy),
+                button('Reveal', doReveal),
+                item.protectedFields.includes(fieldName) ? h('span', { class: 'tag', text: 'protected' }) : null)));
     }
 
-    async function doAutofill() {
-        let tab = null;
-        try {
-            tab = await activeTab();
-        } catch (err) {
-            toast.error(`Autofill: ${errorText(err)}`);
-            return;
-        }
-        if (!tab) {
-            toast.error('Autofill: no active tab to fill.');
-            return;
-        }
-        let host = '';
-        try { host = new URL(tab.url).host; } catch { host = ''; }
-        clear(secretHost);
-        secretHost.appendChild(h('div', { class: 'muted', text: `Waiting for your hardware tap to fill ${host || 'the active tab'}...` }));
-        let value;
-        try {
-            value = await need('autofillPassword')(item.id, host || item.site || '');
-        } catch (err) {
-            toast.error(`Autofill: ${errorText(err)}`);
-            idleSecret();
-            return;
-        }
-        try {
-            const resp = await sendToTab(tab.id, {
-                kind: 'ragewarden.fill',
-                username: item.username || '',
-                password: value,
-            });
-            if (!resp || !resp.ok) throw new Error((resp && resp.error) || 'the page did not accept the fill');
-            toast.ok(`Filled ${resp.host || host}.`);
-        } catch (err) {
-            toast.error(`Autofill: ${errorText(err)}`);
-        } finally {
-            value = '';
-            idleSecret();
-        }
+    function plainReadout(label, value, opts = {}) {
+        return field(label, h('div', { class: 'readout' },
+            h('span', { class: opts.wrap ? 'mono wrap' : 'mono', text: value }),
+            button('Copy', async () => {
+                try {
+                    await writeClipboard(value);
+                    toast.ok(`${label} copied.`);
+                } catch (err) { toast.error(`Copy: ${errorText(err)}`); }
+            }, { variant: 'ghost' })));
     }
 
-    idleSecret();
+    /* A card, identity or SSH key: descriptive fields read with no tap, secrets behind a ceremony. */
+    function typedFields() {
+        const spec = ITEM_KINDS[item.kind];
+        const host = h('div', { class: 'col' });
+        const plainHosts = new Map();
+        for (const f of spec.fields) {
+            if (f.secret || item.protectedFields.includes(f.name)) {
+                host.appendChild(secretField(f.name, f.label));
+            } else {
+                const slot = h('div', {});
+                plainHosts.set(f.name, slot);
+                host.appendChild(slot);
+            }
+        }
+        need('itemDetails')(item.id).then((values) => {
+            for (const f of spec.fields) {
+                const slot = plainHosts.get(f.name);
+                if (slot && values && values[f.name]) slot.appendChild(plainReadout(f.label, values[f.name], { wrap: !!f.multiline }));
+            }
+        }).catch(err => toast.error(`Details: ${errorText(err)}`));
+        return host;
+    }
+
+    /* Protected fields this screen does not lay out itself (written by another client). */
+    function otherProtected(shown) {
+        return item.protectedFields
+            .filter(n => !shown.includes(n))
+            .map(n => secretField(n, fieldLabel(item.kind, n)));
+    }
 
     const historyHost = h('div', { class: 'list-sub' });
     loadHistory(item.id, historyHost);
 
+    const totpHost = h('div', {});
+    let totpTimer = null;
+    const idleTotp = () => {
+        if (totpTimer) { clearInterval(totpTimer); totpTimer = null; }
+        clear(totpHost);
+    };
+    async function doTotp() {
+        idleTotp();
+        totpHost.appendChild(ceremonyBlock('Show the TOTP code of', item, 'this screen'));
+        let res;
+        try {
+            res = await need('totpCode')(item.id);
+        } catch (err) {
+            toast.error(`TOTP: ${errorText(err)}`);
+            idleTotp();
+            return;
+        }
+        let left = Math.max(1, Math.round(res.secondsRemaining || 0));
+        const countdown = h('span', { class: 'mono dim', text: `${left}s` });
+        clear(totpHost);
+        totpHost.appendChild(h('div', { class: 'secret-open' },
+            h('div', { class: 'secret-value mono totp-code', text: res.code }), countdown));
+        totpTimer = setInterval(() => {
+            left -= 1;
+            countdown.textContent = `${left}s`;
+            if (left <= 0) idleTotp();
+        }, 1000);
+    }
+
     return h('div', { class: 'col' },
         appBar(item.name || '(unnamed)', item.site || item.folder || '', {
-            back: () => { stopTicker(); go('vault'); },
-            // stopTicker here too: leaving via Edit used to leave the reveal
+            back: () => { stopAll(); idleTotp(); go('vault'); },
+            // stopAll here too: leaving via Edit used to leave the reveal
             // countdown ticking against a detached node, so a later render
             // could be clobbered by a timer belonging to a screen that is gone.
-            actions: [button('✎', () => { stopTicker(); go('edit', { id: item.id }); },
+            actions: [button('✎', () => { stopAll(); go('edit', { id: item.id }); },
                 { variant: 'icon', title: 'Edit' })],
         }),
         body(
+            item.legacyWrap
+                ? banner('warning', 'Older wrapping',
+                    'This item was wrapped before every secret got its own salt. Re-save it to wrap '
+                    + 'it again in the current format (one tap to open it, one to write it).',
+                    { label: 'Re-save', onClick: async () => {
+                        try {
+                            await guard('Re-save', need('rotateCipher')(item.id));
+                            toast.ok('Re-saved in the current format.');
+                            render();
+                        } catch {}
+                    } })
+                : null,
             item.rage
                 ? banner('success', 'Hardware-protected', 'Each use needs a fresh tap on an enrolled authenticator.')
                 : banner('warning', 'Not hardware-protected',
@@ -528,12 +648,17 @@ function detailScreen(id) {
                         } catch (err) { toast.error(`Copy: ${errorText(err)}`); }
                     }, { variant: 'ghost' })))
                 : null,
-            field('Password', h('div', {},
-                secretHost,
-                row(
-                    button('Autofill', doAutofill, { variant: 'primary' }),
-                    button('Copy', doCopy),
-                    button('Reveal', doReveal)))),
+            ...(isTypedKind(item.kind)
+                ? [typedFields(), ...otherProtected(ITEM_KINDS[item.kind].fields.map(f => f.name))]
+                // A note's body is its secret (how rageterm stores one), so it
+                // reads, fills and yields a TOTP code like a login's password.
+                : [
+                    secretField(primaryField(item.kind), 'Password', { autofill: true }),
+                    ...otherProtected([primaryField(item.kind), 'totp']),
+                    field('One-time code', h('div', {},
+                        totpHost,
+                        row(button('Show TOTP code', doTotp, { variant: item.hasTotp ? 'primary' : 'secondary' })))),
+                ]),
             item.site
                 ? field('Site', h('div', { class: 'readout' },
                     h('span', { class: 'mono', text: item.site }),
@@ -584,10 +709,10 @@ async function loadHistory(id, host) {
         return;
     }
     for (const e of entries.slice(0, 20)) {
-        host.appendChild(h('div', { class: 'srow' },
+        const tags = Array.isArray(e.stanzaTags) && e.stanzaTags.length ? ` · ${e.stanzaTags.join(', ')}` : '';
+        host.appendChild(h('div', { class: 'srow', 'data-history': e.deleted ? 'deletion' : 'revision' },
             h('span', { class: 'mono dim', text: relTime(e.recordedAt) }),
-            h('span', { text: Array.isArray(e.recipientsSummary) && e.recipientsSummary.length
-                ? `${e.recipientsSummary.length} recipient(s)` : 'revision' })));
+            h('span', { text: `${e.deleted ? 'deleted' : 'earlier secret'}${tags}` })));
     }
 }
 
@@ -606,40 +731,148 @@ function editScreen(payload) {
         placeholder: creating ? 'the secret to protect' : 'leave blank to keep the stored secret',
     });
     const type = h('select', { class: 'input' },
-        h('option', { value: 'login', text: 'Login' }),
-        h('option', { value: 'note', text: 'Secure note' }));
-    if (existing && existing.kind && existing.kind !== 'login') type.value = 'note';
+        ...Object.entries(ITEM_KINDS).map(([k, spec]) => h('option', { value: k, text: spec.label })));
+    if (existing) type.value = ITEM_KINDS[existing.kind] ? existing.kind : 'note';
+    const username = textInput({ value: existing ? (existing.username || '') : '', placeholder: 'you@example.com' });
+    const site = textInput({ value: existing ? (existing.site || '') : '', placeholder: 'https://example.com' });
+    const folder = h('select', { class: 'input' },
+        h('option', { value: '', text: 'No folder' }),
+        ...folders().filter(f => f.id).map(f => h('option', { value: f.id, text: f.name })));
+    folder.value = (existing && existing.folderId) || '';
+    const kind = () => type.value;
+    const isLogin = () => kind() === 'login';
+
+    /*
+     * A card, identity or SSH key: one input per field and a Protect toggle.
+     * Protected and secret fields start blank (blank keeps what is stored);
+     * the rest are filled from the item with no tap.
+     */
+    const typedInputs = new Map();
+    function typedForm(k) {
+        typedInputs.clear();
+        const wasProtected = existing ? existing.protectedFields : null;
+        const rows = ITEM_KINDS[k].fields.map((f) => {
+            const sealed = wasProtected ? wasProtected.includes(f.name) : !!f.protect;
+            const keep = !creating && (f.secret || sealed);
+            const input = f.multiline
+                ? h('textarea', { class: 'input mono textarea', rows: '4' })
+                : textInput({ mono: !!f.secret });
+            input.placeholder = keep ? 'blank keeps the stored value' : '';
+            const protect = h('input', { type: 'checkbox', checked: sealed, 'aria-label': `Protect ${f.label}` });
+            typedInputs.set(f.name, { input, protect });
+            return h('div', { class: 'field', 'data-edit-field': f.name },
+                h('span', { class: 'eyebrow', text: f.label }),
+                input,
+                h('label', { class: 'row hint' }, protect, h('span', { text: 'Protect with your keys' })));
+        });
+        if (existing) {
+            need('itemDetails')(existing.id).then((values) => {
+                for (const [n, { input }] of typedInputs) {
+                    if (values && typeof values[n] === 'string' && !input.value) input.value = values[n];
+                }
+            }).catch(err => toast.error(`Details: ${errorText(err)}`));
+        }
+        return rows;
+    }
+
+    const generators = row(
+        button('Generate password', async () => {
+            try { secret.value = await need('generatePassword')({ length: 20 }); } catch (err) {
+                toast.error(`Generate: ${errorText(err)}`);
+            }
+        }, { variant: 'ghost' }),
+        button('Generate passphrase', async () => {
+            try { secret.value = await need('generatePassphrase')({ words: 6, separator: '-' }); } catch (err) {
+                toast.error(`Generate: ${errorText(err)}`);
+            }
+        }, { variant: 'ghost' }));
+    const multiField = existing && !isTypedKind(existing.kind)
+        && existing.protectedFields.some(n => n !== (existing.kind === 'note' ? 'notes' : 'password'));
+
+    const kindHost = h('div', { class: 'col' });
+    function renderKind() {
+        clear(kindHost);
+        if (isTypedKind(kind())) {
+            for (const r of typedForm(kind())) kindHost.appendChild(r);
+            return;
+        }
+        if (isLogin()) {
+            kindHost.appendChild(field('Username', username));
+            kindHost.appendChild(field('Site', site));
+        }
+        if (multiField) {
+            kindHost.appendChild(banner('info', 'Several protected fields',
+                `This item protects ${existing.protectedFields.join(', ')}. It was written by another `
+                + 'client; a new secret here would replace them all, so this screen only renames it.'));
+            return;
+        }
+        kindHost.appendChild(generators);
+        kindHost.appendChild(field('Secret', secret, creating
+            ? 'Stored wrapped. Reading it back always costs a hardware tap.'
+            : 'Blank keeps the stored secret and needs no tap. A new secret is wrapped to '
+              + 'your current recipients; the old one is kept in the item\'s history.'));
+    }
+    type.addEventListener('change', renderKind);
+    renderKind();
 
     const coverage = h('div', { class: 'list-sub' });
     renderCoverage(coverage);
 
+    async function saveTyped() {
+        const values = {};
+        const protect = [];
+        for (const [n, { input, protect: box }] of typedInputs) {
+            values[n] = input.value;
+            if (box.checked) protect.push(n);
+        }
+        const saved = await guard('Save', need('saveItem')(existing ? existing.id : null, {
+            kind: kind(), name: name.value.trim(), values, protect,
+            folderId: creating ? (folder.value || null) : null,
+        }));
+        for (const { input } of typedInputs.values()) input.value = '';
+        return saved;
+    }
+
     const save = button(creating ? 'Create' : 'Save', async () => {
         if (!name.value.trim()) { toast.error('Give the item a name.'); return; }
-        if (creating && !secret.value) { toast.error('Enter the secret to store.'); return; }
+        if (creating && !isTypedKind(kind()) && !secret.value) { toast.error('Enter the secret to store.'); return; }
         save.disabled = true;
         save.textContent = 'Encrypting...';
         try {
-            if (creating) {
+            if (isTypedKind(kind())) {
+                const saved = await saveTyped();
+                const id = existing ? existing.id : (saved && (saved.id || saved.Id));
+                if (existing && folder.value !== (existing.folderId || '')) {
+                    await guard('Folder', need('setFolder')(existing.id, folder.value || null));
+                }
+                toast.ok(creating ? 'Created.' : 'Saved.');
+                go('detail', id);
+            } else if (creating) {
                 const saved = await guard('Create', need('setCipher')(
-                    name.value.trim(), secret.value, { type: type.value }));
+                    name.value.trim(), secret.value, {
+                        type: kind(),
+                        ...(isLogin() ? { username: username.value.trim(), site: site.value.trim() } : {}),
+                    }));
                 secret.value = '';
+                const newId = saved && (saved.id || saved.Id);
+                if (newId && folder.value) await guard('Folder', need('setFolder')(newId, folder.value));
                 toast.ok('Created and wrapped.');
-                go('detail', saved && (saved.id || saved.Id));
+                go('detail', newId);
             } else {
                 /*
                  * Not trimmed and not coerced: a secret may legitimately begin
                  * or end in whitespace, and only a genuinely empty box means
-                 * "keep it". `editCipher` takes null as "re-wrap what is
-                 * already stored", so a rename does not need the plaintext --
-                 * which is just as well, because this screen has no Reveal and
-                 * never prefills. It used to refuse to save without it, so
-                 * renaming an item was impossible from here.
+                 * "keep it". `editCipher` takes null as "keep what is stored",
+                 * so a rename does not need the plaintext.
                  */
                 const replacement = secret.value.length > 0 ? secret.value : null;
-                await guard('Save', need('editCipher')(
-                    existing.id, name.value.trim(), replacement, { type: type.value }));
+                await guard('Save', need('editCipher')(existing.id, name.value.trim(), replacement,
+                    isLogin() ? { username: username.value.trim(), site: site.value.trim() } : {}));
+                if (folder.value !== (existing.folderId || '')) {
+                    await guard('Folder', need('setFolder')(existing.id, folder.value || null));
+                }
                 secret.value = '';
-                toast.ok(replacement === null ? 'Renamed and re-wrapped.' : 'Saved and re-wrapped.');
+                toast.ok(replacement === null ? 'Saved.' : 'Saved and re-wrapped.');
                 go('detail', existing.id);
             }
         } catch {
@@ -654,14 +887,9 @@ function editScreen(payload) {
         }),
         body(
             field('Name', name),
-            field('Type', type),
-            // The re-wrap path unlocks the stored secret once, so it taps too --
-            // say so for both cases rather than let the hardware prompt be a
-            // surprise on what the user thinks is only a rename.
-            field('Secret', secret, creating
-                ? 'Stored wrapped. Reading it back always costs a hardware tap.'
-                : 'Blank keeps the stored secret; typing a new one replaces it. Saving '
-                  + 're-wraps the item either way, which costs one hardware tap.'),
+            creating ? field('Type', type) : null,
+            kindHost,
+            field('Folder', folder),
             eyebrow('Will be wrapped to'),
             coverage),
         footer(save));
@@ -725,7 +953,11 @@ function settingsScreen() {
             navRow('Bulk protect', 'Re-wrap unprotected items', () => go('bulk', { from: 'settings' })),
             navRow('Audit log', 'What this extension did, locally', () => go('audit')),
             h('div', { class: 'spacer' }),
-            button('Lock', () => { app.unlocked = false; go('lock'); }, { variant: 'secondary', full: true }),
+            button('Lock', async () => {
+                try { await need('lock')(); } catch (err) { toast.error(`Lock: ${errorText(err)}`); }
+                app.unlocked = false;
+                go('lock');
+            }, { variant: 'secondary', full: true }),
             // Signing out destroys nothing but a session envelope, and demanding
             // the master password for it meant you could not sign out of a
             // server you could not reach -- the exact case where you want to.
@@ -790,11 +1022,24 @@ async function reloadRecipients(host) {
         host.appendChild(h('div', { class: 'muted', text: 'No recipients published yet.' }));
         return;
     }
+    let stale = new Set();
+    try {
+        stale = new Set((await need('staleBrowserRecipients')()).map(e => e.id));
+    } catch {}
+    if (stale.size > 0) {
+        host.appendChild(banner('warning',
+            `${stale.size} browser recipient${stale.size === 1 ? '' : 's'} not held by this browser`,
+            'New items are still wrapped to them. If they belonged to an earlier install of this '
+            + 'browser, remove them; if another browser holds them, keep them.'));
+    }
     for (const e of entries) {
         host.appendChild(h('div', { class: 'srow srow-tall' },
             h('div', { class: 'srow-main' },
                 h('div', { text: e.displayName || e.id }),
                 h('div', { class: 'mono dim', text: `${e.kind} · ${e.id}` }),
+                stale.has(String(e.id))
+                    ? h('div', { class: 'mono dim', text: 'no key for this on this browser' })
+                    : null,
                 // Only the exception is worth a line. "defaultEncrypt: on" was
                 // printed under every row and said nothing the list did not.
                 e.defaultEncrypt === false
@@ -834,103 +1079,48 @@ function recoveryScreen() {
             button('Open an item with a phrase', () => go('recovery-use'), { variant: 'secondary', full: true })));
 }
 
-/**
- * Discard a recovery identity that was published but never written down.
- *
- * `enrollRecovery()` publishes the registry entry and *then* returns the phrase
- * for display, so from the moment the words appear there is a recipient in the
- * registry whose private half exists only on this screen. Leaving without
- * writing them down does not undo that: every later write is wrapped to a
- * recipient nobody can ever open, and the coverage readout counts it as
- * protection. Removing the entry is the only way back to a true state.
- */
-async function discardUnconfirmedRecovery(res) {
-    if (!res || !res.registryEntryId) return false;
-    try {
-        await need('removeRecipient')(res.registryEntryId);
-        return true;
-    } catch (err) {
-        toast.error(
-            `Could not remove the unconfirmed recovery recipient (${errorText(err)}). `
-            + `Remove ${res.registryEntryId} from Settings -> Recipients by hand, or new items `
-            + 'will be wrapped to a key nobody holds.',
-        );
-        return false;
-    }
-}
-
 function recoveryNewScreen() {
     const host = h('div', {});
-    // Set once the phrase is on screen; drives the guarded exit in the app bar.
-    let live = null;
-    const start = button('Generate and publish', async () => {
+    const bar = h('div', {}, appBar('New recovery phrase', null, { back: () => go('recovery') }));
+    const start = button('Generate a phrase', async () => {
         start.disabled = true;
         start.textContent = 'Generating...';
         let res;
         try {
-            res = await need('enrollRecovery')('Paper recovery');
+            res = await need('generateRecovery')();
         } catch (err) {
-            toast.error(`Enrol recovery: ${errorText(err)}`);
+            toast.error(`Recovery phrase: ${errorText(err)}`);
             start.disabled = false;
-            start.textContent = 'Generate and publish';
+            start.textContent = 'Generate a phrase';
             return;
         }
         if (!res || typeof res.phrase !== 'string' || res.phrase.trim().length === 0) {
-            toast.error('The recovery generator returned no phrase -- nothing was written down.');
+            toast.error('The recovery generator returned no phrase.');
             start.disabled = false;
-            start.textContent = 'Generate and publish';
+            start.textContent = 'Generate a phrase';
             return;
         }
+        clear(bar);
+        bar.appendChild(appBar('New recovery phrase', null, {}));
         clear(host);
-        live = res;
-        host.appendChild(phrasePanel(res, () => { live = null; }));
+        host.appendChild(phrasePanel(res));
     }, { variant: 'primary', full: true });
 
     host.appendChild(h('div', {},
         h('div', { class: 'hint', text:
-            'Generated in WASM. Only the public key is published.' }),
+            'Generated in WASM. Nothing is published until you confirm three of the words; '
+            + 'then only the public key is.' }),
         start));
 
-    // Local confirm, not requireMasterPassword: this screen exists for the day
-    // the server is gone, and a gate that needs the server to answer could pin
-    // the user to it with an unwritten phrase on screen.
-    const back = async () => {
-        if (!live) { go('recovery'); return; }
-        const res = live;
-        if (!await confirmAction({
-            title: 'Leave without writing the phrase down?',
-            body: 'This recovery key is already published as a recipient. If you leave now the '
-                + 'words are gone, so it will be removed again -- otherwise every item you save '
-                + 'afterwards would be wrapped to a key nobody holds.',
-            action: 'Remove it and leave',
-        })) return;
-        live = null;
-        if (await discardUnconfirmedRecovery(res)) {
-            toast.info('Unconfirmed recovery recipient removed.');
-        }
-        go('recovery');
-    };
-
-    return h('div', { class: 'col' },
-        appBar('New recovery phrase', null, { back }),
-        body(host));
+    return h('div', { class: 'col' }, bar, body(host));
 }
 
 /**
- * Show the phrase that `enrollRecovery()` actually generated.
- *
- * The prototype rendered a constant word list from design/data.jsx and dumped
- * the real phrase to `console.warn`. Anyone who wrote down what the screen said
- * was permanently locked out. The words below come from `res.phrase` and from
- * nowhere else.
- *
- * The three-word check gates the *confirmation*, not the exit: a popup can be
- * dismissed by clicking outside it and no script can stop that. So the panel
- * also offers an explicit discard, and the app bar's back action removes the
- * published recipient rather than stranding it. `onConfirmed` tells the screen
- * the entry is now the user's problem and no longer needs cleaning up.
+ * The words of a phrase that is not published yet. The recipient reaches the
+ * registry only from the confirm handler, after three words match, so closing
+ * the popup at any point before that leaves nothing behind.
  */
-function phrasePanel(res, onConfirmed) {
+function phrasePanel(res) {
     const words = res.phrase.trim().split(/\s+/);
     const grid = h('div', { class: 'phrase-grid' });
     words.forEach((w, i) => {
@@ -942,8 +1132,9 @@ function phrasePanel(res, onConfirmed) {
     const checkIdx = pickDistinct(words.length, Math.min(3, words.length));
     const inputs = checkIdx.map(() => textInput({ mono: true, placeholder: 'word' }));
     const status = h('div', { class: 'hint hint-danger' });
+    const panel = h('div', {});
 
-    const done = button('I have written it down', () => {
+    const done = button('I have written it down', async () => {
         const wrong = checkIdx.filter((idx, n) =>
             inputs[n].value.trim().toLowerCase() !== words[idx].toLowerCase());
         if (wrong.length > 0) {
@@ -952,86 +1143,92 @@ function phrasePanel(res, onConfirmed) {
             return;
         }
         status.textContent = '';
-        onConfirmed?.();
-        toast.ok('Recovery identity published and verified.');
-        go('settings');
+        done.disabled = true;
+        done.textContent = 'Publishing...';
+        let published;
+        try {
+            published = await need('publishRecovery')(res.armoredPubkey, 'Paper recovery');
+        } catch (err) {
+            toast.error(`Publish recovery: ${errorText(err)}`);
+            done.disabled = false;
+            done.textContent = 'I have written it down';
+            return;
+        }
+        clear(panel);
+        panel.appendChild(h('div', {},
+            banner('success', 'Recovery phrase published',
+                'New items are wrapped to it from now on. Earlier phrases stay valid recipients '
+                + 'until you remove them in Settings -> Recipients.'),
+            h('div', { class: 'hint', text: published && published.registryEntryId
+                ? `Registry entry: ${published.registryEntryId}` : '' }),
+            button('Test it now', () => go('recovery-use', { test: true }), { variant: 'primary', full: true }),
+            button('Done', () => go('settings'), { variant: 'ghost', full: true })));
+        toast.ok('Recovery phrase verified and published.');
     }, { variant: 'primary', full: true });
 
-    const discard = button('I did not write it down -- remove it', async () => {
+    const discard = button('Discard these words', async () => {
         if (!await confirmAction({
-            title: 'Remove this recovery identity?',
-            body: 'It is already published as a recipient. Removing it now is the safe outcome: '
-                + 'the alternative is items wrapped to a key nobody holds.',
-            action: 'Remove it',
+            title: 'Discard this phrase?',
+            body: 'Nothing has been published yet, so discarding leaves your vault unchanged.',
+            action: 'Discard',
         })) return;
-        onConfirmed?.();
-        if (await discardUnconfirmedRecovery(res)) toast.info('Recovery recipient removed.');
         go('recovery');
     }, { variant: 'ghost', full: true });
 
-    return h('div', {},
-        banner('warning', 'Write these down now',
-            'Closing this popup destroys the only copy. If that happens, remove the recipient '
-            + 'from Settings -> Recipients, or new items will be wrapped to a key nobody holds.'),
+    panel.appendChild(h('div', {},
+        banner('warning', 'Write these down on paper',
+            'Do not copy, photograph or type them anywhere. They are published only after you '
+            + 'confirm three of them below.'),
         eyebrow(`Recovery phrase · ${words.length} words`),
         grid,
-        row(
-            button('Copy phrase', async () => {
-                try {
-                    await writeClipboard(res.phrase);
-                    toast.ok('Phrase copied. Paste it somewhere offline, then clear the clipboard.');
-                } catch (err) { toast.error(`Copy: ${errorText(err)}`); }
-            }, {}),
-            button('Clear clipboard', async () => {
-                await bridge()?.clearClipboard?.();
-                toast.info('Clipboard overwritten.');
-            }, { variant: 'ghost' })),
         h('div', { class: 'spacer' }),
         eyebrow('Confirm three words'),
         ...checkIdx.map((idx, n) => field(`Word ${idx + 1}`, inputs[n])),
         status,
         done,
-        discard,
-        h('div', { class: 'hint', text: res.registryEntryId
-            ? `Registry entry: ${res.registryEntryId}` : '' }));
+        discard));
+    return panel;
 }
 
-function pickDistinct(n, k) {
-    const pool = Array.from({ length: n }, (_, i) => i);
-    const out = [];
-    const rand = new Uint32Array(k);
-    (globalThis.crypto || {}).getRandomValues?.(rand);
-    for (let i = 0; i < k && pool.length > 0; i++) {
-        const r = rand[i] === undefined ? Math.floor(Math.random() * pool.length) : rand[i] % pool.length;
-        out.push(pool.splice(r, 1)[0]);
-    }
-    return out.sort((a, b) => a - b);
-}
-
-function recoveryUseScreen() {
+function recoveryUseScreen(payload) {
     const items = allItems().filter(i => i.rage);
     const pick = h('select', { class: 'input' },
         ...items.map(i => h('option', { value: i.id, text: i.name || i.id })));
     const phrase = h('textarea', { class: 'input mono textarea', rows: '3', placeholder: 'your recovery phrase' });
     const out = h('div', {});
+    let hideTimer = null;
+    const hide = () => {
+        if (hideTimer) { clearInterval(hideTimer); hideTimer = null; }
+        clear(out);
+    };
 
     const run = button('Open the item', async () => {
         if (!pick.value) { toast.error('Pick an item.'); return; }
-        if (!phrase.value.trim()) { toast.error('Paste your recovery phrase.'); return; }
+        if (!phrase.value.trim()) { toast.error('Type your recovery phrase.'); return; }
         run.disabled = true;
         run.textContent = 'Decrypting...';
-        clear(out);
+        hide();
         try {
-            const value = await need('recoverFromPhrase')(pick.value, phrase.value.trim(), 'password');
+            let value = await need('recoverFromPhrase')(pick.value, phrase.value.trim());
             phrase.value = '';
+            let left = 10;
+            const countdown = h('span', { class: 'mono dim', text: `hides in ${left}s` });
             out.appendChild(h('div', { class: 'secret-open' },
                 h('div', { class: 'secret-value mono', text: value }),
-                button('Copy', async () => {
-                    try {
-                        await writeClipboard(value);
-                        toast.ok('Copied.');
-                    } catch (err) { toast.error(`Copy: ${errorText(err)}`); }
-                }, {})));
+                row(
+                    button('Copy', async () => {
+                        try {
+                            await need('copySecret')(value);
+                            toast.ok('Copied. The clipboard is cleared in 30 seconds.');
+                        } catch (err) { toast.error(`Copy: ${errorText(err)}`); }
+                    }, {}),
+                    button('Hide', () => { value = ''; hide(); }, { variant: 'ghost' }),
+                    countdown)));
+            hideTimer = setInterval(() => {
+                left -= 1;
+                countdown.textContent = `hides in ${left}s`;
+                if (left <= 0) { value = ''; hide(); }
+            }, 1000);
         } catch (err) {
             out.appendChild(banner('danger', 'Recovery failed', errorText(err)));
         } finally {
@@ -1041,8 +1238,13 @@ function recoveryUseScreen() {
     }, { variant: 'primary', full: true });
 
     return h('div', { class: 'col' },
-        appBar('Recover with a phrase', null, { back: () => go('recovery') }),
+        appBar(payload && payload.test ? 'Test your paper backup' : 'Recover with a phrase', null,
+            { back: () => { hide(); go('recovery'); } }),
         body(
+            payload && payload.test
+                ? banner('info', 'Type the phrase from your paper',
+                    'Opening any protected item proves the copy you wrote down works.')
+                : null,
             items.length === 0
                 ? banner('warning', 'Nothing to recover', 'No hardware-protected items in this vault.')
                 : null,
@@ -1204,9 +1406,9 @@ function bulkScreen(payload) {
     return h('div', { class: 'col' },
         appBar('Bulk protect', `${targets.length} target(s)`, { back: bulkBack(payload) }),
         body(
-            banner('warning', 'Each item costs a tap',
-                'Re-wrapping decrypts and re-encrypts every item, so every item needs its own '
-                + 'hardware tap. Do not start this if you cannot stay at the key.'),
+            banner('info', 'One tap for the whole batch',
+                'Your key is tapped once to open this browser\'s identity; every item is then '
+                + 're-wrapped with it. An item that identity cannot open asks for its own tap.'),
             eyebrow('Coverage'),
             coverage,
             eyebrow('Items'),
@@ -1283,7 +1485,7 @@ function activeTab() {
 function sendToTab(tabId, message) {
     return new Promise((resolve, reject) => {
         try {
-            chrome.tabs.sendMessage(tabId, message, (resp) => {
+            chrome.tabs.sendMessage(tabId, message, { frameId: 0 }, (resp) => {
                 const err = chrome.runtime && chrome.runtime.lastError;
                 if (err) reject(new Error(err.message));
                 else resolve(resp);
@@ -1304,7 +1506,7 @@ const ROUTES = {
     recipients: recipientsScreen,
     recovery: recoveryScreen,
     'recovery-new': recoveryNewScreen,
-    'recovery-use': recoveryUseScreen,
+    'recovery-use': () => recoveryUseScreen(app.payload),
     folders: foldersScreen,
     bulk: () => bulkScreen(app.payload),
     audit: auditScreen,
@@ -1332,7 +1534,8 @@ function applyInit(state) {
         if (app.init.mockTap) {
             toast.error(app.init.backendLabel || 'MOCK TAP BUILD -- no device is ever touched.');
         }
-        if (app.route === 'boot') go(app.unlocked ? 'vault' : 'lock');
+        app.unlocked = !state.locked;
+        if (app.route === 'boot' || (!app.unlocked && app.route !== 'lock')) go(app.unlocked ? 'vault' : 'lock');
         else render();
     } else {
         go('boot');
@@ -1340,6 +1543,10 @@ function applyInit(state) {
 }
 
 window.addEventListener('ragewarden:init', ev => applyInit(ev.detail));
+window.addEventListener('ragewarden:locked', () => {
+    app.unlocked = false;
+    if (app.route !== 'lock') go('lock');
+});
 
 /*
  * The glue is a separate module script. If it happens to execute before this

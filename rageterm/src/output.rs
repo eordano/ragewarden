@@ -55,33 +55,77 @@ pub fn deliver_clipboard(
 ) -> Result<(), OutputError> {
     let pt_str = std::str::from_utf8(&plaintext)
         .map_err(|e| OutputError::Clipboard(format!("plaintext is not utf-8: {e}")))?;
+    deliver_clipboard_text(pt_str, clear_after_secs, expected_hash)?;
+    drop(plaintext);
+    Ok(())
+}
+
+/// A detached `__clipboard-serve` child takes the plaintext on stdin and owns the clipboard
+/// value until another client replaces it or the clear deadline passes, then clears it. X11 and
+/// Wayland need that owner to stay alive; on every platform it keeps the plaintext out of this
+/// process's clipboard library and keeps any digest of it out of argv. This process returns only
+/// once the value is readable from the clipboard.
+fn deliver_clipboard_text(
+    text: &str,
+    clear_after_secs: u64,
+    expected_hash: &str,
+) -> Result<(), OutputError> {
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    let exe = std::env::current_exe()?;
+    let mut cmd = Command::new(exe);
+    cmd.arg(CLIPBOARD_SERVE_SUBCOMMAND)
+        .arg(clear_after_secs.to_string());
+    detach_stdio(&mut cmd);
+    cmd.stdin(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| OutputError::Clipboard("serve helper has no stdin".into()))?;
+        stdin.write_all(text.as_bytes())?;
+    }
 
     let mut clip =
         arboard::Clipboard::new().map_err(|e| OutputError::Clipboard(format!("init: {e}")))?;
-    // `set_text` takes `impl Into<Cow<'_, str>>`. Passing the borrowed `&str`
-    // yields `Cow::Borrowed`, so no owned `String` of the secret is minted here;
-    // the previous `pt_str.to_string()` left one on the heap with no `Drop` that
-    // wiped it, outliving the `Zeroizing` plaintext it was copied from.
-    clip.set_text(pt_str)
-        .map_err(|e| OutputError::Clipboard(format!("set_text: {e}")))?;
-    drop(plaintext);
-
-    if clear_after_secs > 0 {
-        spawn_clipboard_clear_helper(clear_after_secs, expected_hash)?;
+    let deadline = Instant::now() + CLIPBOARD_SERVE_TIMEOUT;
+    loop {
+        if let Ok(cur) = clip.get_text() {
+            if hex_sha256(Zeroizing::new(cur).as_bytes()) == expected_hash {
+                return Ok(());
+            }
+        }
+        if let Some(status) = child.try_wait()? {
+            let landed = clip
+                .get_text()
+                .map(|cur| hex_sha256(Zeroizing::new(cur).as_bytes()) == expected_hash)
+                .unwrap_or(false);
+            if status.success() && landed {
+                return Ok(());
+            }
+            return Err(OutputError::Clipboard(format!(
+                "serve helper exited ({status}) before the value reached the clipboard"
+            )));
+        }
+        if Instant::now() >= deadline {
+            return Err(OutputError::Clipboard(format!(
+                "the value did not reach the clipboard within {}s",
+                CLIPBOARD_SERVE_TIMEOUT.as_secs()
+            )));
+        }
+        thread::sleep(Duration::from_millis(25));
     }
-    Ok(())
 }
 
-fn spawn_clipboard_clear_helper(secs: u64, expected_hash: &str) -> Result<(), OutputError> {
-    let exe = std::env::current_exe()?;
-    let mut cmd = Command::new(exe);
-    cmd.arg("__clipboard-clear-helper")
-        .arg(secs.to_string())
-        .arg(expected_hash);
-    detach_stdio(&mut cmd);
-    cmd.spawn()?;
-    Ok(())
-}
+pub const CLIPBOARD_SERVE_SUBCOMMAND: &str = "__clipboard-serve";
+
+/// Windows `exec`: the inherited pipe handle the child reads the secret from.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const SECRET_HANDLE_ENV: &str = "RAGEWARDEN_SECRET_HANDLE";
+
+const CLIPBOARD_SERVE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[cfg(unix)]
 fn detach_stdio(cmd: &mut Command) {
@@ -91,6 +135,8 @@ fn detach_stdio(cmd: &mut Command) {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
+    // SAFETY: runs in the forked child before exec; setsid(2) is
+    // async-signal-safe and touches no memory shared with the parent.
     unsafe {
         cmd.pre_exec(|| {
             let _ = libc::setsid();
@@ -107,25 +153,83 @@ fn detach_stdio(cmd: &mut Command) {
         .stderr(Stdio::null());
 }
 
-pub fn run_clipboard_clear_helper(secs: u64, expected_hash: &str) -> Result<(), OutputError> {
-    thread::sleep(Duration::from_secs(secs));
-    let mut clip = match arboard::Clipboard::new() {
-        Ok(c) => c,
+/// The `__clipboard-serve` child: owns the selection for `secs` (0 = until replaced), kept out of
+/// clipboard-manager histories, then clears it if it still holds this value.
+pub fn run_clipboard_serve(secs: u64) -> Result<(), OutputError> {
+    use std::io::Read;
+    use std::time::Instant;
 
-        Err(_) => return Ok(()),
+    let mut buf = Zeroizing::new(Vec::new());
+    io::stdin().read_to_end(&mut buf)?;
+    let text = Zeroizing::new(
+        std::str::from_utf8(&buf)
+            .map_err(|e| OutputError::Clipboard(format!("plaintext is not utf-8: {e}")))?
+            .to_owned(),
+    );
+    drop(buf);
+    let expected_hash = hex_sha256(text.as_bytes());
+    let deadline = (secs > 0).then(|| Instant::now() + Duration::from_secs(secs));
+
+    let mut clip =
+        arboard::Clipboard::new().map_err(|e| OutputError::Clipboard(format!("init: {e}")))?;
+    let served = serve_until(&mut clip, &text, deadline);
+    drop(text);
+    served?;
+
+    if let Some(deadline) = deadline {
+        if let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            thread::sleep(left);
+        }
+        clear_if_unchanged(&mut clip, &expected_hash);
+    }
+    // arboard's own copy is released here at the latest; the global
+    // allocator (zalloc) wipes it as it is freed.
+    drop(clip);
+    Ok(())
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+))]
+fn serve_until(
+    clip: &mut arboard::Clipboard,
+    text: &str,
+    deadline: Option<std::time::Instant>,
+) -> Result<(), OutputError> {
+    use arboard::SetExtLinux;
+    let set = clip.set().exclude_from_history();
+    let set = match deadline {
+        Some(deadline) => set.wait_until(deadline),
+        None => set.wait(),
     };
-    // Whatever is on the clipboard right now is very likely the secret we put
-    // there; wrap it so the comparison copy is wiped when this returns.
+    set.text(text.to_owned())
+        .map_err(|e| OutputError::Clipboard(format!("set_text: {e}")))
+}
+
+#[cfg(not(all(
+    unix,
+    not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+)))]
+fn serve_until(
+    clip: &mut arboard::Clipboard,
+    text: &str,
+    _deadline: Option<std::time::Instant>,
+) -> Result<(), OutputError> {
+    clip.set_text(text)
+        .map_err(|e| OutputError::Clipboard(format!("set_text: {e}")))
+}
+
+fn clear_if_unchanged(clip: &mut arboard::Clipboard, expected_hash: &str) {
     let cur = match clip.get_text() {
         Ok(s) => Zeroizing::new(s),
-        Err(_) => return Ok(()),
+        Err(_) => return,
     };
     if hex_sha256(cur.as_bytes()) == expected_hash {
         let _ = clip.set_text(String::new());
 
         let _ = clip.clear();
     }
-    Ok(())
 }
 
 pub fn hex_sha256(data: &[u8]) -> String {
@@ -270,10 +374,38 @@ mod sha2_compat {
     }
 }
 
+/// What the `exec` child inherits. rageterm's own `RAGEWARDEN_*` settings never
+/// reach it; `clean` drops everything else too except a minimal login set.
+#[derive(Debug, Clone, Default)]
+pub struct ExecEnv {
+    pub clean: bool,
+    pub keep: Vec<String>,
+}
+
+const CLEAN_ENV_BASE: &[&str] = &["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG"];
+
+/// The child's environment, computed from the parent's.
+pub fn exec_environment<I>(parent: I, env: &ExecEnv) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    parent
+        .into_iter()
+        .filter(|(k, _)| !k.starts_with("RAGEWARDEN_"))
+        .filter(|(k, _)| {
+            !env.clean
+                || CLEAN_ENV_BASE.contains(&k.as_str())
+                || k.starts_with("LC_")
+                || env.keep.iter().any(|keep| keep == k)
+        })
+        .collect()
+}
+
 pub fn deliver_exec(
     plaintext: Plaintext,
     argv: &[String],
     via_env: bool,
+    env: &ExecEnv,
 ) -> Result<i32, OutputError> {
     if argv.is_empty() {
         return Err(OutputError::Io(io::Error::new(
@@ -285,6 +417,8 @@ pub fn deliver_exec(
     if argv.len() > 1 {
         cmd.args(&argv[1..]);
     }
+    cmd.env_clear()
+        .envs(exec_environment(std::env::vars(), env));
     if via_env {
         let secret_str = std::str::from_utf8(&plaintext).map_err(|e| {
             OutputError::Io(io::Error::new(
@@ -293,7 +427,10 @@ pub fn deliver_exec(
             ))
         })?;
         cmd.env("RAGEWARDEN_SECRET", secret_str);
-        let status = cmd.spawn()?.wait()?;
+        let mut child = cmd.spawn()?;
+        drop(cmd);
+        drop(plaintext);
+        let status = child.wait()?;
         return Ok(status.code().unwrap_or(-1));
     }
 
@@ -305,6 +442,8 @@ fn deliver_exec_fd3(plaintext: Plaintext, mut cmd: Command) -> Result<i32, Outpu
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
 
+    // SAFETY: pipe(2) writes two fresh descriptors into `fds`, which this
+    // block owns exclusively and wraps in OwnedFd exactly once each.
     let (read_fd, write_fd): (OwnedFd, OwnedFd) = unsafe {
         let mut fds = [-1i32; 2];
         let rc = libc::pipe(fds.as_mut_ptr());
@@ -319,6 +458,9 @@ fn deliver_exec_fd3(plaintext: Plaintext, mut cmd: Command) -> Result<i32, Outpu
 
     let read_raw = read_fd.as_raw_fd();
 
+    // SAFETY: runs in the forked child before exec and calls only dup2(2) and
+    // fcntl(2), both async-signal-safe; `read_raw` stays open in the parent
+    // until after spawn returns.
     unsafe {
         cmd.pre_exec(move || {
             if libc::dup2(read_raw, 3) == -1 {
@@ -349,14 +491,104 @@ fn deliver_exec_fd3(plaintext: Plaintext, mut cmd: Command) -> Result<i32, Outpu
     Ok(status.code().unwrap_or(-1))
 }
 
-#[cfg(not(unix))]
+/// Windows has no FD 3: the secret goes down an anonymous pipe whose read end
+/// the child inherits, named by `RAGEWARDEN_SECRET_HANDLE` (the handle value in
+/// decimal). The write end is not inheritable and is closed after writing, so
+/// the child reads exactly the secret and then EOF.
+#[cfg(windows)]
+fn deliver_exec_fd3(plaintext: Plaintext, mut cmd: Command) -> Result<i32, OutputError> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+
+    let mut read: HANDLE = std::ptr::null_mut();
+    let mut write: HANDLE = std::ptr::null_mut();
+    let attrs = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: 1,
+    };
+    // SAFETY: CreatePipe writes two fresh handles into `read`/`write`, which
+    // this function owns exclusively from here on.
+    if unsafe { CreatePipe(&mut read, &mut write, &attrs, 0) } == 0 {
+        return Err(OutputError::Io(io::Error::last_os_error()));
+    }
+    // SAFETY: both handles were just created by CreatePipe and are wrapped in
+    // OwnedHandle exactly once, which closes them on drop.
+    let (read_end, write_end) = unsafe {
+        (
+            OwnedHandle::from_raw_handle(read as _),
+            OwnedHandle::from_raw_handle(write as _),
+        )
+    };
+    // SAFETY: `write` is a valid handle owned by `write_end`; clearing its
+    // inherit flag keeps the child from holding the pipe open.
+    if unsafe { SetHandleInformation(write, HANDLE_FLAG_INHERIT, 0) } == 0 {
+        return Err(OutputError::Io(io::Error::last_os_error()));
+    }
+    cmd.env(SECRET_HANDLE_ENV, (read as usize).to_string());
+    let mut child = cmd.spawn()?;
+    drop(read_end);
+    let mut writer = std::fs::File::from(write_end);
+    writer.write_all(&plaintext)?;
+    drop(plaintext);
+    drop(writer);
+    let status = child.wait()?;
+    Ok(status.code().unwrap_or(-1))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn deliver_exec_fd3(plaintext: Plaintext, _cmd: Command) -> Result<i32, OutputError> {
     drop(plaintext);
     Err(OutputError::Io(io::Error::new(
         io::ErrorKind::Unsupported,
-        "exec --via-fd is unix-only; use --via-env on this platform",
+        "exec without --via-env is not supported on this platform",
     )))
 }
 
 #[allow(dead_code)]
 pub type Pt = Zeroizing<Vec<u8>>;
+
+#[cfg(test)]
+mod exec_env_tests {
+    use super::*;
+
+    fn parent() -> Vec<(String, String)> {
+        [
+            ("PATH", "/bin"),
+            ("HOME", "/h"),
+            ("LC_ALL", "C"),
+            ("RAGEWARDEN_CONFIG_DIR", "/c"),
+            ("RAGEWARDEN_NATIVE_HOST_ALLOW_SOFTWARE", "1"),
+            ("SSH_AUTH_SOCK", "/s"),
+            ("AWS_PROFILE", "p"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    fn keys(v: &[(String, String)]) -> Vec<&str> {
+        v.iter().map(|(k, _)| k.as_str()).collect()
+    }
+
+    #[test]
+    fn rageterm_settings_never_reach_the_child() {
+        let env = exec_environment(parent(), &ExecEnv::default());
+        assert!(!keys(&env).iter().any(|k| k.starts_with("RAGEWARDEN_")));
+        assert!(keys(&env).contains(&"SSH_AUTH_SOCK"));
+    }
+
+    #[test]
+    fn a_clean_environment_keeps_only_the_login_set_and_named_variables() {
+        let env = exec_environment(
+            parent(),
+            &ExecEnv {
+                clean: true,
+                keep: vec!["AWS_PROFILE".into()],
+            },
+        );
+        assert_eq!(keys(&env), vec!["PATH", "HOME", "LC_ALL", "AWS_PROFILE"]);
+    }
+}

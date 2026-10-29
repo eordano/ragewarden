@@ -6,4 +6,6 @@ open class RageNativeException(message: String) : RuntimeException(message) {
     class AeadFailure(message: String) : RageNativeException(message)
 
     class IdentityMissing(message: String) : RageNativeException(message)
+
+    class Internal(message: String) : RageNativeException(message)
 }

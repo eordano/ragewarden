@@ -24,15 +24,17 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontStyle
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.data.Clipboard
 import ragewarden.ragedroid.model.VaultItem
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
+import ragewarden.ragedroid.ui.uiString
 
 private const val REVEAL_AUTO_HIDE_SECS = 10
 
@@ -42,6 +44,7 @@ fun SshBody(
     clipboard: Clipboard,
     showToast: (String) -> Unit,
 ) {
+    val strings = androidx.compose.ui.platform.LocalContext.current
     val c = rageColors
     var showingPrivate by remember { mutableStateOf(false) }
 
@@ -60,7 +63,7 @@ fun SshBody(
     val passphrase = item.passphrase
 
     Column(modifier = Modifier.fillMaxWidth()) {
-        Field(label = "Key type") {
+        Field(label = stringResource(R.string.key_type)) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -78,7 +81,7 @@ fun SshBody(
             }
         }
 
-        Field(label = "Fingerprint") {
+        Field(label = stringResource(R.string.fingerprint)) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -98,7 +101,7 @@ fun SshBody(
             }
         }
 
-        Field(label = "Public key", hint = "Always safe to share.") {
+        Field(label = stringResource(R.string.public_key), hint = stringResource(R.string.always_safe_to_share)) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -118,8 +121,8 @@ fun SshBody(
                     )
                     CopyButton(
                         onCopy = {
-                            clipboard.copyVisible(publicKey, "public key")
-                            showToast("Public key copied")
+                            clipboard.copyVisible(publicKey, uiString(R.string.public_key_2))
+                            showToast(strings.getString(R.string.public_key_copied))
                         },
                         compact = true,
                     )
@@ -128,8 +131,8 @@ fun SshBody(
         }
 
         Field(
-            label = "Private key",
-            hint = "Copy to clipboard for your SSH tool -- clears in 30s. Reveal to view in full.",
+            label = stringResource(R.string.private_key),
+            hint = stringResource(R.string.copy_to_clipboard_for_your_ssh),
         ) {
             if (privateKey == null) {
                 Row(
@@ -157,43 +160,12 @@ fun SshBody(
                         modifier = Modifier.fillMaxWidth(),
                     )
                     Spacer(modifier = Modifier.height(10.dp))
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(1.dp)
-                            .background(c.divider),
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(6.dp)
-                                    .background(c.success, RoundedCornerShape(50)),
-                            )
-                            Text(
-                                text = "Auto-hides in 10s",
-                                style = RageType.meta.copy(fontWeight = FontWeight.SemiBold),
-                                color = c.success,
-                            )
-                        }
-                        CopyButton(
-                            onCopy = {
-                                val bytes = privateKey.toByteArray(Charsets.UTF_8)
-                                clipboard.copySensitive(bytes, "private key")
-                                bytes.fill(0)
-                                showToast("Private key copied · clears in 30s")
-                            },
-                            compact = true,
-                        )
-                    }
+                    AutoHideFooter(onCopy = {
+                        val bytes = privateKey.toByteArray(Charsets.UTF_8)
+                        clipboard.copySensitive(bytes, uiString(R.string.private_key_2), item = item.name)
+                        bytes.fill(0)
+                        showToast(strings.getString(R.string.private_key_copied_clears_in_30s))
+                    })
                 }
             } else {
                 Row(
@@ -202,12 +174,12 @@ fun SshBody(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     RageButton(
-                        label = "Copy private key",
+                        label = stringResource(R.string.copy_private_key),
                         onClick = {
                             val bytes = privateKey.toByteArray(Charsets.UTF_8)
-                            clipboard.copySensitive(bytes, "private key")
+                            clipboard.copySensitive(bytes, uiString(R.string.private_key_2), item = item.name)
                             bytes.fill(0)
-                            showToast("Private key copied · clears in 30s")
+                            showToast(strings.getString(R.string.private_key_copied_clears_in_30s))
                         },
                         variant = ButtonVariant.Secondary,
                         icon = Icons.Outlined.Terminal,
@@ -215,7 +187,7 @@ fun SshBody(
                         fullWidth = true,
                     )
                     RageButton(
-                        label = "Reveal",
+                        label = stringResource(R.string.show_private_key),
                         onClick = { showingPrivate = true },
                         variant = ButtonVariant.Ghost,
                         icon = Icons.Outlined.Visibility,
@@ -224,7 +196,7 @@ fun SshBody(
             }
         }
 
-        Field(label = "Comment") {
+        Field(label = stringResource(R.string.comment)) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -246,7 +218,7 @@ fun SshBody(
                     CopyButton(
                         onCopy = {
                             clipboard.copyVisible(comment, "comment")
-                            showToast("Comment copied")
+                            showToast(strings.getString(R.string.comment_copied))
                         },
                         compact = true,
                     )
@@ -254,7 +226,7 @@ fun SshBody(
             }
         }
 
-        Field(label = "Passphrase", hint = "Locks the private key at rest.") {
+        Field(label = stringResource(R.string.passphrase), hint = stringResource(R.string.locks_the_private_key_at_rest)) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -276,9 +248,9 @@ fun SshBody(
                     CopyButton(
                         onCopy = {
                             val bytes = passphrase.toByteArray(Charsets.UTF_8)
-                            clipboard.copySensitive(bytes, "passphrase")
+                            clipboard.copySensitive(bytes, "passphrase", item = item.name)
                             bytes.fill(0)
-                            showToast("Passphrase copied · clears in 30s")
+                            showToast(strings.getString(R.string.passphrase_copied_clears_in_30s))
                         },
                         compact = true,
                     )
@@ -296,29 +268,10 @@ fun SshBody(
 private fun NotSetText(modifier: Modifier = Modifier) {
     val c = rageColors
     Text(
-        text = "Not set",
+        text = stringResource(R.string.not_set),
         style = RageType.body.copy(fontSize = 14.sp, fontStyle = FontStyle.Italic),
         color = c.fgSecondary,
         modifier = modifier,
     )
 }
 
-@Composable
-private fun NotesField(text: String) {
-    val c = rageColors
-    Field(label = "Notes") {
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(c.surfaceSunken, RoundedCornerShape(8.dp))
-                .border(1.dp, c.border, RoundedCornerShape(8.dp))
-                .padding(horizontal = 12.dp, vertical = 10.dp),
-        ) {
-            Text(
-                text = text,
-                style = RageType.body.copy(fontSize = 13.5.sp),
-                color = c.fgPrimary,
-            )
-        }
-    }
-}

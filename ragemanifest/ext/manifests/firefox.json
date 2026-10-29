@@ -12,6 +12,8 @@
     "storage",
     "activeTab",
     "clipboardWrite",
+    "alarms",
+    "idle",
     // Firefox has supported nativeMessaging since 50, and rageterm serves this
     // browser specifically: install_native_host.rs has a Browser::Firefox arm
     // whose DEFAULT_FIREFOX_EXTENSION_ID is the same "ragewarden@ragewarden"

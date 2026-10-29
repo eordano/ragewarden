@@ -75,18 +75,24 @@ mod tests {
 
     #[test]
     fn generate_then_recover_via_mnemonic_yields_same_identity() {
-        let gen = generate().expect("generate");
-        let recovered = from_mnemonic(&gen.mnemonic).expect("recover");
+        let generated = generate().expect("generate");
+        let recovered = from_mnemonic(&generated.mnemonic).expect("recover");
 
-        assert_eq!(gen.armored_pubkey.as_str(), recovered.to_public().to_string());
+        assert_eq!(
+            generated.armored_pubkey.as_str(),
+            recovered.to_public().to_string()
+        );
     }
 
     #[test]
     fn from_phrase_round_trips() {
-        let gen = generate().expect("generate");
-        let phrase = gen.mnemonic.to_string();
+        let generated = generate().expect("generate");
+        let phrase = generated.mnemonic.to_string();
         let recovered = from_phrase(&phrase).expect("recover from phrase");
-        assert_eq!(gen.armored_pubkey.as_str(), recovered.to_public().to_string());
+        assert_eq!(
+            generated.armored_pubkey.as_str(),
+            recovered.to_public().to_string()
+        );
     }
 
     #[test]
@@ -101,17 +107,17 @@ mod tests {
 
     #[test]
     fn mnemonic_is_24_words() {
-        let gen = generate().expect("generate");
-        let phrase = gen.mnemonic.to_string();
+        let generated = generate().expect("generate");
+        let phrase = generated.mnemonic.to_string();
         let words: Vec<&str> = phrase.split_whitespace().collect();
         assert_eq!(words.len(), 24);
     }
 
     #[test]
     fn deterministic_derivation_locked_by_info_string() {
-        let gen = generate().expect("generate");
-        let a = from_mnemonic(&gen.mnemonic).unwrap();
-        let b = from_mnemonic(&gen.mnemonic).unwrap();
+        let generated = generate().expect("generate");
+        let a = from_mnemonic(&generated.mnemonic).unwrap();
+        let b = from_mnemonic(&generated.mnemonic).unwrap();
         assert_eq!(a.to_public().to_string(), b.to_public().to_string());
     }
 }

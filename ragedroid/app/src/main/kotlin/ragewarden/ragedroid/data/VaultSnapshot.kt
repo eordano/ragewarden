@@ -31,17 +31,25 @@ object VaultMetaNames {
     const val RAGETERM_RECIPIENT_LIST: String = "Ragewarden Recipients (do not edit)"
 
     /**
-     * `core/src/history.rs::MARKER_NAME`. rageterm keeps one document under
-     * this exact name; ragemanifest keeps one per cipher, named
-     * `"$HISTORY:<cipherId>"`. Both are matched.
+     * `core/src/history.rs::MARKER_NAME`: the account's one history document,
+     * which every client writes.
      */
-    const val HISTORY: String = "__ragewarden_history_v1__"
+    const val HISTORY: String = "__ragewarden_history_v2__"
+
+    /**
+     * `core/src/history.rs::LEGACY_MARKER_NAME`: rageterm's earlier single
+     * document under this name, and ragemanifest's per-cipher ones named
+     * `"$HISTORY_V1:<cipherId>"`.
+     */
+    const val HISTORY_V1: String = "__ragewarden_history_v1__"
 
     fun isMeta(name: String): Boolean =
         name == RecipientRegistry.MARKER_NAME ||
             name == RAGETERM_RECIPIENT_LIST ||
             name == HISTORY ||
-            name.startsWith("$HISTORY:")
+            name.startsWith("$HISTORY:") ||
+            name == HISTORY_V1 ||
+            name.startsWith("$HISTORY_V1:")
 }
 
 data class VaultSnapshot(val items: ImmutableList<VaultItem>) {
@@ -104,7 +112,7 @@ data class VaultSnapshot(val items: ImmutableList<VaultItem>) {
                 name = optStr("name") ?: "",
                 username = optStr("username") ?: "",
                 site = optStr("site") ?: "",
-                folder = optStr("folder") ?: "All",
+                folder = optStr("folder") ?: ragewarden.ragedroid.model.NO_FOLDER,
                 folderId = optStr("folderId"),
                 rage = o.optBoolean("rage"),
                 recipients = recipients,
@@ -139,7 +147,27 @@ data class VaultSnapshot(val items: ImmutableList<VaultItem>) {
                 privateKey = optFromObj(ssh, "privateKey"),
                 comment = optFromObj(ssh, "comment"),
                 passphrase = optFromObj(ssh, "passphrase"),
+                block = blockOf(card, identity, ssh),
+                protectedFields = o.optJSONArray("protectedFields")
+                    ?.let { a -> (0 until a.length()).map(a::getString) }
+                    .orEmpty()
+                    .toImmutableList(),
             )
+        }
+
+        private fun blockOf(card: JSONObject?, identity: JSONObject?, ssh: JSONObject?): kotlinx.collections.immutable.ImmutableMap<String, String> {
+            val out = LinkedHashMap<String, String>()
+            fun copy(src: JSONObject?, names: List<String>, rename: Map<String, String> = emptyMap()) {
+                if (src == null) return
+                for (name in names) {
+                    val dtoKey = rename[name] ?: name
+                    if (src.has(dtoKey) && !src.isNull(dtoKey)) src.optString(dtoKey).takeIf { it.isNotEmpty() }?.let { out[name] = it }
+                }
+            }
+            copy(card, ItemFields.CARD)
+            copy(identity, ItemFields.IDENTITY)
+            copy(ssh, ItemFields.SSH_KEY, mapOf("keyFingerprint" to "fingerprint"))
+            return kotlinx.collections.immutable.persistentMapOf<String, String>().putAll(out)
         }
 
         private fun mapKind(cipherType: Int, o: JSONObject): VaultItemKind = when (cipherType) {

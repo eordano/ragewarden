@@ -15,22 +15,31 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.listSaver
+import androidx.compose.runtime.saveable.Saver
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlinx.collections.immutable.ImmutableList
 import kotlinx.collections.immutable.persistentListOf
 import kotlinx.collections.immutable.toPersistentList
+import kotlinx.collections.immutable.toImmutableList
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.data.Clipboard
 import ragewarden.ragedroid.data.SessionStore
 import ragewarden.ragedroid.data.VaultBridge
 import ragewarden.ragedroid.data.toUiRecipient
 import ragewarden.ragedroid.di.appEntryPoint
+import ragewarden.ragedroid.model.NO_FOLDER
 import ragewarden.ragedroid.model.VaultItem
+import ragewarden.ragedroid.model.VaultItemKind
 import ragewarden.ragedroid.ui.components.Toast
 import ragewarden.ragedroid.ui.components.ToastHost
 import ragewarden.ragedroid.ui.components.ToastKind
@@ -64,7 +73,7 @@ import ragewarden.ragedroid.ui.screens.TokenExpiredScreen
 import ragewarden.ragedroid.ui.screens.VaultListScreen
 import ragewarden.ragedroid.ui.theme.rageColors
 
-private sealed interface Stage {
+internal sealed interface Stage {
     data object FirstRun : Stage
     data object Vault : Stage
     data object Search : Stage
@@ -74,7 +83,7 @@ private sealed interface Stage {
     data object Folders : Stage
     data object FolderEdit : Stage
     data object AddItemTypePicker : Stage
-    data object AddItem : Stage
+    data class AddItem(val kind: AddItemKind) : Stage
     data class RecipientDetail(val recipientId: String) : Stage
     data object AuditLog : Stage
     data object BackfillWizard : Stage
@@ -87,6 +96,35 @@ private sealed interface Stage {
     data object TokenExpired : Stage
     data object AutofillPickerPreview : Stage
     data object ImePreview : Stage
+}
+
+internal object StageCodec {
+    private val objects: List<Stage> = listOf(
+        Stage.FirstRun, Stage.Vault, Stage.Search, Stage.Settings, Stage.Account, Stage.AddRecipient,
+        Stage.Folders, Stage.FolderEdit, Stage.AddItemTypePicker, Stage.AuditLog, Stage.BackfillWizard,
+        Stage.BulkProtect, Stage.PaperRecovery, Stage.RecoverFromPhrase, Stage.RecipientsList,
+        Stage.TokenExpired, Stage.AutofillPickerPreview, Stage.ImePreview,
+    )
+
+    fun encode(stage: Stage): List<String> = when (stage) {
+        is Stage.AddItem -> listOf("AddItem", stage.kind.name)
+        is Stage.RecipientDetail -> listOf("RecipientDetail", stage.recipientId)
+        is Stage.TapFailure -> listOf("TapFailure", stage.itemId, stage.kind.name)
+        is Stage.ItemHistory -> listOf("ItemHistory", stage.itemId)
+        else -> listOf(stage.toString())
+    }
+
+    fun decode(parts: List<String>): Stage? = runCatching {
+        when (parts.firstOrNull()) {
+            "AddItem" -> Stage.AddItem(AddItemKind.valueOf(parts[1]))
+            "RecipientDetail" -> Stage.RecipientDetail(parts[1])
+            "TapFailure" -> Stage.TapFailure(parts[1], TapFailureKind.valueOf(parts[2]))
+            "ItemHistory" -> Stage.ItemHistory(parts[1])
+            else -> objects.firstOrNull { it.toString() == parts.firstOrNull() }
+        }
+    }.getOrNull()
+
+    val saver: Saver<Stage, Any> = listSaver(save = { encode(it) }, restore = { decode(it) })
 }
 
 @Composable
@@ -108,7 +146,7 @@ fun RageApp() {
     val hostActivity = LocalActivity.current ?: localContext.findActivity()
 
     val signedInAtLaunch = remember { sessionStore.has() || VaultBridge.hasBackend() }
-    var stage by remember {
+    var stage by rememberSaveable(stateSaver = StageCodec.saver) {
         mutableStateOf<Stage>(if (signedInAtLaunch) Stage.Vault else Stage.FirstRun)
     }
 
@@ -143,36 +181,35 @@ fun RageApp() {
      * they were -- but the screens are rebuilt from scratch, so a reveal that was
      * on screen when the app stopped is gone.
      *
-     * What this does *not* do: `BitwardenVaultRepository.cached` and the session
-     * blob stay resident in the process while locked. Locking gates the readers,
-     * it is not a key-zeroisation boundary. That is a separate change with its
-     * own cost (unlock would need a re-sync, breaking offline use) and it is not
-     * claimed here.
+     * Locking also drops the keys: `BitwardenVaultRepository` listens on
+     * [ragewarden.ragedroid.data.LockState] and strips the user key out of the
+     * session blob and clears the decrypted vault cache. Unlock re-derives the
+     * key from the master password (or the biometric-sealed copy) and decrypts
+     * the sealed offline copy of the vault, so it still works offline.
      */
     val lockState = remember(context) { context.appEntryPoint().lockState() }
     val locked by lockState.locked.collectAsState()
     var wasStopped by remember { mutableStateOf(false) }
     var paperRecoveryFromFirstRun by remember { mutableStateOf(false) }
-    var openItemId by remember { mutableStateOf<String?>(null) }
-    var editItemId by remember { mutableStateOf<String?>(null) }
+    var openItemId by rememberSaveable { mutableStateOf<String?>(null) }
+    var editItemId by rememberSaveable { mutableStateOf<String?>(null) }
     var openIdentityPickerForItem by remember { mutableStateOf<String?>(null) }
     var toast by remember { mutableStateOf<Toast?>(null) }
     var vaultRefreshTick by remember { mutableStateOf(0) }
     var folderEditTarget by remember { mutableStateOf<ragewarden.ragedroid.ui.screens.FolderEntry?>(null) }
 
     val scope = rememberCoroutineScope()
-    val clipboard = remember(context, scope) {
-        val auditFeed = context.appEntryPoint().auditFeed()
+    val clipboard = remember(context) {
+        val auditFeed = runCatching { context.appEntryPoint().auditFeed() }.getOrNull()
+        // Not the composition's scope: the clear can land after this screen is gone.
+        val auditScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Main.immediate)
         Clipboard(
             context = context,
-            scope = scope,
-            onSensitiveCopy = { label ->
-                scope.launch {
-                    auditFeed.record(
-                        action = ragewarden.ragedroid.data.audit.AuditAction.Copy,
-                        item = label,
-                        cleared = true,
-                    )
+            onSensitiveCopy = { copy ->
+                auditFeed?.let { feed ->
+                    val id = auditScope.async { feed.recordReturningId(action = copy.action, item = copy.item, reason = copy.field) }
+                    val gone: () -> Unit = { auditScope.launch { feed.markCleared(id.await()) } }
+                    gone
                 }
             },
         )
@@ -237,13 +274,30 @@ fun RageApp() {
     }
 
     val showToast: (String) -> Unit = { msg -> toast = inferToast(msg) }
+    val finishPaperRecovery: (Stage, Stage) -> Unit = { afterFirstRun, otherwise ->
+        showToast(context.getString(R.string.recovery_phrase_saved))
+        if (paperRecoveryFromFirstRun) {
+            paperRecoveryFromFirstRun = false
+            scope.launch {
+                VaultBridge.repository()?.pushRecipientRegistry()
+                VaultBridge.repository()?.sync()
+                stage = afterFirstRun
+            }
+        } else {
+            stage = otherwise
+        }
+    }
     val isDebuggable = remember(context) {
         (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
     }
 
+    var confirmSignOut by remember { mutableStateOf(false) }
+    val requestSignOut: () -> Unit = { confirmSignOut = true }
     val performSignOut: () -> Unit = {
+        confirmSignOut = false
         val signedOutAccountId = VaultBridge.repository()?.accountId.orEmpty()
         VaultBridge.repository()?.logout()
+        runCatching { context.appEntryPoint().sessionKeyWrap().clear() }
         if (signedOutAccountId.isNotBlank()) {
             context.appEntryPoint().rotationTracker().forget(signedOutAccountId)
         }
@@ -286,10 +340,14 @@ fun RageApp() {
                 else if (openItemId != null) openItemId = null
                 else hostActivity?.moveTaskToBack(true)
             }
+            is Stage.AddItem -> stage = Stage.AddItemTypePicker
+            Stage.PaperRecovery -> {
+                stage = if (paperRecoveryFromFirstRun) Stage.FirstRun else Stage.Settings
+                paperRecoveryFromFirstRun = false
+            }
             Stage.Search,
             Stage.Settings,
             Stage.AddItemTypePicker,
-            Stage.AddItem,
             Stage.AutofillPickerPreview,
             Stage.ImePreview,
             -> stage = Stage.Vault
@@ -299,7 +357,6 @@ fun RageApp() {
             Stage.AuditLog,
             Stage.BackfillWizard,
             Stage.BulkProtect,
-            Stage.PaperRecovery,
             Stage.RecoverFromPhrase,
             Stage.RecipientsList,
             -> stage = Stage.Settings
@@ -329,7 +386,7 @@ fun RageApp() {
             // still holding whatever it had decrypted. This disposes it.
             LockScreen(
                 onUnlock = { lockState.unlock() },
-                onSignOut = performSignOut,
+                onSignOut = requestSignOut,
                 onToast = showToast,
                 // Not `VaultBridge.repository()`: that is null until something
                 // calls `ensureBackend`, and on a cold launch straight into the
@@ -420,13 +477,13 @@ fun RageApp() {
                 } else {
                     null
                 },
-                onSignOut = performSignOut,
+                onSignOut = requestSignOut,
                 onToast = showToast,
                 )
             }
             Stage.Account -> AccountScreen(
                 onBack = { stage = Stage.Settings },
-                onSignOut = performSignOut,
+                onSignOut = requestSignOut,
                 onToast = showToast,
             )
             Stage.AddRecipient -> AddRecipientScreen(
@@ -453,28 +510,25 @@ fun RageApp() {
                 repo = VaultBridge.ensureBackend(context),
                 onBack = { stage = Stage.Folders },
                 onSave = {
-                    showToast("Folder saved")
+                    showToast(context.getString(R.string.folder_saved))
                     stage = Stage.Folders
                 },
                 onDelete = {
-                    showToast("Folder deleted")
+                    showToast(context.getString(R.string.folder_deleted))
                     stage = Stage.Folders
                 },
             )
             Stage.AddItemTypePicker -> AddItemTypePickerScreen(
                 onBack = { stage = Stage.Vault },
-                onPick = { kind ->
-                    addItemKind = kind
-                    stage = Stage.AddItem
-                },
+                onPick = { kind -> stage = Stage.AddItem(kind) },
             )
-            Stage.AddItem -> AddItemScreen(
-                itemKind = addItemKind ?: AddItemKind.Login,
+            is Stage.AddItem -> AddItemScreen(
+                itemKind = (stage as Stage.AddItem).kind,
                 repo = VaultBridge.ensureBackend(context),
                 onBack = { stage = Stage.AddItemTypePicker },
                 onSave = { _, _ ->
                     vaultRefreshTick += 1
-                    showToast("Item saved")
+                    showToast(context.getString(R.string.item_saved))
                     stage = Stage.Vault
                 },
                 onToast = showToast,
@@ -484,13 +538,17 @@ fun RageApp() {
                     liveRecipients.firstOrNull { it.id == current.recipientId }
                 }
                 if (recipient == null) {
-                    showToast("Recipient not found")
-                    stage = Stage.Settings
+                    val notFound = stringResource(R.string.recipient_not_found)
+                    LeaveWhenGone(current.recipientId) {
+                        showToast(notFound)
+                        stage = Stage.Settings
+                    }
                 } else {
                     RecipientDetailScreen(
                         recipient = recipient,
                         onBack = { stage = Stage.Settings },
                         onToast = showToast,
+                        onRewrapStale = { stage = Stage.BackfillWizard },
                     )
                 }
             }
@@ -504,7 +562,7 @@ fun RageApp() {
                     entries = auditEntries,
                     onClear = {
                         scope.launch { auditFeed.clear() }
-                        showToast("Activity cleared")
+                        showToast(context.getString(R.string.activity_cleared))
                     },
                     onToast = showToast,
                 )
@@ -512,7 +570,7 @@ fun RageApp() {
             Stage.BackfillWizard -> BackfillWizardScreen(
                 onBack = { stage = Stage.Settings },
                 onComplete = {
-                    showToast("Backfill complete")
+                    showToast(context.getString(R.string.backfill_complete))
                     stage = Stage.Settings
                 },
                 onToast = showToast,
@@ -547,19 +605,8 @@ fun RageApp() {
                         stage = Stage.Settings
                     }
                 },
-                onComplete = {
-                    showToast("Recovery phrase saved")
-                    if (paperRecoveryFromFirstRun) {
-                        paperRecoveryFromFirstRun = false
-                        scope.launch {
-                            VaultBridge.repository()?.pushRecipientRegistry()
-                            VaultBridge.repository()?.sync()
-                            stage = Stage.Vault
-                        }
-                    } else {
-                        stage = Stage.Settings
-                    }
-                },
+                onComplete = { finishPaperRecovery(Stage.Vault, Stage.Settings) },
+                onTestNow = { finishPaperRecovery(Stage.RecoverFromPhrase, Stage.RecoverFromPhrase) },
                 onToast = showToast,
             )
             is Stage.TapFailure -> {
@@ -589,12 +636,23 @@ fun RageApp() {
                 val item = items.firstOrNull { it.id == current.itemId }
                 val historyStore = remember(context) { context.appEntryPoint().historyStore() }
                 val accountIdLive = VaultBridge.repository()?.accountId.orEmpty()
-                val historyEntries = remember(current.itemId, accountIdLive, vaultRefreshTick) {
+                val localEntries = remember(current.itemId, accountIdLive, vaultRefreshTick) {
                     historyStore.forItem(accountIdLive, current.itemId)
+                }
+                // The account's shared history document (every client writes it
+                // before replacing or deleting a protected value), then what this
+                // device recorded locally.
+                var sharedEntries by remember(current.itemId, vaultRefreshTick) {
+                    mutableStateOf<ImmutableList<ragewarden.ragedroid.ui.screens.HistoryRevision>>(persistentListOf())
+                }
+                LaunchedEffect(current.itemId, vaultRefreshTick) {
+                    VaultBridge.repository()?.history(current.itemId)?.onSuccess { list ->
+                        sharedEntries = list.map(::sharedRevision).toImmutableList()
+                    }
                 }
                 ItemHistoryScreen(
                     item = item,
-                    entries = historyEntries,
+                    entries = (sharedEntries + localEntries).toImmutableList(),
                     onBack = {
                         openItemId = current.itemId
                         stage = Stage.Vault
@@ -602,14 +660,14 @@ fun RageApp() {
                 )
             }
             Stage.TokenExpired -> TokenExpiredScreen(
-                onSignIn = performSignOut,
-                onLater = { stage = Stage.Settings },
+                onSignIn = requestSignOut,
+                onLater = { stage = Stage.Vault },
             )
             Stage.AutofillPickerPreview -> SystemAutofillPickerScreen(
                 domain = null,
                 packageName = null,
                 onAutofill = { item ->
-                    showToast("Autofilled ${item.name} (preview)")
+                    showToast(context.getString(R.string.autofilled_preview, item.name))
                     stage = Stage.Settings
                 },
                 onCreate = { stage = Stage.AddItemTypePicker },
@@ -619,7 +677,7 @@ fun RageApp() {
                 domain = null,
                 packageName = null,
                 onAutofill = { item ->
-                    showToast("Filled ${item.name} (preview)")
+                    showToast(context.getString(R.string.filled_preview, item.name))
                     stage = Stage.Settings
                 },
                 onBack = { stage = Stage.Settings },
@@ -628,26 +686,59 @@ fun RageApp() {
         }
         }
 
+        if (confirmSignOut) {
+            androidx.compose.material3.AlertDialog(
+                onDismissRequest = { confirmSignOut = false },
+                title = { androidx.compose.material3.Text(stringResource(R.string.sign_out)) },
+                text = {
+                    androidx.compose.material3.Text(
+                        stringResource(R.string.this_removes_the_session_the_offline),
+                    )
+                },
+                confirmButton = {
+                    androidx.compose.material3.TextButton(onClick = performSignOut) {
+                        androidx.compose.material3.Text(stringResource(R.string.sign_out_2))
+                    }
+                },
+                dismissButton = {
+                    androidx.compose.material3.TextButton(onClick = { confirmSignOut = false }) {
+                        androidx.compose.material3.Text(stringResource(R.string.cancel))
+                    }
+                },
+            )
+        }
         ToastHost(toast = toast, modifier = Modifier.fillMaxSize())
     }
 }
 
-private var addItemKind: AddItemKind? = null
 
 private fun vaultItems(context: android.content.Context): ImmutableList<VaultItem> {
     val backend = VaultBridge.ensureBackend(context.applicationContext)
     return backend.snapshot()
 }
 
-private fun isLoginLike(item: VaultItem): Boolean {
-    val n = item.name.lowercase()
-    val id = item.id.lowercase()
-    val nonLogin = "card" in id || "card" in n || "visa" in n || "amex" in n ||
-        "mastercard" in n ||
-        "ssh" in id || "ssh" in n || ("key" in id && "yubi" !in id) ||
-        "ident" in id || "passport" in n || "license" in n || "ident" in n ||
-        "note" in id || "note" in n
-    return !nonLogin
+internal fun sharedRevision(e: ragewarden.ragedroid.data.SharedHistoryEntry): ragewarden.ragedroid.ui.screens.HistoryRevision {
+    val time = java.time.Instant.ofEpochMilli(e.recordedAt).atZone(java.time.ZoneId.systemDefault())
+    return ragewarden.ragedroid.ui.screens.HistoryRevision(
+        id = "shared-${e.recordedAt}",
+        when_ = time.format(java.time.format.DateTimeFormatter.ofPattern("MMMM d · HH:mm")),
+        by = e.recipientsSummary.joinToString(", ").ifEmpty { uiString(R.string.another_client) },
+        current = false,
+        changes = persistentListOf(
+            ragewarden.ragedroid.ui.screens.HistoryChange(
+                if (e.deleted) uiString(R.string.audit_deleted) else uiString(R.string.previous_value),
+                diff = e.stanzaTags.joinToString(" · ").ifEmpty { null },
+            ),
+        ),
+    )
+}
+
+internal enum class DetailRoute { Login, Kind }
+
+internal fun detailRouteFor(item: VaultItem): DetailRoute = when {
+    item.kind == VaultItemKind.Login -> DetailRoute.Login
+    item.kind == VaultItemKind.Note && item.rage && item.notes == null -> DetailRoute.Login
+    else -> DetailRoute.Kind
 }
 
 @Composable
@@ -692,6 +783,13 @@ private fun VaultStage(
     val rotationStale = remember(appContext, accountId, refreshTick, staleness) {
         if (accountId.isBlank()) false
         else rotationTracker.isStale(accountId)
+    }
+    var keyListResetTick by remember { mutableStateOf(0) }
+    val keyListUnreadable = remember(appContext, accountId, refreshTick, staleness, keyListResetTick) {
+        accountId.isNotBlank() && appContext.appEntryPoint().recipientStore().let { store ->
+            store.forAccount(accountId)
+            store.isUnreadable(accountId)
+        }
     }
 
     // One coordinator per Activity + account. It owns identity resolution, the
@@ -741,16 +839,16 @@ private fun VaultStage(
      * front when no local key can satisfy the item and fails closed when a
      * biometric-bound key's prompt is unavailable.
      */
-    val decryptWithGate: suspend (String, Set<String>?) -> ByteArray = { itemId, onlyRecipientIds ->
+    val decryptWithGate: suspend (String, Set<String>?, String?, ragewarden.ragedroid.data.audit.AuditAction?, String) -> ByteArray = { itemId, onlyRecipientIds, purpose, use, field ->
         val item = backend.get(itemId)
-        if (item != null && !item.rage) {
-            backend.decrypt(itemId, emptyList())
+        if (item == null || (field != ragewarden.ragedroid.data.ItemFields.WHOLE_PAYLOAD && !ragewarden.ragedroid.data.ItemFields.needsTap(item, field))) {
+            backend.decryptField(itemId, emptyList(), use, field)
         } else {
             tapCoordinator.authorize(
-                purpose = "Reveal “${item?.name ?: "a protected secret"}”",
+                purpose = purpose ?: uiString(R.string.reveal_3, item.name),
                 onlyRecipientIds = onlyRecipientIds,
             ) { identities ->
-                backend.decrypt(itemId, identities)
+                backend.decryptField(itemId, identities, use, field)
             }
         }
     }
@@ -759,30 +857,55 @@ private fun VaultStage(
         editing != null -> EditItemScreen(
             item = editing,
             onCancel = onCloseEdit,
-            onSave = { newPlaintext ->
+            onSave = { edit ->
                 scope.launch {
                     runCatching {
-                        backend.update(editing, newPlaintext)
-                    }.onSuccess {
+                        // Re-sealing some protected fields needs the others: open the whole payload once.
+                        val changing = buildSet {
+                            if (edit.newSecret != null) add(ragewarden.ragedroid.data.ItemFields.primary(editing.kind))
+                            edit.secretChanges?.keys?.let(::addAll)
+                        }
+                        val whole = if (editing.rage && edit.migrateToSsh == null && changing.isNotEmpty() &&
+                            ragewarden.ragedroid.data.ItemFields.protectedFields(editing).any { it !in changing }
+                        ) {
+                            decryptWithGate(
+                                editing.id,
+                                null,
+                                uiString(R.string.keep_the_rest_of_protected_while, editing.name),
+                                null,
+                                ragewarden.ragedroid.data.ItemFields.WHOLE_PAYLOAD,
+                            )
+                        } else {
+                            null
+                        }
+                        try {
+                            backend.edit(editing, edit.copy(currentPayload = whole))
+                        } finally {
+                            whole?.fill(0)
+                        }
+                    }.also { edit.newSecret?.fill(0) }.onSuccess {
                         onItemSaved()
-                        showToast("Item saved")
+                        showToast(context.getString(R.string.item_saved))
                         onCloseEdit()
                     }.onFailure { e ->
-                        showToast("Save failed: ${e.message}")
+                        showToast(context.getString(R.string.save_failed, e.message ?: context.getString(R.string.unknown_error)))
                     }
                 }
             },
             decryptCurrent = {
                 // Editing a protected item still costs a tap: it decrypts the
                 // current value to prefill the field.
-                runCatching { decryptWithGate(editing.id, null) }.getOrNull()
+                runCatching { decryptWithGate(editing.id, null, uiString(R.string.show_password_to_edit_it, editing.name), ragewarden.ragedroid.data.audit.AuditAction.Reveal, "") }.getOrNull()
             },
         )
         current != null -> {
-            if (isLoginLike(current)) {
+            if (detailRouteFor(current) == DetailRoute.Login) {
                 ItemDetailScreen(
                     item = current,
-                    decryptPassword = { id, only -> decryptWithGate(id, only) },
+                    // use == null is the re-encrypt path, which re-wraps the whole payload.
+                    decryptPassword = { id, only, purpose, use ->
+                        decryptWithGate(id, only, purpose, use, if (use == null) ragewarden.ragedroid.data.ItemFields.WHOLE_PAYLOAD else "")
+                    },
                     clipboard = clipboard,
                     showToast = showToast,
                     onBack = onCloseDetail,
@@ -804,6 +927,15 @@ private fun VaultStage(
                     onSetUpDevice = onEnrollFirst,
                     tapPresentation = tapPresentation,
                     pinRequest = pendingPinRequest,
+                    decryptField = { field ->
+                        decryptWithGate(
+                            current.id,
+                            null,
+                            context.getString(R.string.show_field_purpose, current.name, ragewarden.ragedroid.data.ItemFields.label(field).lowercase()),
+                            ragewarden.ragedroid.data.audit.AuditAction.Reveal,
+                            field,
+                        )
+                    },
                 )
             } else {
                 KindDetailScreen(
@@ -812,12 +944,21 @@ private fun VaultStage(
                     onEdit = { onEdit(current.id) },
                     clipboard = clipboard,
                     showToast = showToast,
+                    decryptProtected = { field ->
+                        decryptWithGate(
+                            current.id,
+                            null,
+                            uiString(R.string.show_on_screen_for_30_seconds, current.name, ragewarden.ragedroid.data.ItemFields.label(field).lowercase()),
+                            ragewarden.ragedroid.data.audit.AuditAction.Reveal,
+                            field,
+                        )
+                    },
                 )
             }
         }
         else -> {
             val derivedFolders = remember(items) {
-                (listOf("All") + items.map { it.folder }.distinct().filter { it.isNotBlank() && it != "All" })
+                (listOf(NO_FOLDER) + items.map { it.folder }.distinct().filter { it.isNotBlank() && it != NO_FOLDER })
                     .toPersistentList()
             }
             VaultListScreen(
@@ -831,15 +972,20 @@ private fun VaultStage(
                 onEnrollFirst = onEnrollFirst,
                 rotationStale = rotationStale,
                 onRotate = onRotate,
+                keyListUnreadable = keyListUnreadable,
+                onResetKeyList = {
+                    appContext.appEntryPoint().recipientStore().resetUnreadable(accountId)
+                    keyListResetTick += 1
+                    showToast(appContext.getString(R.string.key_list_reset_done))
+                },
             )
         }
     }
 }
 
-private fun isAuthFailure(t: Throwable): Boolean {
-    val msg = (t.message ?: "").lowercase()
-    return "401" in msg || "unauthorized" in msg || "invalid_grant" in msg
-}
+private fun isAuthFailure(t: Throwable): Boolean =
+    t is ragewarden.ragedroid.data.BitwardenVaultRepository.SessionExpiredException ||
+        t.cause is ragewarden.ragedroid.data.BitwardenVaultRepository.SessionExpiredException
 
 private fun inferToast(message: String): Toast {
     val lower = message.lowercase()

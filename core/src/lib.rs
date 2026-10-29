@@ -12,30 +12,43 @@ use zeroize::Zeroizing;
 pub mod armored;
 pub mod audit;
 pub mod bech32;
+#[cfg(feature = "bitwarden")]
 pub mod bitwarden;
+pub mod generator;
+#[cfg(feature = "history")]
 pub mod history;
 #[cfg(feature = "reqwest-client")]
 pub mod http_reqwest;
 pub mod identity;
+#[cfg(feature = "bitwarden")]
+pub mod kdf;
+#[cfg(feature = "policy")]
 pub mod policy;
+pub mod protected;
 pub mod recipient;
 pub mod recovery;
+#[cfg(feature = "registry")]
 pub mod registry;
 pub mod stanza;
 pub mod stanza_format;
+#[cfg(feature = "sync")]
 pub mod sync;
+#[cfg(feature = "bitwarden")]
 pub mod tokens;
 pub mod totp;
+#[cfg(feature = "bitwarden")]
 pub mod type2;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "bitwarden"))]
 mod tests;
 
 pub use armored::{ArmoredAgeRecipient, ArmoredAgeSecret, ArmoredKeyError};
 pub use identity::{FileKey, Identity, IdentityError};
 pub use recipient::Recipient;
 pub use stanza::Stanza;
+#[cfg(feature = "bitwarden")]
 pub use tokens::{BearerToken, RefreshToken};
+#[cfg(feature = "bitwarden")]
 pub use type2::Type2EncString;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,7 +75,9 @@ impl AgeBlob {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-#[error("age blob is not valid UTF-8 (first bad byte at offset {valid_up_to}); ASCII-armored age output always is, so this blob is not armored age output")]
+#[error(
+    "age blob is not valid UTF-8 (first bad byte at offset {valid_up_to}); ASCII-armored age output always is, so this blob is not armored age output"
+)]
 pub struct AgeBlobUtf8Error {
     pub valid_up_to: usize,
 }
@@ -124,13 +139,63 @@ pub fn encrypt(plaintext: &[u8], recipients: &[Recipient]) -> Result<AgeBlob, En
 
 pub type PrfTable<'a> = &'a [PrfEntry<'a>];
 
+/// One authenticator evaluation for `encrypt_with_prf`: the PRF output the
+/// credential `credential_id` under `rp_id` returned for `salt`. The salt is
+/// what the stanza carries, so drawing a fresh one per secret
+/// ([`prf_requests_for`]) makes every secret need its own evaluation -- one
+/// captured output opens one secret, not the vault.
+///
+/// An empty `credential_id` names the recipient whose enrolment salt equals
+/// `salt`: the per-recipient form every client wrote before, still accepted
+/// (and still siphonable) until that client evaluates fresh salts.
 #[derive(Debug, Clone, Copy)]
 pub struct PrfEntry<'a> {
     pub rp_id: &'a str,
 
+    pub credential_id: &'a [u8],
+
     pub salt: &'a [u8; 32],
 
     pub prf_output: &'a [u8; 32],
+}
+
+/// What a client must have each PRF authenticator evaluate before one
+/// `encrypt_with_prf` call: one fresh CSPRNG salt per PRF recipient.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrfRequest {
+    pub rp_id: String,
+
+    pub credential_id: Vec<u8>,
+
+    pub salt: [u8; 32],
+}
+
+pub fn prf_requests_for(recipients: &[Recipient]) -> Vec<PrfRequest> {
+    use rand_core::Rng;
+    recipients
+        .iter()
+        .filter_map(|r| match r {
+            Recipient::Fido2HmacSecret {
+                credential_id,
+                rp_id,
+                ..
+            }
+            | Recipient::PasskeyPrf {
+                credential_id,
+                rp_id,
+                ..
+            } => {
+                let mut salt = [0u8; 32];
+                rand::rng().fill_bytes(&mut salt);
+                Some(PrfRequest {
+                    rp_id: rp_id.clone(),
+                    credential_id: credential_id.clone(),
+                    salt,
+                })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 pub fn encrypt_with_prf(
@@ -160,14 +225,29 @@ pub fn encrypt_with_prf(
                     .map_err(|e: &str| EncryptError::Recipient(e.to_string()))?;
                 age_recipients.push(Box::new(parsed));
             }
-            Recipient::YubiKeyPiv { public_key, .. } => {
-                hardware_recipients.push(HardwareRecipient::PivP256 {
+            Recipient::YubiKeyPiv {
+                public_key,
+                stanza_version,
+                ..
+            } => {
+                hardware_recipients.push(HardwareRecipient::PivX25519 {
                     pubkey: *public_key,
+                    version: stanza_version_of(*stanza_version)?,
                 });
+            }
+            Recipient::YubiKeyPivP256 { public_key, .. } => {
+                if !stanza_format::is_valid_p256_sec1_compressed(public_key) {
+                    return Err(EncryptError::Recipient(
+                        "YubiKeyPivP256 pubkey must be a 33-byte SEC1-compressed P-256 point"
+                            .to_string(),
+                    ));
+                }
+                hardware_recipients.push(HardwareRecipient::PivP256 { pubkey: public_key });
             }
             Recipient::AndroidKeystore {
                 public_key,
                 key_handle,
+                stanza_version,
             } => {
                 if public_key.len() != 33 {
                     return Err(EncryptError::Recipient(format!(
@@ -185,6 +265,7 @@ pub fn encrypt_with_prf(
                 hardware_recipients.push(HardwareRecipient::Keystore {
                     pubkey: public_key,
                     key_handle,
+                    version: stanza_version_of(*stanza_version)?,
                 });
             }
             Recipient::Fido2HmacSecret {
@@ -192,7 +273,7 @@ pub fn encrypt_with_prf(
                 salt,
                 rp_id,
             } => {
-                let prf = lookup_prf(prf_table, rp_id, salt)
+                let (salt, prf) = lookup_prf(prf_table, rp_id, credential_id, salt)
                     .ok_or(EncryptError::NeedsPrfOutput(stanza_format::TAG_FIDO2_HMAC))?;
                 hardware_recipients.push(HardwareRecipient::Fido2 {
                     credential_id,
@@ -207,7 +288,7 @@ pub fn encrypt_with_prf(
                 rp_id,
                 ..
             } => {
-                let prf = lookup_prf(prf_table, rp_id, salt).ok_or(
+                let (salt, prf) = lookup_prf(prf_table, rp_id, credential_id, salt).ok_or(
                     EncryptError::NeedsPrfOutput(stanza_format::TAG_WEBAUTHN_PRF_V1),
                 )?;
                 hardware_recipients.push(HardwareRecipient::WebauthnPrf {
@@ -253,16 +334,27 @@ pub fn encrypt_with_prf(
     Ok(AgeBlob(output))
 }
 
-fn lookup_prf<'a>(table: PrfTable<'a>, rp_id: &str, salt: &[u8; 32]) -> Option<&'a [u8; 32]> {
+fn stanza_version_of(v: u8) -> Result<stanza_format::EcdhStanzaVersion, EncryptError> {
+    stanza_format::EcdhStanzaVersion::from_wire(v)
+        .map_err(|e| EncryptError::Recipient(e.to_string()))
+}
+
+fn lookup_prf<'a>(
+    table: PrfTable<'a>,
+    rp_id: &str,
+    credential_id: &[u8],
+    enrolment_salt: &[u8; 32],
+) -> Option<(&'a [u8; 32], &'a [u8; 32])> {
     use subtle::ConstantTimeEq;
-    for e in table {
+    table.iter().find_map(|e| {
         let rp_match: bool = e.rp_id.as_bytes().ct_eq(rp_id.as_bytes()).into();
-        let salt_match: bool = e.salt.ct_eq(salt).into();
-        if rp_match && salt_match {
-            return Some(e.prf_output);
-        }
-    }
-    None
+        let names_this_recipient = if e.credential_id.is_empty() {
+            bool::from(e.salt.ct_eq(enrolment_salt))
+        } else {
+            e.credential_id == credential_id
+        };
+        (rp_match && names_this_recipient).then_some((e.salt, e.prf_output))
+    })
 }
 
 pub fn decrypt(
@@ -272,9 +364,13 @@ pub fn decrypt(
     let armored = ArmoredReader::new(blob.as_bytes());
     let decryptor = age::Decryptor::new(armored).map_err(|e| DecryptError::Age(format!("{e}")))?;
 
+    let failures = std::cell::RefCell::new(Vec::new());
     let mut adapters: Vec<IdentityAdapter<'_>> = Vec::new();
     for id in identities {
-        adapters.push(IdentityAdapter(id.as_ref()));
+        adapters.push(IdentityAdapter {
+            identity: id.as_ref(),
+            failures: &failures,
+        });
     }
 
     let mut id_refs: Vec<&dyn age::Identity> = Vec::new();
@@ -291,15 +387,39 @@ pub fn decrypt(
         return Err(DecryptError::NoMatchingIdentity);
     }
 
-    let mut reader = decryptor
-        .decrypt(id_refs.into_iter())
-        .map_err(|e| match e {
-            age::DecryptError::NoMatchingKeys => DecryptError::NoMatchingIdentity,
-            other => DecryptError::Age(format!("{other}")),
-        })?;
-    let mut buf = Vec::new();
+    let result = decryptor.decrypt(id_refs.into_iter());
+    let failure = most_telling_failure(std::mem::take(&mut *failures.borrow_mut()));
+    let mut reader = match result {
+        Ok(reader) => reader,
+        Err(age::DecryptError::NoMatchingKeys) => {
+            return Err(failure.map_or(DecryptError::NoMatchingIdentity, DecryptError::Identity));
+        }
+        Err(other) => {
+            return Err(failure.map_or_else(
+                || DecryptError::Age(format!("{other}")),
+                DecryptError::Identity,
+            ));
+        }
+    };
+    let mut buf = Zeroizing::new(Vec::with_capacity(blob.as_bytes().len()));
     reader.read_to_end(&mut buf)?;
-    Ok(Zeroizing::new(buf))
+    Ok(buf)
+}
+
+/// The failure to report when no identity produced the file key: a refusal
+/// by the user or the device outranks a device that was absent or broken,
+/// which outranks a stanza that did not parse.
+fn most_telling_failure(failures: Vec<IdentityError>) -> Option<IdentityError> {
+    fn rank(e: &IdentityError) -> u8 {
+        match e {
+            IdentityError::Cancelled => 0,
+            IdentityError::Auth(_) => 1,
+            IdentityError::Hardware(_) => 2,
+            IdentityError::Io(_) => 3,
+            IdentityError::Crypto(_) => 4,
+        }
+    }
+    failures.into_iter().min_by_key(rank)
 }
 
 /// Parse an armored age blob far enough to record every recipient stanza in
@@ -317,7 +437,9 @@ pub fn parse_header_stanzas(blob: &AgeBlob) -> Result<Vec<Stanza>, DecryptError>
             &self,
             stanza: &age_core_compat::AgeStanza,
         ) -> Option<Result<age_core_compat::AgeFileKey, age::DecryptError>> {
-            self.inner.borrow_mut().push(age_core_compat::age_stanza_to_ours(stanza));
+            self.inner
+                .borrow_mut()
+                .push(age_core_compat::age_stanza_to_ours(stanza));
             None
         }
     }
@@ -333,33 +455,86 @@ pub fn parse_header_stanzas(blob: &AgeBlob) -> Result<Vec<Stanza>, DecryptError>
     Ok(recorder.inner.into_inner())
 }
 
-struct IdentityAdapter<'a>(&'a dyn Identity);
+/// How many PRF stanzas in `blob`'s header use the pre-`wrap_salt` format,
+/// whose body key every secret wrapped to that authenticator shares. Header
+/// only: no unwrap, no hardware. Any such secret should be rotated; [`rewrap`]
+/// writes the current format.
+pub fn legacy_prf_wraps(blob: &AgeBlob) -> Result<usize, DecryptError> {
+    Ok(parse_header_stanzas(blob)?
+        .iter()
+        .filter(|s| stanza_format::is_legacy_prf_wrap(s))
+        .count())
+}
 
+#[derive(Debug, Error)]
+pub enum RewrapError {
+    #[error("decrypt: {0}")]
+    Decrypt(#[from] DecryptError),
+
+    #[error("encrypt: {0}")]
+    Encrypt(#[from] EncryptError),
+}
+
+/// Opens `blob` with `identities` and wraps the same plaintext to
+/// `recipients` in the current stanza formats. The plaintext never leaves
+/// zeroizing memory.
+pub fn rewrap(
+    blob: &AgeBlob,
+    identities: &[Box<dyn Identity>],
+    recipients: &[Recipient],
+    prf_table: PrfTable<'_>,
+) -> Result<AgeBlob, RewrapError> {
+    let plaintext = decrypt(blob, identities)?;
+    Ok(encrypt_with_prf(&plaintext, recipients, prf_table)?)
+}
+
+struct IdentityAdapter<'a> {
+    identity: &'a dyn Identity,
+    failures: &'a std::cell::RefCell<Vec<IdentityError>>,
+}
+
+/// An identity's failure on one stanza does not end the search: the next
+/// stanza or identity may still produce the file key, which is the
+/// multi-recipient fall-through. The failure is kept so that, when nothing
+/// matches, the caller gets it instead of `NoMatchingIdentity` -- an absent
+/// or refusing device must never read as "no device was named", which is
+/// what lets a caller offer the software key. A cancellation is the user
+/// saying no to this decryption, so it ends the search at once.
 impl<'a> age::Identity for IdentityAdapter<'a> {
     fn unwrap_stanza(
         &self,
         stanza: &age_core_compat::AgeStanza,
     ) -> Option<Result<age_core_compat::AgeFileKey, age::DecryptError>> {
         let our_stanza = age_stanza_to_ours(stanza);
-        match self.0.try_unwrap_stanza(&our_stanza) {
+        match self.identity.try_unwrap_stanza(&our_stanza) {
             Ok(Some(file_key)) => Some(Ok(age_filekey_from_bytes(*file_key))),
             Ok(None) => None,
-
+            Err(IdentityError::Cancelled) => {
+                self.failures.borrow_mut().push(IdentityError::Cancelled);
+                Some(Err(age::DecryptError::Io(std::io::Error::other(
+                    "cancelled by user",
+                ))))
+            }
             Err(e) => {
-                let io_err = std::io::Error::new(std::io::ErrorKind::Other, e.to_string());
-                Some(Err(age::DecryptError::Io(io_err)))
+                self.failures.borrow_mut().push(e);
+                None
             }
         }
     }
 }
 
 enum HardwareRecipient<'a> {
-    PivP256 {
+    PivX25519 {
         pubkey: [u8; 32],
+        version: stanza_format::EcdhStanzaVersion,
+    },
+    PivP256 {
+        pubkey: &'a [u8],
     },
     Keystore {
         pubkey: &'a [u8],
         key_handle: &'a str,
+        version: stanza_format::EcdhStanzaVersion,
     },
     Fido2 {
         credential_id: &'a [u8],
@@ -377,6 +552,13 @@ enum HardwareRecipient<'a> {
 
 struct HardwareAdapter<'a>(HardwareRecipient<'a>);
 
+fn invalid_input(e: stanza_format::StanzaFormatError) -> age::EncryptError {
+    age::EncryptError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        e.to_string(),
+    ))
+}
+
 impl<'a> age::Recipient for HardwareAdapter<'a> {
     fn wrap_file_key(
         &self,
@@ -384,18 +566,21 @@ impl<'a> age::Recipient for HardwareAdapter<'a> {
     ) -> Result<(Vec<age_core_compat::AgeStanza>, HashSet<String>), age::EncryptError> {
         let fk_bytes = age_core_compat::age_filekey_to_bytes(file_key);
         let stanza = match &self.0 {
+            HardwareRecipient::PivX25519 { pubkey, version } => {
+                stanza_format::encrypt_piv_x25519_stanza(&fk_bytes, pubkey, *version)
+            }
             HardwareRecipient::PivP256 { pubkey } => {
-                stanza_format::encrypt_piv_p256_stanza(&fk_bytes, pubkey)
+                stanza_format::encrypt_piv_ec_p256_stanza(&fk_bytes, pubkey)
+                    .map_err(invalid_input)?
             }
-            HardwareRecipient::Keystore { pubkey, key_handle } => {
-                stanza_format::encrypt_ragedroid_keystore_stanza(&fk_bytes, pubkey, key_handle)
-                    .map_err(|e| {
-                        age::EncryptError::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            e.to_string(),
-                        ))
-                    })?
-            }
+            HardwareRecipient::Keystore {
+                pubkey,
+                key_handle,
+                version,
+            } => stanza_format::encrypt_ragedroid_keystore_stanza(
+                &fk_bytes, pubkey, key_handle, *version,
+            )
+            .map_err(invalid_input)?,
             HardwareRecipient::Fido2 {
                 credential_id,
                 salt,

@@ -5,6 +5,7 @@ import { dirname, resolve } from 'node:path';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export const EXTENSION_DIST = resolve(__dirname, 'dist', 'extension');
+export const MOCK_EXTENSION_DIST = resolve(__dirname, 'dist', 'extension-mock');
 export const PLAYWRIGHT_DIR = __dirname;
 
 export default defineConfig({

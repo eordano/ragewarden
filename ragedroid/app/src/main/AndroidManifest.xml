@@ -25,8 +25,34 @@
             </intent-filter>
         </activity>
 
+        <!-- AutofillAuthActivity and AutofillUnlockActivity hand their result back
+             through startIntentSenderForResult, which only works in the caller's task:
+             launched singleInstance (a new task) the caller got RESULT_CANCELED the
+             moment the sheet opened, and nothing was ever filled. -->
         <activity
             android:name=".autofill.AutofillAuthActivity"
+            android:exported="false"
+            android:theme="@style/Theme.Ragedroid"
+            android:excludeFromRecents="true"
+            android:taskAffinity="" />
+
+        <activity
+            android:name=".ime.ImeAuthActivity"
+            android:exported="false"
+            android:theme="@style/Theme.Ragedroid"
+            android:excludeFromRecents="true"
+            android:taskAffinity="" />
+
+        <activity
+            android:name=".autofill.AutofillUnlockActivity"
+            android:exported="false"
+            android:theme="@style/Theme.Ragedroid"
+            android:excludeFromRecents="true"
+            android:taskAffinity="" />
+
+
+        <activity
+            android:name=".autofill.AutofillSaveActivity"
             android:exported="false"
             android:theme="@style/Theme.Ragedroid"
             android:excludeFromRecents="true"

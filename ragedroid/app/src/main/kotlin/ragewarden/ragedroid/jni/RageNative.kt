@@ -14,6 +14,9 @@ object RageNative {
     external fun smoke(): String
 
     @JvmStatic
+    external fun selfTestPanic(): Int
+
+    @JvmStatic
     external fun encrypt(plaintext: ByteArray, recipientPubkey: ByteArray): ByteArray
 
     @JvmStatic
@@ -44,6 +47,7 @@ object RageNative {
     @JvmStatic
     external fun decryptWithSoftwareSecret(blob: ByteArray, armoredSecret: String): ByteArray
 
+    /** A fresh age X25519 secret key in its text form; [pubkeyFromArmoredSecret] gives its public key. */
     @JvmStatic
     external fun generateSoftwareIdentity(): String
 
@@ -63,15 +67,33 @@ object RageNative {
     ): ByteArray
 
     @JvmStatic
-    external fun login(
+    external fun loginWithDevice(
         serverUrl: String,
         email: String,
         password: String,
         deviceName: String,
+        deviceId: String,
+        kdfPinJson: String?,
+        allowLegacyKdf: Boolean,
     ): ByteArray
 
+    /** New access/refresh tokens for [sessionBlob]; everything else is kept. */
     @JvmStatic
-    external fun fetchVault(sessionBlob: ByteArray): ByteArray
+    external fun refreshSession(sessionBlob: ByteArray): ByteArray
+
+    /** Raises the account's KDF to the current default server-side; returns the new session. */
+    @JvmStatic
+    external fun upgradeKdf(sessionBlob: ByteArray, password: String, deviceName: String): ByteArray
+
+    /** Unlocked session blob, or an empty array when [password] is wrong. */
+    @JvmStatic
+    external fun unlockSession(lockedSessionBlob: ByteArray, password: String): ByteArray
+
+    @JvmStatic
+    external fun fetchVaultRaw(sessionBlob: ByteArray): ByteArray
+
+    @JvmStatic
+    external fun decryptVault(sessionBlob: ByteArray, rawVault: ByteArray): ByteArray
 
     @JvmStatic
     external fun extractRageBlob(sessionBlob: ByteArray, cipherJson: String): ByteArray?
@@ -107,6 +129,78 @@ object RageNative {
         cipherId: String,
         cipherInJson: ByteArray,
     ): ByteArray
+
+    /** [unwrapStanza] that also knows the recipient's public key, which the v2 stanzas bind into their HKDF salt. */
+    @JvmStatic
+    external fun unwrapStanzaForRecipient(
+        stanzaTag: String,
+        stanzaArgs: Array<String>,
+        stanzaBody: ByteArray,
+        secret: ByteArray,
+        recipientPublicKey: ByteArray,
+    ): ByteArray
+
+    /** How many PRF stanzas in [armored] still use the legacy per-recipient salt. */
+    @JvmStatic
+    external fun legacyPrfWraps(armored: String): Int
+
+    @JvmStatic
+    external fun generatePassword(length: Int, lowercase: Boolean, uppercase: Boolean, digits: Boolean, symbols: Boolean): String
+
+    @JvmStatic
+    external fun generatePassphrase(words: Int, separator: String): String
+
+    @JvmStatic
+    external fun buildCipher(
+        sessionBlob: ByteArray,
+        draftJson: ByteArray,
+        armoredBlob: String?,
+    ): ByteArray
+
+    @JvmStatic
+    external fun updateCipherPreserving(
+        sessionBlob: ByteArray,
+        cipherId: String,
+        armoredBlob: String?,
+        editJson: ByteArray,
+    ): ByteArray
+
+    @JvmStatic
+    external fun setFolder(
+        sessionBlob: ByteArray,
+        cipherId: String,
+        folderId: String?,
+    ): ByteArray
+
+    /** The plaintext a rage blob seals for [fieldsJson] (field name -> value):
+     *  the bare value for the item type's primary field alone, a v2 field map
+     *  otherwise. Encrypt the result as the item's rage blob. */
+    @JvmStatic
+    external fun sealProtectedFields(cipherType: Int, fieldsJson: ByteArray): ByteArray
+
+    /** One field out of a decrypted rage payload; "" is the primary field. */
+    @JvmStatic
+    external fun protectedField(cipherType: Int, plaintext: ByteArray, field: String): ByteArray
+
+    /** JSON array of the fields the item's rage blob holds; no tap needed. */
+    @JvmStatic
+    external fun protectedFieldNames(sessionBlob: ByteArray, cipherJson: String): ByteArray
+
+    /** An unprotected field's plaintext, or null when the item has none. */
+    @JvmStatic
+    external fun outerField(sessionBlob: ByteArray, cipherJson: String, field: String): ByteArray?
+
+    @JvmStatic
+    external fun historyRecord(
+        sessionBlob: ByteArray,
+        cipherId: String,
+        priorPayloadArmored: String,
+        recipientsSummaryJson: ByteArray,
+        deleted: Boolean,
+    ): ByteArray
+
+    @JvmStatic
+    external fun historyLoad(sessionBlob: ByteArray, cipherId: String): ByteArray
 
     @JvmStatic
     external fun decryptWithIdentities(

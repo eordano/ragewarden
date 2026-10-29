@@ -21,16 +21,19 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.collections.immutable.ImmutableList
 import kotlinx.collections.immutable.toImmutableList
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.model.Recipient
 import ragewarden.ragedroid.model.VaultItem
 import ragewarden.ragedroid.ui.theme.RageTheme
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
+import ragewarden.ragedroid.ui.uiString
 
 @Composable
 fun MultiIdentityPickerSheet(
@@ -53,12 +56,11 @@ fun MultiIdentityPickerSheet(
         ?.toImmutableList()
         ?: kotlinx.collections.immutable.persistentListOf()
 
-    Sheet(open = open, onDismiss = onClose, title = "Pick a recipient") {
+    Sheet(open = open, onDismiss = onClose, title = stringResource(R.string.choose_which_key_to_use)) {
         Column(modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp)) {
             if (ids.isEmpty()) {
                 Text(
-                    text = "No identities on this device can decrypt this item -- " +
-                        "use your recovery phrase or enrol on the device that originally encrypted it.",
+                    text = stringResource(R.string.no_identities_on_this_device_can),
                     style = RageType.body.copy(fontSize = 14.sp, lineHeight = 21.sp),
                     color = c.fgSecondary,
                     modifier = Modifier.padding(bottom = 12.dp),
@@ -67,7 +69,7 @@ fun MultiIdentityPickerSheet(
                     Spacer(modifier = Modifier.height(4.dp))
                     Box(modifier = Modifier.fillMaxWidth()) {
                         RageButton(
-                            label = "Use recovery phrase",
+                            label = stringResource(R.string.use_recovery_phrase),
                             icon = Icons.Outlined.Description,
                             variant = ButtonVariant.Primary,
                             fullWidth = true,
@@ -80,8 +82,7 @@ fun MultiIdentityPickerSheet(
                 }
             } else {
                 Text(
-                    text = "More than one identity can decrypt ${item?.name ?: "this item"}. " +
-                        "Pick the one you have on hand.",
+                    text = stringResource(R.string.more_than_one_identity_can_decrypt, item?.name ?: stringResource(R.string.this_item)),
                     style = RageType.body.copy(fontSize = 14.sp, lineHeight = 21.sp),
                     color = c.fgSecondary,
                     modifier = Modifier.padding(bottom = 12.dp),
@@ -119,7 +120,7 @@ fun MultiIdentityPickerSheet(
                                     color = c.fgEmphasis,
                                 )
                                 Text(
-                                    text = "${kindLabel(r)} · last used ${r.lastUsed}",
+                                    text = if (r.lastUsed.isBlank()) kindLabel(r) else stringResource(R.string.last_used_3, kindLabel(r), r.lastUsed),
                                     style = RageType.sansBody.copy(fontSize = 11.5.sp, lineHeight = 14.sp),
                                     color = c.fgSecondary,
                                     modifier = Modifier.padding(top = 2.dp),
@@ -149,10 +150,10 @@ fun MultiIdentityPickerSheet(
 
 private fun kindLabel(r: Recipient): String = when (r.kind) {
     ragewarden.ragedroid.model.RecipientKind.YubiKey -> "YubiKey"
-    ragewarden.ragedroid.model.RecipientKind.Fido2 -> "FIDO2 token"
-    ragewarden.ragedroid.model.RecipientKind.PasskeyPrf -> "Passkey"
+    ragewarden.ragedroid.model.RecipientKind.Fido2 -> uiString(R.string.fido2_token)
+    ragewarden.ragedroid.model.RecipientKind.PasskeyPrf -> uiString(R.string.passkey)
     ragewarden.ragedroid.model.RecipientKind.StrongBox -> "StrongBox"
-    ragewarden.ragedroid.model.RecipientKind.Recovery -> "Paper recovery"
-    ragewarden.ragedroid.model.RecipientKind.Software -> "Software identity"
+    ragewarden.ragedroid.model.RecipientKind.Recovery -> uiString(R.string.paper_recovery)
+    ragewarden.ragedroid.model.RecipientKind.Software -> uiString(R.string.software_identity)
 }
 

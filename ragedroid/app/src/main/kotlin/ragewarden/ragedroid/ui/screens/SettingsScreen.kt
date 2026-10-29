@@ -1,5 +1,9 @@
 package ragewarden.ragedroid.ui.screens
 
+import androidx.compose.ui.res.stringResource
+import kotlinx.coroutines.launch
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.platform.LocalContext
 import android.content.pm.ApplicationInfo
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -20,7 +24,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material.icons.outlined.BugReport
@@ -57,6 +60,7 @@ import androidx.compose.ui.unit.sp
 import kotlinx.collections.immutable.ImmutableList
 import kotlinx.collections.immutable.persistentListOf
 import kotlinx.collections.immutable.toImmutableList
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.data.VaultBridge
 import ragewarden.ragedroid.data.toUiRecipient
 import ragewarden.ragedroid.di.appEntryPoint
@@ -64,11 +68,12 @@ import ragewarden.ragedroid.model.Recipient
 import ragewarden.ragedroid.model.RecipientKind
 import ragewarden.ragedroid.model.VaultItem
 import ragewarden.ragedroid.ui.components.AppBar
-import ragewarden.ragedroid.ui.components.IconBtn
+import ragewarden.ragedroid.ui.components.BackButton
 import ragewarden.ragedroid.ui.components.Mono
 import ragewarden.ragedroid.ui.components.RecipientPickerSheet
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
+import ragewarden.ragedroid.ui.uiString
 
 @Composable
 fun SettingsScreen(
@@ -118,10 +123,35 @@ fun SettingsScreen(
             .toImmutableList()
     }
 
-    var autofill by remember { mutableStateOf(autofillOn) }
-    var ime by remember { mutableStateOf(imeOn) }
+    val setupContext = LocalContext.current
+    val sourceUriHandler = androidx.compose.ui.platform.LocalUriHandler.current
+    var autofill by remember { mutableStateOf(ragewarden.ragedroid.ui.SystemSetup.autofillEnabled(setupContext)) }
+    var ime by remember { mutableStateOf(ragewarden.ragedroid.ui.SystemSetup.keyboardEnabled(setupContext)) }
+    val setupLifecycle = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    androidx.compose.runtime.DisposableEffect(setupLifecycle) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                autofill = ragewarden.ragedroid.ui.SystemSetup.autofillEnabled(setupContext)
+                ime = ragewarden.ragedroid.ui.SystemSetup.keyboardEnabled(setupContext)
+            }
+        }
+        setupLifecycle.lifecycle.addObserver(observer)
+        onDispose { setupLifecycle.lifecycle.removeObserver(observer) }
+    }
     var defaultsPickerOpen by remember { mutableStateOf(false) }
-    var defaultRecipientIds by remember { mutableStateOf(initialDefaultRecipientIds) }
+    val settingsContext = LocalContext.current
+    val recipientStoreForDefaults = remember(settingsContext) {
+        runCatching { settingsContext.appEntryPoint().recipientStore() }.getOrNull()
+    }
+    val accountForDefaults = VaultBridge.repository()?.accountId.orEmpty()
+    var defaultRecipientIds by remember(accountForDefaults) {
+        mutableStateOf(
+            recipientStoreForDefaults?.takeIf { accountForDefaults.isNotBlank() }
+                ?.forAccount(accountForDefaults)?.filter { it.defaultEncrypt }?.map { it.id }?.toImmutableList()
+                ?: initialDefaultRecipientIds,
+        )
+    }
+    val defaultsScope = rememberCoroutineScope()
 
     val itemCount = items.size
     val protectedItems = items.count { it.rage }
@@ -132,14 +162,8 @@ fun SettingsScreen(
 
     Column(modifier = Modifier.fillMaxSize().background(c.background)) {
         AppBar(
-            title = "Settings",
-            leading = {
-                IconBtn(
-                    icon = Icons.AutoMirrored.Outlined.ArrowBack,
-                    contentDescription = "Back",
-                    onClick = onBack,
-                )
-            },
+            title = stringResource(R.string.settings),
+            leading = { BackButton(onBack) },
         )
 
         Column(
@@ -157,7 +181,7 @@ fun SettingsScreen(
             )
 
             SettingsSectionLabel(
-                label = "Identities",
+                label = stringResource(R.string.identities),
                 action = {
                     Row(
                         modifier = Modifier
@@ -173,7 +197,7 @@ fun SettingsScreen(
                             modifier = Modifier.size(13.dp),
                         )
                         Text(
-                            text = "Add",
+                            text = stringResource(R.string.add),
                             style = RageType.button.copy(fontSize = 12.5.sp),
                             color = c.accent,
                         )
@@ -188,7 +212,7 @@ fun SettingsScreen(
                             .padding(horizontal = 16.dp, vertical = 14.dp),
                     ) {
                         Text(
-                            text = "No identities enrolled yet. Tap Add above to enrol your first.",
+                            text = stringResource(R.string.no_identities_enrolled_yet_tap_add),
                             style = RageType.body.copy(fontSize = 13.sp, lineHeight = 18.sp),
                             color = c.fgSecondary,
                         )
@@ -210,92 +234,89 @@ fun SettingsScreen(
                 Divider()
                 SettingsRow(
                     icon = Icons.Outlined.Shield,
-                    title = "Manage recipients",
-                    subtitle = "List every recipient on the cross-device registry. Remove any one of them.",
+                    title = stringResource(R.string.manage_recipients),
+                    subtitle = stringResource(R.string.every_key_that_can_open_your),
                     onClick = onListRecipients,
                 )
             }
 
-            SettingsSectionLabel(label = "Vault")
+            SettingsSectionLabel(label = stringResource(R.string.vault))
             Card {
                 SettingsRow(
                     icon = Icons.Outlined.Folder,
-                    title = "Folders",
+                    title = stringResource(R.string.folders),
                     subtitle = when (folderCount) {
-                        0 -> "No custom folders yet"
-                        1 -> "1 folder"
-                        else -> "$folderCount folders"
+                        0 -> stringResource(R.string.no_custom_folders_yet)
+                        else -> androidx.compose.ui.res.pluralStringResource(R.plurals.folder_count, folderCount, folderCount)
                     },
                     onClick = onFolders,
                 )
                 Divider()
                 SettingsRow(
                     icon = Icons.Outlined.Description,
-                    title = "Recovery phrase",
-                    subtitle = "Generate a fresh 24-word recovery phrase",
+                    title = stringResource(R.string.create_a_new_recovery_phrase),
+                    subtitle = stringResource(R.string.earlier_phrases_keep_working_until_you),
                     onClick = onRecovery,
                 )
                 Divider()
                 SettingsRow(
                     icon = Icons.Outlined.Key,
-                    title = "Recover from paper backup",
-                    subtitle = "Type a 24-word phrase to read items it can unlock.",
+                    title = stringResource(R.string.test_my_paper_backup),
+                    subtitle = stringResource(R.string.type_your_phrase_and_open_one),
                     onClick = onRecoverFromPhrase,
                 )
                 Divider()
                 SettingsRow(
                     icon = Icons.Outlined.History,
-                    title = "Recent unlocks",
-                    subtitle = "$activityCount entries · stored on this device",
+                    title = stringResource(R.string.activity),
+                    subtitle = stringResource(R.string.entries_stored_on_this_device, activityCount),
                     onClick = onOpenAuditLog,
                 )
                 Divider()
                 SettingsRow(
                     icon = Icons.Outlined.Upgrade,
-                    title = "Protect existing items",
-                    subtitle = "Convert un-protected ciphers into rage-protected ones.",
+                    title = stringResource(R.string.protect_existing_items),
+                    subtitle = stringResource(R.string.protect_items_that_are_not_protected),
                     onClick = onBackfill,
                 )
                 Divider()
                 SettingsRow(
                     icon = Icons.Outlined.Shield,
-                    title = "Bulk protect wizard",
-                    subtitle = "Select items, pick recipients, and protect in bulk.",
+                    title = stringResource(R.string.bulk_protect_wizard),
+                    subtitle = stringResource(R.string.select_items_pick_recipients_and_protect),
                     onClick = onBulkProtect,
                 )
             }
 
-            SettingsSectionLabel(label = "System integration")
+            SettingsSectionLabel(label = stringResource(R.string.system_integration))
             Card {
                 SettingsSwitchRow(
                     icon = Icons.Outlined.Bolt,
-                    title = "Autofill",
+                    title = stringResource(R.string.autofill),
                     subtitle = if (autofill) {
-                        "RageDroid is the active autofill provider."
+                        stringResource(R.string.ragedroid_is_the_active_autofill_provider)
                     } else {
-                        "Tap to make RageDroid the active autofill provider."
+                        stringResource(R.string.tap_to_make_ragedroid_the_active)
                     },
                     on = autofill,
                     onChange = {
-                        autofill = it
                         onAutofillToggle(it)
-                        onToast(if (it) "Autofill enabled." else "Autofill disabled.")
+                        ragewarden.ragedroid.ui.SystemSetup.openAutofillSettings(settingsContext)
                     },
                 )
                 Divider()
                 SettingsSwitchRow(
                     icon = Icons.Outlined.Keyboard,
-                    title = "Quick-fill keyboard",
+                    title = stringResource(R.string.quick_fill_keyboard),
                     subtitle = if (ime) {
-                        "A RageDroid keyboard suggests credentials inside login forms."
+                        stringResource(R.string.a_ragedroid_keyboard_suggests_credentials_inside)
                     } else {
-                        "Suggests credentials inline above the keys, even in apps that don't support Autofill."
+                        stringResource(R.string.suggests_credentials_inline_above_the_keys)
                     },
                     on = ime,
                     onChange = {
-                        ime = it
                         onImeToggle(it)
-                        onToast(if (it) "Quick-fill keyboard enabled." else "Quick-fill keyboard disabled.")
+                        ragewarden.ragedroid.ui.SystemSetup.openKeyboardSettings(settingsContext)
                     },
                 )
                 // Demo surfaces: they render mock credentials rather than doing
@@ -305,36 +326,36 @@ fun SettingsScreen(
                     Divider()
                     SettingsRow(
                         icon = Icons.Outlined.Preview,
-                        title = "Preview autofill picker",
-                        subtitle = "Debug-only · what RageDroid shows when an app requests credentials.",
+                        title = stringResource(R.string.preview_autofill_picker),
+                        subtitle = stringResource(R.string.debug_only_what_ragedroid_shows_when),
                         onClick = onAutofillPreview,
                     )
                     Divider()
                     SettingsRow(
                         icon = Icons.Outlined.Preview,
-                        title = "Preview keyboard",
-                        subtitle = "Debug-only · the quick-fill keyboard surface without leaving the app.",
+                        title = stringResource(R.string.preview_keyboard),
+                        subtitle = stringResource(R.string.debug_only_the_quick_fill_keyboard),
                         onClick = onImePreview,
                     )
                 }
             }
 
-            SettingsSectionLabel(label = "Security")
+            SettingsSectionLabel(label = stringResource(R.string.security))
             Card {
                 SettingsRow(
                     icon = Icons.Outlined.LockReset,
-                    title = "Lock now",
-                    subtitle = "Require biometric or master password to re-open the vault.",
+                    title = stringResource(R.string.lock_now),
+                    subtitle = stringResource(R.string.require_biometric_or_master_password_to),
                     onClick = onLockNow,
                 )
             }
 
-            SettingsSectionLabel(label = "About")
+            SettingsSectionLabel(label = stringResource(R.string.about))
             Card {
                 SettingsRow(
                     icon = Icons.Outlined.Info,
-                    title = "Version",
-                    value = "0.4.1 · build 81a3",
+                    title = stringResource(R.string.version),
+                    value = "${ragewarden.ragedroid.BuildConfig.VERSION_NAME} · build ${ragewarden.ragedroid.BuildConfig.VERSION_CODE}",
                     onClick = null,
                 )
                 Divider()
@@ -342,15 +363,15 @@ fun SettingsScreen(
                 // a chevron that only toasts "Opens browser" is a lie.
                 SettingsRow(
                     icon = Icons.Outlined.Language,
-                    title = "Source code",
-                    subtitle = "github.com/eordano/ragewarden",
-                    onClick = null,
+                    title = stringResource(R.string.source_code),
+                    subtitle = stringResource(R.string.github_com_eordano_ragewarden),
+                    onClick = { sourceUriHandler.openUri("https://github.com/eordano/ragewarden") },
                 )
                 Divider()
                 SettingsRow(
                     icon = Icons.Outlined.Close,
-                    title = "Sign out & forget device",
-                    subtitle = "Wipes the encrypted vault cache from this device.",
+                    title = stringResource(R.string.sign_out_2),
+                    subtitle = stringResource(R.string.removes_the_session_offline_vault_copy),
                     danger = true,
                     onClick = onSignOut,
                 )
@@ -358,8 +379,8 @@ fun SettingsScreen(
                     Divider()
                     SettingsRow(
                         icon = Icons.Outlined.BugReport,
-                        title = "Simulate token expiry",
-                        subtitle = "Debug-only · jumps to the re-auth screen.",
+                        title = stringResource(R.string.simulate_token_expiry),
+                        subtitle = stringResource(R.string.debug_only_jumps_to_the_re),
                         onClick = onDebugTokenExpired,
                     )
                 }
@@ -367,7 +388,7 @@ fun SettingsScreen(
 
             Spacer(modifier = Modifier.height(24.dp))
             Text(
-                text = "RageDroid 0.4.1 · A LocalForge product\nage 1.2.0 · yubikit-android 2.5",
+                text = stringResource(R.string.ragedroid_yubikit_android, ragewarden.ragedroid.BuildConfig.VERSION_NAME, ragewarden.ragedroid.BuildConfig.YUBIKIT_VERSION),
                 style = RageType.body.copy(
                     fontSize = 13.sp,
                     lineHeight = 19.5.sp,
@@ -389,8 +410,29 @@ fun SettingsScreen(
         recipients = resolvedRecipients,
         selected = defaultRecipientIds,
         onChange = { next ->
-            defaultRecipientIds = next
-            onToast("Default recipients updated · ${next.size} selected")
+            val store = recipientStoreForDefaults
+            if (store == null || accountForDefaults.isBlank()) {
+                onToast(uiString(R.string.not_saved_sign_in_first_2))
+                return@RecipientPickerSheet
+            }
+            val before = defaultRecipientIds.toSet()
+            defaultsScope.launch {
+                val result = runCatching {
+                    store.forAccount(accountForDefaults).forEach { r ->
+                        val want = r.id in next
+                        if (want != (r.id in before) || want != r.defaultEncrypt) {
+                            store.setDefaultEncrypt(accountForDefaults, r.id, want)
+                        }
+                    }
+                    VaultBridge.repository()?.pushRecipientRegistry()
+                }
+                if (result.isSuccess) {
+                    defaultRecipientIds = next
+                    onToast(uiString(R.string.default_recipients_updated_selected, next.size))
+                } else {
+                    onToast(uiString(R.string.not_saved, result.exceptionOrNull()?.message ?: uiString(R.string.unknown_error)))
+                }
+            }
         },
         allowEmpty = false,
         onToast = onToast,
@@ -441,7 +483,7 @@ private fun AccountHero(
                     color = c.fgEmphasis,
                 )
                 Mono(
-                    text = "$server · $itemCount items · $protectedItems protected",
+                    text = stringResource(R.string.items_protected, server, itemCount, protectedItems),
                     size = 11,
                     color = c.fgSecondary,
                     modifier = Modifier.padding(top = 2.dp),
@@ -480,8 +522,8 @@ private fun SettingsSectionLabel(
 }
 
 @Composable
-private fun SettingsRow(
-    icon: ImageVector?,
+internal fun SettingsRow(
+    icon: ImageVector? = null,
     title: String,
     subtitle: String? = null,
     value: String? = null,
@@ -678,12 +720,12 @@ private fun DefaultRecipientsRow(
         }
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = "Default recipients",
+                text = stringResource(R.string.default_recipients),
                 style = RageType.rowTitle.copy(fontSize = 14.5.sp),
                 color = c.fgEmphasis,
             )
             Text(
-                text = "Every new item is encrypted to these recipients by default.",
+                text = stringResource(R.string.every_new_item_is_encrypted_to),
                 style = RageType.caption.copy(fontSize = 11.5.sp),
                 color = c.fgSecondary,
                 modifier = Modifier.padding(top = 2.dp),
@@ -691,7 +733,7 @@ private fun DefaultRecipientsRow(
             Spacer(modifier = Modifier.height(8.dp))
             if (selected.isEmpty()) {
                 Text(
-                    text = "None -- new items will be unprotected. Tap to choose at least one.",
+                    text = stringResource(R.string.none_new_items_will_be_unprotected),
                     style = RageType.caption.copy(
                         fontSize = 12.sp,
                         fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold,
@@ -749,10 +791,10 @@ private fun recipientKindIcon(kind: RecipientKind): ImageVector = when (kind) {
 }
 
 private fun recipientKindLabel(kind: RecipientKind): String = when (kind) {
-    RecipientKind.YubiKey -> "YubiKey · PIV"
-    RecipientKind.Fido2 -> "FIDO2 hmac-secret"
-    RecipientKind.PasskeyPrf -> "Passkey · WebAuthn PRF"
-    RecipientKind.StrongBox -> "Android StrongBox"
-    RecipientKind.Recovery -> "Paper recovery"
-    RecipientKind.Software -> "Software identity"
+    RecipientKind.YubiKey -> uiString(R.string.yubikey_piv)
+    RecipientKind.Fido2 -> uiString(R.string.fido2_hmac_secret)
+    RecipientKind.PasskeyPrf -> uiString(R.string.passkey_webauthn_prf)
+    RecipientKind.StrongBox -> uiString(R.string.android_strongbox)
+    RecipientKind.Recovery -> uiString(R.string.paper_recovery)
+    RecipientKind.Software -> uiString(R.string.software_identity)
 }

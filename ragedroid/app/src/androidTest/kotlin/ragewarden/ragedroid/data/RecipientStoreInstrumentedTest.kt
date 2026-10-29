@@ -6,7 +6,6 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -127,17 +126,13 @@ class RecipientStoreInstrumentedTest {
             keystoreHandle = "marker-handle",
         )
         runBlocking { store.add("acct-A", rec) }
-        val raw = ctx.getSharedPreferences("ragewarden.recipients.v2", Context.MODE_PRIVATE)
-            .getString("recipients:acct-A", null)
-        assertNotNull(raw)
-        assertTrue(
-            "raw prefs payload should not contain plaintext marker",
-            raw!!.contains("marker-display-name").not(),
-        )
-        assertTrue(
-            "raw prefs payload should not contain plaintext handle marker",
-            raw.contains("marker-handle").not(),
-        )
+        val all = ctx.getSharedPreferences("ragewarden.recipients.v2", Context.MODE_PRIVATE).all
+        assertTrue("one stored entry", all.size == 1)
+        assertTrue("pref names must not reveal the account id", all.keys.none { "acct-A" in it })
+        val raw = all.values.single() as String
+        assertTrue("raw prefs payload should not contain plaintext marker", "marker-display-name" !in raw)
+        assertTrue("raw prefs payload should not contain plaintext handle marker", "marker-handle" !in raw)
+        assertEquals(listOf("r1"), store.forAccount("acct-A").map { it.id })
     }
 
     @Test

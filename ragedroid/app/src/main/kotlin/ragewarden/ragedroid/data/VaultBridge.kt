@@ -1,5 +1,6 @@
 package ragewarden.ragedroid.data
 
+import ragewarden.ragedroid.data.audit.AuditAction
 import android.content.Context
 import dagger.hilt.EntryPoint
 import dagger.hilt.InstallIn
@@ -25,9 +26,22 @@ interface VaultBridgeEntryPoint {
 interface VaultBackend {
     fun snapshot(): ImmutableList<VaultItem>
     fun get(id: String): VaultItem?
-    suspend fun decrypt(itemId: String, identities: List<KotlinIdentity>): ByteArray
+    suspend fun decrypt(itemId: String, identities: List<KotlinIdentity>): ByteArray = decrypt(itemId, identities, AuditAction.Reveal)
+    suspend fun decrypt(itemId: String, identities: List<KotlinIdentity>, use: AuditAction?): ByteArray
+
+    /**
+     * One field of the item (see [ItemFields]): a protected one is narrowed out
+     * of the decrypted payload by core, never shown raw; [ItemFields.WHOLE_PAYLOAD]
+     * returns the payload whole, for re-wrapping.
+     */
+    suspend fun decryptField(itemId: String, identities: List<KotlinIdentity>, use: AuditAction?, field: String): ByteArray =
+        if (field.isEmpty()) decrypt(itemId, identities, use) else throw UnsupportedOperationException("field reveals are not wired in this backend")
     suspend fun update(item: VaultItem, plaintext: ByteArray?): VaultItem
-    suspend fun create(item: VaultItem, plaintext: ByteArray): VaultItem
+    suspend fun create(item: VaultItem, plaintext: ByteArray?): VaultItem
+    suspend fun createTyped(item: VaultItem, block: Map<String, String>, secrets: Map<String, String>): VaultItem =
+        throw UnsupportedOperationException("typed items are not wired in this backend")
+    suspend fun edit(item: VaultItem, edit: ItemEdit): VaultItem =
+        throw UnsupportedOperationException("edit is not wired in this backend")
 
     suspend fun delete(itemId: String)
     suspend fun listFolders(): ImmutableList<Folder>
@@ -39,14 +53,23 @@ interface VaultBackend {
 private class RepoVaultBackend(private val repo: BitwardenVaultRepository) : VaultBackend {
     override fun snapshot(): ImmutableList<VaultItem> = repo.snapshot()
     override fun get(id: String): VaultItem? = repo.get(id)
-    override suspend fun decrypt(itemId: String, identities: List<KotlinIdentity>): ByteArray =
-        repo.decrypt(itemId, identities).getOrThrow()
+    override suspend fun decrypt(itemId: String, identities: List<KotlinIdentity>, use: AuditAction?): ByteArray =
+        repo.decrypt(itemId, identities, use).getOrThrow()
+
+    override suspend fun decryptField(itemId: String, identities: List<KotlinIdentity>, use: AuditAction?, field: String): ByteArray =
+        repo.decrypt(itemId, identities, use, field).getOrThrow()
 
     override suspend fun update(item: VaultItem, plaintext: ByteArray?): VaultItem =
         repo.update(item, plaintext).getOrThrow()
 
-    override suspend fun create(item: VaultItem, plaintext: ByteArray): VaultItem =
+    override suspend fun create(item: VaultItem, plaintext: ByteArray?): VaultItem =
         repo.create(item, plaintext).getOrThrow()
+
+    override suspend fun createTyped(item: VaultItem, block: Map<String, String>, secrets: Map<String, String>): VaultItem =
+        repo.createTyped(item, block, secrets).getOrThrow()
+
+    override suspend fun edit(item: VaultItem, edit: ItemEdit): VaultItem =
+        repo.edit(item, edit).getOrThrow()
 
     override suspend fun delete(itemId: String) {
         repo.deleteItem(itemId).getOrThrow()

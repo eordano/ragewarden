@@ -2,7 +2,7 @@
  * Native-messaging bridge to `rageterm --native-host`.
  *
  * WHAT THIS IS. A blob written by rageterm or ragedroid can carry recipient
- * stanzas no browser can open: `piv-p256` (a YubiKey PIV slot) and
+ * stanzas no browser can open: `piv-x25519-v2` / `piv-p256` (a YubiKey PIV slot) and
  * `fido2-hmac` (a FIDO2 hmac-secret credential). WebAuthn cannot reach either.
  * rageterm can -- rageterm/src/native_host.rs answers
  * `{"method":"unwrap_stanza", stanza, context}` and blocks on a physical touch
@@ -28,21 +28,10 @@
  *      actually opens the blob. Before this, JS had no route to the blob at all
  *      -- `cipher.rage` is a boolean, not a payload.
  *
- * WHAT IS STILL UNPROVEN, AND WILL STAY UNPROVEN UNTIL A KEY IS PLUGGED IN.
- * The `tap` block is an assertion by a separate process on the other end of a
- * pipe. Nothing in it is signed; this side cannot distinguish a truthful host
- * from a patched one that writes `touched: true` over a software unwrap. The
- * trust boundary this bridge actually enforces is therefore narrower than the
- * WebAuthn path's: the browser fails closed on every reply that does not CLAIM
- * a verified touch, and records the claim in the same receipt trail as a real
- * assertion. It does not, and from here cannot, verify the claim. Attestation
- * over a signed channel (a per-unwrap challenge the device signs, checkable
- * here) is the next thing to build, and until then a native-host receipt should
- * be read as "rageterm says a key was touched", never as "a key was touched".
- *
- * No hardware key existed on the machine where this was written. Every success
- * path below is unexercised. The refusal paths -- no host, `touched: false`,
- * malformed reply -- are the tested ones.
+ * Every unwrap carries a fresh challenge. A host that signs it (native-proof.js,
+ * native-unwrap-proof-v1) with a key the recipient's registry entry publishes
+ * turns "rageterm says a key was touched" into a checked touch; when such a key
+ * is published, an unsigned reply is refused.
  */
 
 import {
@@ -51,6 +40,7 @@ import {
     NativeTapRefusedError,
     performNativeHostTap,
 } from './hardware-tap.js';
+import { attestationKeysForStanza, newChallenge, verifyUnwrapProof } from './native-proof.js';
 
 export { BACKEND_NATIVE_HOST, NativeTapRefusedError };
 
@@ -65,7 +55,7 @@ export const NATIVE_HOST_NAME = 'com.ragewarden.host';
  * user-presence bits come from authenticatorData rather than from a claim.
  * Given a choice between evidence and hearsay, take the evidence.
  */
-export const NATIVE_ONLY_STANZA_TAGS = Object.freeze(['piv-p256', 'fido2-hmac']);
+export const NATIVE_ONLY_STANZA_TAGS = Object.freeze(['piv-x25519-v2', 'piv-p256', 'fido2-hmac']);
 
 /* Field on the reply that carries CONTRACT 1. */
 export const HOST_ATTESTATION_FIELD = 'tap';
@@ -214,14 +204,17 @@ export async function unwrapStanzaWithReceipt(stanza, context = {}) {
         );
     }
 
+    const challenge = newChallenge();
+    const wireContext = {
+        action: String(context.action || ''),
+        destination: String(context.destination || ''),
+        origin: String(context.origin || ''),
+    };
     const reply = await sendToWorker({
         kind: 'native.unwrap',
         stanza: wire,
-        context: {
-            action: String(context.action || ''),
-            destination: String(context.destination || ''),
-            origin: String(context.origin || ''),
-        },
+        context: wireContext,
+        challenge,
     });
 
     if (!reply || reply.ok !== true) {
@@ -244,12 +237,24 @@ export async function unwrapStanzaWithReceipt(stanza, context = {}) {
      * receipt is what can refuse, and a refusal after the key has been passed
      * to a caller is not a refusal.
      */
+    const tap = reply[HOST_ATTESTATION_FIELD];
+    let attested;
+    try {
+        ({ attested } = await verifyUnwrapProof({
+            proof: tap && tap.proof, challenge, stanza: wire, context: wireContext,
+            trustedKeys: await attestationKeysForStanza(wire, context.attestationEntries || []),
+        }));
+    } catch (e) {
+        throw new NativeTapRefusedError(e.message);
+    }
     const receipt = performNativeHostTap({
-        tap: reply[HOST_ATTESTATION_FIELD],
+        tap,
+        attested,
         host: NATIVE_HOST_NAME,
         action: context.action,
         destination: context.destination,
         origin: context.origin,
+        cipherId: context.cipherId,
     });
     const stanzaIndex = stanzaIndexOf(stanza);
     return {
@@ -271,9 +276,10 @@ export async function unwrapStanzaWithReceipt(stanza, context = {}) {
  * even though only one of them ends up spending a key.
  */
 export function nativeHostUnwrapCallback({
-    action = '', destination = '', origin = '', onReceipt = null,
+    action = '', destination = '', origin = '', cipherId = '', onReceipt = null,
+    attestationEntries = [],
 } = {}) {
-    const context = { action, destination, origin };
+    const context = { action, destination, origin, cipherId, attestationEntries };
     return async function nativeUnwrap(stanzas) {
         const list = Array.isArray(stanzas) ? stanzas : Array.from(stanzas || []);
         const candidates = list.filter(s => NATIVE_ONLY_STANZA_TAGS.includes(stanzaTag(s)));
@@ -303,26 +309,5 @@ export function nativeHostUnwrapCallback({
         throw lastUnavailable || new NativeHostUnavailableError(
             'no stanza on this item could be unwrapped by the host',
         );
-    };
-}
-
-/**
- * Identity-source adapter, in the `{ kind, tryUnwrap(stanza) }` shape the rest
- * of the extension uses. `tryUnwrap` resolves `null` for stanzas this source
- * could never answer -- an ordinary "not mine" -- and otherwise yields
- * `{ fileKeyB64, receipt }`, never a bare key.
- */
-export function nativeMessagingPivIdentity(opts = {}) {
-    const context = opts.context || {};
-    const tags = Object.freeze([...(opts.stanzaTags || NATIVE_ONLY_STANZA_TAGS)]);
-    return {
-        kind: 'native-messaging-piv',
-        host: NATIVE_HOST_NAME,
-        tags,
-        backends: NATIVE_HOST_TAP_BACKENDS,
-        async tryUnwrap(stanza) {
-            if (!tags.includes(stanzaTag(stanza))) return null;
-            return unwrapStanzaWithReceipt(stanza, context);
-        },
     };
 }

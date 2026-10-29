@@ -10,6 +10,19 @@ import org.junit.runner.RunWith
 class RageNativeShapeTest {
 
     @Test
+    fun a_panicking_export_throws_Internal_and_the_process_survives() {
+        repeat(3) {
+            try {
+                RageNative.selfTestPanic()
+                fail("expected Internal, got success")
+            } catch (e: RageNativeException.Internal) {
+                assertTrue("message was: ${e.message}", e.message?.contains("selfTestPanic") == true)
+            }
+        }
+        assertTrue(RageNative.smoke().contains("linked"))
+    }
+
+    @Test
     fun encryptToRecipients_with_invalid_json_throws_MalformedStanza() {
         try {
             RageNative.encryptToRecipients(

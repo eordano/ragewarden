@@ -1,5 +1,7 @@
 package ragewarden.ragedroid.ui.screens
 
+import ragewarden.ragedroid.R
+import androidx.compose.ui.res.stringResource
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -51,7 +53,7 @@ fun TokenExpiredScreen(
             leading = {
                 IconBtn(
                     icon = Icons.Outlined.Close,
-                    contentDescription = "Close",
+                    contentDescription = stringResource(R.string.close),
                     onClick = onLater,
                 )
             },
@@ -79,29 +81,28 @@ fun TokenExpiredScreen(
             }
             Spacer(modifier = Modifier.height(20.dp))
             Text(
-                text = "Session expired.",
+                text = stringResource(R.string.session_expired),
                 style = RageType.h1.copy(fontSize = 26.sp, lineHeight = 30.sp),
                 color = c.fgEmphasis,
                 textAlign = TextAlign.Center,
             )
             Spacer(modifier = Modifier.height(12.dp))
             Text(
-                text = "Your sign-in token timed out. The vault is still encrypted on this " +
-                    "device -- you can keep reading cached items, but new syncs need a fresh token.",
+                text = stringResource(R.string.the_server_would_not_renew_this),
                 style = RageType.body.copy(fontSize = 15.sp, lineHeight = 23.sp),
                 color = c.fgSecondary,
                 textAlign = TextAlign.Center,
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "No data left the device. No master password is required again.",
+                text = stringResource(R.string.signing_in_again_keeps_the_keys),
                 style = RageType.body.copy(fontSize = 13.5.sp, lineHeight = 20.sp, fontStyle = FontStyle.Italic),
                 color = c.fgSecondary,
                 textAlign = TextAlign.Center,
             )
         }
         RageButton(
-            label = "Re-authenticate",
+            label = stringResource(R.string.sign_in_again),
             onClick = onSignIn,
             icon = Icons.Outlined.Key,
             fullWidth = true,
@@ -114,7 +115,7 @@ fun TokenExpiredScreen(
             contentAlignment = Alignment.Center,
         ) {
             Text(
-                text = "Keep working offline",
+                text = stringResource(R.string.keep_working_offline),
                 style = RageType.sansBody.copy(fontSize = 13.sp),
                 color = c.fgSecondary,
             )

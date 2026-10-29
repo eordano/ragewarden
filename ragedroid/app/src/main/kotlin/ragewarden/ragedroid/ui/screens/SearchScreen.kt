@@ -1,5 +1,7 @@
 package ragewarden.ragedroid.ui.screens
 
+import ragewarden.ragedroid.R
+import androidx.compose.ui.res.stringResource
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -160,7 +162,7 @@ fun SearchScreen(
         ) {
             IconBtn(
                 icon = Icons.AutoMirrored.Outlined.ArrowBack,
-                contentDescription = "Back",
+                contentDescription = stringResource(R.string.back),
                 onClick = onBack,
             )
             Row(
@@ -187,7 +189,7 @@ fun SearchScreen(
                     decorationBox = { inner ->
                         if (query.isEmpty()) {
                             Text(
-                                text = "Search vault, recipients, notes",
+                                text = stringResource(R.string.search_vault_recipients_notes),
                                 style = RageType.sansBody,
                                 color = c.fgSecondary,
                             )
@@ -198,7 +200,7 @@ fun SearchScreen(
                 if (query.isNotEmpty()) {
                     IconBtn(
                         icon = Icons.Outlined.Close,
-                        contentDescription = "Clear search",
+                        contentDescription = stringResource(R.string.clear_search),
                         onClick = { query = "" },
                         iconSize = 16,
                     )
@@ -215,7 +217,7 @@ fun SearchScreen(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             FilterChip(
-                label = "Protected only",
+                label = stringResource(R.string.protected_only),
                 icon = Icons.Outlined.Link,
                 active = protectedOnly,
                 onClick = { protectedOnly = !protectedOnly },
@@ -226,8 +228,8 @@ fun SearchScreen(
             if (filterableRecipients.isNotEmpty()) {
                 FilterChip(
                     label = recipientId
-                        ?.let { rid -> filterableRecipients.firstOrNull { it.id == rid }?.name ?: "Recipient" }
-                        ?: "Recipient",
+                        ?.let { rid -> filterableRecipients.firstOrNull { it.id == rid }?.name ?: stringResource(R.string.recipient) }
+                        ?: stringResource(R.string.recipient),
                     icon = Icons.Outlined.Key,
                     active = recipientId != null,
                     onClick = {
@@ -237,7 +239,7 @@ fun SearchScreen(
                 )
             }
             FilterChip(
-                label = folder ?: "Folder",
+                label = folder ?: stringResource(R.string.folder),
                 icon = Icons.Outlined.Folder,
                 active = folder != null,
                 onClick = {
@@ -257,7 +259,7 @@ fun SearchScreen(
                         .padding(horizontal = 8.dp, vertical = 5.dp),
                 ) {
                     Text(
-                        text = "Clear",
+                        text = stringResource(R.string.clear),
                         style = RageType.button.copy(fontWeight = FontWeight.SemiBold),
                         color = c.fgSecondary,
                     )
@@ -280,13 +282,13 @@ fun SearchScreen(
             )
         } else {
             Text(
-                text = "${hits.size} ${if (hits.size == 1) "result" else "results"}",
+                text = androidx.compose.ui.res.pluralStringResource(R.plurals.result_count, hits.size, hits.size),
                 style = RageType.eyebrow,
                 color = c.fgSecondary,
                 modifier = Modifier.padding(start = 18.dp, end = 18.dp, top = 10.dp, bottom = 6.dp),
             )
             if (hits.isEmpty()) {
-                EmptyHint(message = "Nothing matches that search.")
+                EmptyHint(message = stringResource(R.string.nothing_matches_that_search))
             } else {
                 LazyColumn(modifier = Modifier.fillMaxSize()) {
                     items(hits, key = { it.item.id }) { hit ->
@@ -322,22 +324,22 @@ private fun EmptySearchState(
 ) {
     val c = rageColors
     if (recents.isEmpty() && pinned.isEmpty()) {
-        EmptyHint(message = "Type to search, or pick a filter.")
+        EmptyHint(message = stringResource(R.string.type_to_search_or_pick_a))
         return
     }
     LazyColumn(modifier = Modifier.fillMaxSize()) {
         if (recents.isNotEmpty()) {
-            item("recent-label") { SearchSection(label = "Recent") }
+            item("recent-label") { SearchSection(label = stringResource(R.string.recent)) }
             items(recents, key = { "rc-${it.id}" }) { item ->
-                PlainResultRow(item = item, hint = "Recent", hintIcon = null, onClick = { onOpen(item) })
+                PlainResultRow(item = item, hint = stringResource(R.string.recent), hintIcon = null, onClick = { onOpen(item) })
             }
         }
         if (pinned.isNotEmpty()) {
-            item("pinned-label") { SearchSection(label = "Pinned") }
+            item("pinned-label") { SearchSection(label = stringResource(R.string.pinned)) }
             items(pinned, key = { "pn-${it.id}" }) { item ->
                 PlainResultRow(
                     item = item,
-                    hint = "Pinned",
+                    hint = stringResource(R.string.pinned),
                     hintIcon = Icons.Outlined.Star,
                     onClick = { onOpen(item) },
                 )
@@ -477,7 +479,7 @@ private fun SearchResultRowPlus(
                                 .padding(horizontal = 7.dp, vertical = 1.dp),
                         ) {
                             Text(
-                                text = "MATCHED ${match.label().uppercase()}",
+                                text = stringResource(R.string.matched, match.label().uppercase()),
                                 style = RageType.eyebrow,
                                 color = c.accent,
                             )
@@ -486,7 +488,7 @@ private fun SearchResultRowPlus(
                 }
                 val sub = when (match) {
                     MatchField.Notes -> snippet(item.notes.orEmpty(), query)
-                    MatchField.Folder -> "in ${item.folder}"
+                    MatchField.Folder -> stringResource(R.string.in_, item.folder)
                     else -> {
                         val site = item.site.takeIf { it.isNotBlank() }
                         if (site != null) "${item.username} · $site" else item.username

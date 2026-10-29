@@ -74,6 +74,19 @@ object AssistStructureWalker {
         }
     }
 
+    /** What was typed into [ids], for a save request; fields with no text are left out. */
+    fun textValues(structure: AssistStructure, ids: Set<AutofillId>): Map<AutofillId, CharSequence> {
+        val out = HashMap<AutofillId, CharSequence>()
+        fun visit(node: AssistStructure.ViewNode) {
+            val id = node.autofillId
+            val value = node.autofillValue
+            if (id != null && id in ids && value != null && value.isText) out[id] = value.textValue
+            for (i in 0 until node.childCount) visit(node.getChildAt(i))
+        }
+        for (i in 0 until structure.windowNodeCount) structure.getWindowNodeAt(i).rootViewNode?.let(::visit)
+        return out
+    }
+
     private fun readHintCompat(node: AssistStructure.ViewNode): String? =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) node.hint else null
 }

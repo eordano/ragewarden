@@ -3,16 +3,13 @@ const BUILD_FLAGS = Object.freeze(Object.assign(
     (typeof globalThis !== 'undefined' && globalThis.__RAGEWARDEN_BUILD_FLAGS) || {},
 ));
 
-const HOST_ID = 'ragewarden-content-host';
-const CHIP_TAG = 'ragewarden-autofill-chip';
-const PROMPT_TAG = 'ragewarden-autofill-prompt';
+const HOST_ID = `rw-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
 const AUTOFILL_KEYSTROKE_DELAY_MS = 12;
 
 const state = {
     host: null,
     shadow: null,
     chipEl: null,
-    promptEl: null,
     activeField: null,
     matches: [],
     origin: location.origin,
@@ -20,6 +17,8 @@ const state = {
     chipBound: false,
     debounceTimer: null,
     pendingFill: null,
+    lastCredentialField: null,
+    busy: false,
 };
 
 function targetStillValid(el, mustBePassword) {
@@ -114,7 +113,6 @@ function ensureShadowHost() {
     if (state.host && state.host.isConnected) return state.shadow;
     const host = document.createElement('div');
     host.id = HOST_ID;
-    host.setAttribute('aria-hidden', 'true');
     host.style.cssText = 'all: initial; position: absolute; top: 0; left: 0; z-index: 2147483646; pointer-events: none;';
     const shadow = host.attachShadow({ mode: 'closed' });
     const style = document.createElement('style');
@@ -155,54 +153,22 @@ const SHADOW_CSS = `
 .chip-dot { width: 8px; height: 8px; border-radius: 50%; background: #6a8fff; }
 .chip-label { font-weight: 500; letter-spacing: 0.01em; }
 .chip-meta { opacity: 0.65; font-size: 11px; }
-.prompt-backdrop {
-    position: fixed; inset: 0; z-index: 2147483647;
+.picker-backdrop {
+    position: fixed; inset: 0; z-index: 2147483647; pointer-events: auto;
     background: rgba(0,0,0,0.55);
-    pointer-events: auto;
     display: flex; align-items: center; justify-content: center;
     font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
 }
-.prompt-card {
-    background: #1d1d1d;
-    color: #faf6ee;
-    border: 1px solid #2c2c2c;
-    border-radius: 12px;
-    padding: 22px 20px 18px;
-    width: min(360px, 92vw);
-    box-shadow: 0 24px 60px rgba(0,0,0,0.5);
+.picker-card {
+    background: #1d1d1d; color: #faf6ee; border: 1px solid #2c2c2c; border-radius: 12px;
+    padding: 18px; width: min(360px, 92vw); box-shadow: 0 24px 60px rgba(0,0,0,0.5);
 }
-.prompt-title {
-    font-size: 16px; font-weight: 600; margin: 0 0 6px;
+.picker-title { font-size: 15px; font-weight: 600; margin: 0 0 10px; }
+.picker-list { display: grid; gap: 6px; margin-bottom: 12px; }
+.picker-btn {
+    border-radius: 8px; border: 1px solid #2c2c2c; background: #121212; color: #faf6ee;
+    padding: 8px 12px; font: inherit; font-size: 13px; cursor: pointer; text-align: left;
 }
-.prompt-domain {
-    font-family: ui-monospace, "SF Mono", Menlo, monospace;
-    color: #6a8fff;
-    word-break: break-all;
-}
-.prompt-sub {
-    font-size: 12px; opacity: 0.72; margin: 4px 0 18px;
-}
-.prompt-actions {
-    display: flex; gap: 10px; justify-content: flex-end;
-}
-.prompt-btn {
-    border-radius: 8px;
-    border: 1px solid #2c2c2c;
-    background: #121212;
-    color: #faf6ee;
-    padding: 8px 14px;
-    font-size: 13px;
-    cursor: pointer;
-    font-family: inherit;
-}
-.prompt-btn-primary {
-    background: #6a8fff;
-    color: #0e0e16;
-    border-color: #6a8fff;
-    font-weight: 600;
-}
-.prompt-btn:disabled { opacity: 0.6; cursor: default; }
-.prompt-status { margin-top: 10px; font-size: 12px; opacity: 0.7; min-height: 16px; }
 `;
 
 function showChip(field, match) {
@@ -213,7 +179,10 @@ function showChip(field, match) {
     chip.setAttribute('data-ragewarden-chip', '1');
     chip.setAttribute('role', 'button');
     chip.setAttribute('tabindex', '0');
-    chip.setAttribute('aria-label', `Ragewarden autofill into ${state.domain}`);
+    const count = state.matches.length;
+    chip.setAttribute('aria-label', count > 1
+        ? `Ragewarden: ${count} logins for ${state.domain}`
+        : `Ragewarden autofill into ${state.domain}`);
     const dot = document.createElement('span');
     dot.className = 'chip-dot';
     const label = document.createElement('span');
@@ -221,22 +190,26 @@ function showChip(field, match) {
     label.textContent = 'ragewarden';
     const meta = document.createElement('span');
     meta.className = 'chip-meta';
-    meta.textContent = match.name || state.domain;
+    meta.textContent = count > 1 ? `${count} logins` : (match.name || state.domain);
     chip.append(dot, label, meta);
-    positionChip(chip, field);
     chip.addEventListener('click', onChipClick);
     chip.addEventListener('keydown', e => {
         if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onChipClick(); }
     });
     shadow.appendChild(chip);
+    positionChip(chip, field);
     state.chipEl = chip;
     state.activeField = field;
 }
 
 function positionChip(chip, field) {
     const r = field.getBoundingClientRect();
-    chip.style.top = `${Math.max(4, r.top - 28)}px`;
-    chip.style.left = `${r.right - 110}px`;
+    const width = chip.offsetWidth || 110;
+    const height = chip.offsetHeight || 24;
+    const maxLeft = Math.max(4, window.innerWidth - width - 4);
+    chip.style.left = `${Math.min(maxLeft, Math.max(4, r.right - width))}px`;
+    const above = r.top - height - 4;
+    chip.style.top = `${above >= 4 ? above : Math.min(window.innerHeight - height - 4, r.bottom + 4)}px`;
 }
 
 function hideChip() {
@@ -246,9 +219,86 @@ function hideChip() {
     }
 }
 
+function setChipStatus(text) {
+    if (!state.chipEl) return;
+    const meta = state.chipEl.querySelector('.chip-meta');
+    if (meta) meta.textContent = text;
+}
+
+/*
+ * The chip goes straight to the Ragewarden authorization window: that window,
+ * outside this page, is the consent. An in-page "Continue?" sheet added a
+ * click a hostile page could imitate and no security.
+ */
 async function onChipClick() {
-    const match = state.matches[0];
-    if (!match) return;
+    if (state.matches.length === 0 || state.busy) return;
+    if (state.matches.length > 1) {
+        showPicker();
+        return;
+    }
+    await requestFill(state.matches[0]);
+}
+
+function closePicker() {
+    if (state.pickerEl) {
+        state.pickerEl.remove();
+        state.pickerEl = null;
+    }
+    if (state.chipEl) state.chipEl.focus();
+}
+
+/**
+ * Which of several logins for this origin to fill. Choosing is not consent:
+ * the Ragewarden window that opens next names the chosen item and asks for the tap.
+ */
+function showPicker() {
+    const shadow = ensureShadowHost();
+    if (state.pickerEl) state.pickerEl.remove();
+    const backdrop = document.createElement('div');
+    backdrop.className = 'picker-backdrop';
+    backdrop.setAttribute('data-ragewarden-picker', '1');
+    const card = document.createElement('div');
+    card.className = 'picker-card';
+    card.setAttribute('role', 'dialog');
+    card.setAttribute('aria-modal', 'true');
+    card.setAttribute('aria-labelledby', 'ragewarden-picker-title');
+    const title = document.createElement('h2');
+    title.className = 'picker-title';
+    title.id = 'ragewarden-picker-title';
+    title.textContent = `Which login for ${state.domain}?`;
+    const list = document.createElement('div');
+    list.className = 'picker-list';
+    for (const m of state.matches) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'picker-btn';
+        b.setAttribute('data-ragewarden-pick', m.id);
+        b.textContent = [m.name, m.username].filter(Boolean).join(' · ') || m.id;
+        b.addEventListener('click', () => { closePicker(); requestFill(m); });
+        list.appendChild(b);
+    }
+    const cancel = document.createElement('button');
+    cancel.className = 'picker-btn';
+    cancel.type = 'button';
+    cancel.textContent = 'Cancel';
+    cancel.addEventListener('click', closePicker);
+    card.append(title, list, cancel);
+    backdrop.appendChild(card);
+    backdrop.addEventListener('click', e => { if (e.target === backdrop) closePicker(); });
+    card.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') { e.preventDefault(); closePicker(); return; }
+        if (e.key !== 'Tab') return;
+        const items = [...card.querySelectorAll('button')];
+        const active = card.getRootNode().activeElement;
+        if (e.shiftKey && active === items[0]) { e.preventDefault(); items[items.length - 1].focus(); }
+        else if (!e.shiftKey && active === items[items.length - 1]) { e.preventDefault(); items[0].focus(); }
+    });
+    shadow.appendChild(backdrop);
+    state.pickerEl = backdrop;
+    list.firstChild.focus();
+}
+
+async function requestFill(match) {
     const { usernameEl, passwordEl } = findCredentialPair(state.activeField)
         || { usernameEl: null, passwordEl: null };
     state.pendingFill = {
@@ -258,125 +308,34 @@ async function onChipClick() {
         href: location.href,
         at: Date.now(),
     };
-    showPromptSheet(match);
-}
-
-function showPromptSheet(match) {
-    const shadow = ensureShadowHost();
-    if (state.promptEl) state.promptEl.remove();
-    const backdrop = document.createElement('div');
-    backdrop.className = 'prompt-backdrop';
-    backdrop.setAttribute('data-ragewarden-prompt', '1');
-    const card = document.createElement('div');
-    card.className = 'prompt-card';
-    const title = document.createElement('h2');
-    title.className = 'prompt-title';
-    title.setAttribute('data-ragewarden-action', 'autofill');
-    const dom = document.createElement('span');
-    dom.className = 'prompt-domain';
-    dom.textContent = state.domain;
-    title.append(document.createTextNode('Autofill into '), dom, document.createTextNode('?'));
-    const sub = document.createElement('div');
-    sub.className = 'prompt-sub';
-    sub.textContent = match.rage
-        ? 'Continue opens a separate Ragewarden window, outside this page, where you tap '
-          + 'your security key to decrypt this item for one fill.'
-        : 'This item is NOT hardware-encrypted. Continue opens a separate Ragewarden '
-          + 'window, outside this page, where you tap your security key to authorize '
-          + 'releasing it for one fill.';
-    const actions = document.createElement('div');
-    actions.className = 'prompt-actions';
-    const cancel = document.createElement('button');
-    cancel.className = 'prompt-btn';
-    cancel.type = 'button';
-    cancel.textContent = 'Cancel';
-    const go = document.createElement('button');
-    go.className = 'prompt-btn prompt-btn-primary';
-    go.type = 'button';
-    go.setAttribute('data-ragewarden-confirm', '1');
-    go.textContent = 'Continue';
-    const status = document.createElement('div');
-    status.className = 'prompt-status';
-    status.setAttribute('data-ragewarden-status', '1');
-    actions.append(cancel, go);
-    card.append(title, sub, actions, status);
-    backdrop.appendChild(card);
-    shadow.appendChild(backdrop);
-    state.promptEl = backdrop;
-    /*
-     * A hardware tap is spent the instant it happens, so nothing may throw the
-     * result of one away behind the user's back.
-     *
-     * Dismissing the backdrop mid-ceremony used to be allowed: the go-handler
-     * disables the two buttons but the backdrop kept its listener, and one
-     * stray click ran closePromptSheet(), which nulls state.pendingFill and
-     * detaches this card. The unlock kept running to completion -- the user
-     * really tapped, the worker really settled ok with plaintext, the release
-     * was really recorded -- and then fillCredentialPair() threw "no fill target
-     * was captured when you authorized" into a status node that was no longer
-     * in the document. Real tap, real release, nothing filled, nothing said.
-     * While the request is in flight the backdrop stops dismissing; Cancel is
-     * already disabled across the same window.
-     */
-    let inFlight = false;
-    cancel.addEventListener('click', () => closePromptSheet());
-    backdrop.addEventListener('click', e => {
-        if (inFlight || e.target !== backdrop) return;
-        closePromptSheet();
-    });
-    go.addEventListener('click', async () => {
-        go.disabled = true;
-        cancel.disabled = true;
-        inFlight = true;
-        status.textContent = 'Opening the Ragewarden authorization window '
-            + '(look outside this page)...';
-        let resp = null;
-        try {
-            resp = await sendBg({
-                kind: 'vault.unlock',
-                cipherId: match.id,
-                action: 'autofill',
-            });
-            if (!resp || !resp.ok) {
-                status.textContent = (resp && resp.error) || 'failed';
-                cancel.disabled = false;
-                return;
-            }
-            if (!resp.ceremony || !(resp.ceremony.taps > 0)) {
-                status.textContent = 'refused: no hardware tap was recorded for this release';
-                cancel.disabled = false;
-                return;
-            }
-            if (resp.ceremony.mock) {
-                status.textContent = 'MOCK TAP BUILD -- NO DEVICE WAS TOUCHED. '
-                    + 'Filling anyway because this is a development build.';
-                console.warn(
-                    '[ragewarden] autofill authorized by a MOCK hardware tap -- '
-                    + 'this build is not safe for real secrets',
-                );
-            }
-            await fillCredentialPair(resp.plaintext);
-            closePromptSheet();
-        } catch (err) {
-            status.textContent = (err && err.message) || String(err);
-            cancel.disabled = false;
-        } finally {
-            inFlight = false;
-            if (resp && resp.plaintext && typeof resp.plaintext === 'object') {
-                resp.plaintext.username = '';
-                resp.plaintext.password = '';
-            }
-            go.disabled = false;
+    state.busy = true;
+    setChipStatus('opening Ragewarden...');
+    let resp = null;
+    try {
+        resp = await sendBg({ kind: 'vault.unlock', cipherId: match.id, action: 'autofill' });
+        if (!resp || !resp.ok) {
+            setChipStatus((resp && resp.error) || 'not filled');
+            return;
         }
-    });
-}
-
-function closePromptSheet() {
-    if (state.promptEl) {
-        state.promptEl.remove();
-        state.promptEl = null;
+        if (!resp.ceremony || !(resp.ceremony.taps > 0)) {
+            setChipStatus('refused: no hardware tap was recorded');
+            return;
+        }
+        if (resp.ceremony.mock) {
+            console.warn('[ragewarden] autofill authorized by a MOCK hardware tap -- not safe for real secrets');
+        }
+        await fillCredentialPair(resp.plaintext);
+        setChipStatus(match.name || state.domain);
+    } catch (err) {
+        setChipStatus((err && err.message) || String(err));
+    } finally {
+        state.busy = false;
+        state.pendingFill = null;
+        if (resp && resp.plaintext && typeof resp.plaintext === 'object') {
+            resp.plaintext.username = '';
+            resp.plaintext.password = '';
+        }
     }
-    state.pendingFill = null;
 }
 
 async function fillCredentialPair(plaintext) {
@@ -478,6 +437,7 @@ function bindFocusListener() {
     document.addEventListener('focusin', e => {
         const el = e.target;
         if (isPasswordField(el) || isLikelyUsernameField(el)) {
+            state.lastCredentialField = el;
             debounceShowChip(el);
         }
     }, true);
@@ -498,31 +458,49 @@ function bindFocusListener() {
     });
 }
 
-/**
- * Fill a credential pair pushed from an extension page (the popup), after the
- * popup has already run the tap ceremony for this exact item.
- *
- * Only extension pages can reach this: `chrome.tabs.sendMessage` is not
- * available to content scripts, and `sender.tab` is set for anything that came
- * from a page. The target fields are resolved here, at fill time, so the popup
- * never gets to name a field.
+function visiblePasswordFields() {
+    return Array.from(document.querySelectorAll('input')).filter(i => isPasswordField(i) && targetStillValid(i, true));
+}
+
+/*
+ * The field to fill for a popup-initiated fill: the credential field that has
+ * focus, else the one the user last focused on this page, else the only
+ * visible password field. Several candidates and no choice is a refusal --
+ * guessing is how a password lands in the wrong form.
  */
-async function fillFromExtensionPage(msg) {
-    const active = document.activeElement;
-    let pair = (isPasswordField(active) || isLikelyUsernameField(active))
-        ? findCredentialPair(active)
-        : { usernameEl: null, passwordEl: null };
-    if (!pair.passwordEl) {
-        for (const i of document.querySelectorAll('input')) {
-            if (isPasswordField(i) && targetStillValid(i, true)) {
-                pair = { passwordEl: i, usernameEl: findSiblingUsername(i) };
-                break;
-            }
+function chosenCredentialPair() {
+    for (const el of [document.activeElement, state.lastCredentialField]) {
+        if ((isPasswordField(el) || isLikelyUsernameField(el)) && targetStillValid(el, false)) {
+            return findCredentialPair(el);
         }
     }
-    if (!pair.passwordEl && !pair.usernameEl) {
-        throw new Error(`no login field found on ${location.host}`);
+    const candidates = visiblePasswordFields();
+    if (candidates.length === 1) {
+        return { passwordEl: candidates[0], usernameEl: findSiblingUsername(candidates[0]) };
     }
+    if (candidates.length > 1) {
+        throw new Error(
+            `${location.host} has ${candidates.length} password fields -- click into the one `
+            + 'to fill, then autofill again. Nothing was filled.',
+        );
+    }
+    throw new Error(`no login field found on ${location.host}`);
+}
+
+/**
+ * Fill a credential pair pushed from the popup after it ran the tap ceremony.
+ * The popup pins the origin it captured before the tap; a page that navigated
+ * away meanwhile is refused. Only extension pages reach this (sender.tab is
+ * set for anything that came from a page).
+ */
+async function fillFromExtensionPage(msg) {
+    if (!msg.expectedOrigin || msg.expectedOrigin !== location.origin) {
+        throw new Error(
+            `the tap was for ${msg.expectedOrigin || 'another page'} but this tab is now `
+            + `${location.origin} -- nothing was filled`,
+        );
+    }
+    const pair = chosenCredentialPair();
     state.pendingFill = {
         usernameEl: pair.usernameEl,
         passwordEl: pair.passwordEl,
@@ -558,11 +536,9 @@ function bindExtensionFillListener() {
 }
 
 function init() {
-    if (window.top !== window) {
-        return;
-    }
     bindFocusListener();
     bindExtensionFillListener();
+    // test-hooks:begin
     if (BUILD_FLAGS.testHooks !== true) {
         return;
     }
@@ -573,39 +549,26 @@ function init() {
             origin: state.origin,
             domain: state.domain,
             chipPresent: !!state.chipEl,
-            promptPresent: !!state.promptEl,
+            promptPresent: false,
             matches: state.matches,
         }),
         clickChip: () => state.chipEl ? state.chipEl.click() : null,
-        readPromptText: () => {
-            if (!state.promptEl) return null;
-            const t = state.promptEl.querySelector('.prompt-title');
-            return t ? t.textContent : null;
-        },
-        confirmPrompt: () => {
-            if (!state.promptEl) throw new Error('no prompt visible');
-            const btn = state.promptEl.querySelector('[data-ragewarden-confirm="1"]');
-            if (!btn) throw new Error('confirm button missing');
-            btn.click();
-        },
-        waitForPromptClosed: () => new Promise((resolve) => {
-            if (!state.promptEl) return resolve();
-            const i = setInterval(() => {
-                if (!state.promptEl) { clearInterval(i); resolve(); }
-            }, 30);
+        waitForFillSettled: () => new Promise((resolve) => {
+            const i = setInterval(() => { if (!state.busy) { clearInterval(i); resolve(); } }, 30);
         }),
         snapshotInternalState: () => {
             const shadowText = state.shadow ? walkShadowText(state.shadow) : '';
             return {
                 hasMatches: state.matches.length > 0,
                 chipPresent: !!state.chipEl,
-                promptPresent: !!state.promptEl,
+                promptPresent: false,
                 matchesJson: JSON.stringify(state.matches),
                 shadowTextLength: shadowText.length,
                 shadowTextSample: shadowText.slice(0, 256),
             };
         },
     };
+    // test-hooks:end
 }
 
 function walkShadowText(root) {

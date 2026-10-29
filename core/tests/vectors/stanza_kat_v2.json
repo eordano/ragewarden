@@ -1,0 +1,78 @@
+{
+  "comment": "Known answers for core::stanza_format writers. Inputs are fixed; outputs must match byte for byte. Regenerate only with RAGEWARDEN_BLESS_VECTORS=1 after a deliberate format change.",
+  "fido2_hmac": {
+    "args": [
+      "a2F0LWNyZWRlbnRpYWw",
+      "UVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVE",
+      "kat.example",
+      "dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHQ"
+    ],
+    "body_hex": "e864596d53057d5aaf79e07242e08f4b9dd18614ce982a8dc5543c599cb16ee5",
+    "tag": "fido2-hmac"
+  },
+  "inputs": {
+    "file_key_hex": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+    "keystore_key_handle": "kat-alias",
+    "p256_ephemeral_secret_hex": "3535353535353535353535353535353535353535353535353535353535353535",
+    "p256_recipient_pub_hex": "03462dba1ae4fc1a968b4dacf20cdd6dbe1fae34aa971514a63d3405c3d1cfd383",
+    "p256_recipient_secret_hex": "2121212121212121212121212121212121212121212121212121212121212121",
+    "prf_credential_id_hex": "6b61742d63726564656e7469616c",
+    "prf_output_hex": "6363636363636363636363636363636363636363636363636363636363636363",
+    "prf_rp_id": "kat.example",
+    "prf_salt_hex": "5151515151515151515151515151515151515151515151515151515151515151",
+    "wrap_salt_hex": "7474747474747474747474747474747474747474747474747474747474747474",
+    "x25519_ephemeral_secret_hex": "1717171717171717171717171717171717171717171717171717171717171717",
+    "x25519_recipient_pub_hex": "132c442be010fbd57e72603328aa76e71fccc1503aae219327d14d9c9993f472",
+    "x25519_recipient_secret_hex": "4242424242424242424242424242424242424242424242424242424242424242"
+  },
+  "piv_p256": {
+    "args": [
+      "XS6IeA",
+      "ArMQAmhzFvmQDMDOnmwie+ipgr4cPsVHpBreviKJ26r1"
+    ],
+    "body_hex": "17e93012a2f33df9e360a489bcb1ca675ea1348e74e4decc45f51184e6d40ecc",
+    "tag": "piv-p256"
+  },
+  "piv_x25519_v1": {
+    "args": [
+      "8T/vPvqVmKKiP8dWv2iP6LvX9s+VKLuu87REJojwqzE",
+      "gtqzKg"
+    ],
+    "body_hex": "3534e1dd2cb9f2f9ac0686b86852cd10892223890529d790b151173585780011",
+    "tag": "piv-p256"
+  },
+  "piv_x25519_v2": {
+    "args": [
+      "8T/vPvqVmKKiP8dWv2iP6LvX9s+VKLuu87REJojwqzE",
+      "gtqzKg"
+    ],
+    "body_hex": "26ceb6cee78f2240d4f7d758c6090df3b03344052b7054ade126ffb0008ade5b",
+    "tag": "piv-x25519-v2"
+  },
+  "ragedroid_keystore_v1": {
+    "args": [
+      "NNQXILLBNRUWC4Y",
+      "ArMQAmhzFvmQDMDOnmwie+ipgr4cPsVHpBreviKJ26r1"
+    ],
+    "body_hex": "b1ac9a7cd3be67b173964220e92d284951a503e40bb4f59d18eb2c78778d43d2",
+    "tag": "ragedroid-keystore-v1"
+  },
+  "ragedroid_keystore_v2": {
+    "args": [
+      "NNQXILLBNRUWC4Y",
+      "ArMQAmhzFvmQDMDOnmwie+ipgr4cPsVHpBreviKJ26r1"
+    ],
+    "body_hex": "c5ec1abff5e663cf30ede58b98317e0a4b2c252ac70e06b425c232bcb1221b68",
+    "tag": "ragedroid-keystore-v2"
+  },
+  "webauthn_prf_v1": {
+    "args": [
+      "a2F0LWNyZWRlbnRpYWw",
+      "kat.example",
+      "UVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVE",
+      "dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHQ"
+    ],
+    "body_hex": "ce64462ce43ba3f7bbd8f12cb7fa18f0b4ce4a1f0fe67ebee779531943b7e206",
+    "tag": "webauthn-prf-v1"
+  }
+}

@@ -2,6 +2,7 @@
 name = "ragemanifest"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
@@ -25,11 +26,11 @@ base64 = { workspace = true }
 async-trait = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-js-sys = "0.3"
+wasm-bindgen = "=0.2.127"
+wasm-bindgen-futures = "=0.4.77"
+js-sys = "=0.3.104"
 age-core = { workspace = true }
-web-sys = { version = "0.3", features = [
+web-sys = { version = "=0.3.104", features = [
     "Headers",
     "Request",
     "RequestInit",

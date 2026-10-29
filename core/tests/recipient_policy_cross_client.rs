@@ -14,28 +14,20 @@
 //!      client the same recipient set for the same registry, no matter which
 //!      route the client takes into core, with exactly one sanctioned and
 //!      *reported* difference (`SkipReason::NoLocalAuthenticator`);
-//!   3. pins the wire encoding of that set into `tests/vectors/`, which the
-//!      ragedroid (Kotlin) side reads back
-//!      (`ragedroid/.../RecipientPolicyConformanceTest.kt`) so a serialization
-//!      drift in Kotlin fails a test instead of producing an unopenable item.
-//!
-//! This file used to claim the ragemanifest (JS) side read the vectors too. It
-//! does not -- nothing under `ragemanifest/` opens
-//! `recipient_policy_v1.json`. The claim mattered because it read as coverage:
-//! it says the browser's wire encoding is pinned, when in fact the browser is
-//! the client that mistagged its own passkey as `Fido2` (see
-//! `browser_passkey_prf_is_a_different_recipient_than_fido2_hmac` below) for as
-//! long as this comment stood. The vectors carry a browser-passkey case anyway,
-//! so a JS reader can be added without regenerating them; until one exists this
-//! comment must not pretend otherwise.
+//!   3. pins the wire encoding of that set into `tests/vectors/`, which each
+//!      client's own route reads back and must reproduce: ragedroid's JNI
+//!      `select_encrypt_recipients` (`ragedroid/jni`, plus Kotlin's
+//!      `RecipientPolicyConformanceTest`) and the browser's
+//!      `recipient_select::select_encrypt_recipients`
+//!      (`ragemanifest/tests/recipient_vectors.rs`), so a client that adds its
+//!      own filter or drifts in serialization fails a test instead of
+//!      producing an unopenable item.
 
 use std::collections::BTreeSet;
 
-use ragewarden_core::policy::{
-    self, LocalAuthenticators, Selection, SkipReason,
-};
-use ragewarden_core::registry::{kinds, WireDocument, WireEntry};
 use ragewarden_core::Recipient;
+use ragewarden_core::policy::{self, LocalAuthenticators, Selection, SkipReason};
+use ragewarden_core::registry::{WireDocument, WireEntry, kinds};
 
 const VECTOR_PATH: &str = "tests/vectors/recipient_policy_v1.json";
 
@@ -63,6 +55,8 @@ fn blank(id: &str, kind: &str, created_at: i64) -> WireEntry {
         fido2_rp_id: None,
         fido2_salt: None,
         recovery_armored_pubkey: None,
+        stanza_version: None,
+        attestation_public_key: None,
     }
 }
 
@@ -82,14 +76,12 @@ fn blank(id: &str, kind: &str, created_at: i64) -> WireEntry {
 /// pins the exact skip list this registry produces.
 fn fixture_registry() -> Vec<WireEntry> {
     let mut software = blank("e-software", kinds::SOFTWARE, 1_000);
-    software.recovery_armored_pubkey = Some(
-        "age1nukguzqzgkpd087j2ju3v54x9rdhzfq6gwms9cw35lvdwq3chpuq6xz32k".into(),
-    );
+    software.recovery_armored_pubkey =
+        Some("age1nukguzqzgkpd087j2ju3v54x9rdhzfq6gwms9cw35lvdwq3chpuq6xz32k".into());
 
     let mut recovery = blank("e-recovery", kinds::RECOVERY, 2_000);
-    recovery.recovery_armored_pubkey = Some(
-        "age1zvkyg2lqzraa2lnjvqej32nkuu0ues2s82hzrye869xeexvn73equnujwj".into(),
-    );
+    recovery.recovery_armored_pubkey =
+        Some("age1zvkyg2lqzraa2lnjvqej32nkuu0ues2s82hzrye869xeexvn73equnujwj".into());
 
     let mut yubikey = blank("e-yubikey", kinds::YUBIKEY, 3_000);
     yubikey.piv_pubkey = Some(hex(&[0x11u8; 32]));
@@ -109,7 +101,6 @@ fn fixture_registry() -> Vec<WireEntry> {
     disabled.default_encrypt = false;
     disabled.recovery_armored_pubkey = Some("age1disabledxxxxxxxxxxxxxxxxxxxxx".into());
 
-    // 32-byte legacy keystore pubkey: right kind, unusable material.
     let mut malformed = blank("e-malformed", kinds::STRONG_BOX, 7_000);
     malformed.keystore_pubkey = Some("00".repeat(32));
     malformed.keystore_handle = Some("legacy".into());
@@ -130,14 +121,11 @@ fn fixture_registry() -> Vec<WireEntry> {
 /// this crate cannot rebuild; a new top-level vector field is invisible to it
 /// (`Json { ignoreUnknownKeys = true }`, and it looks fields up by name).
 fn browser_passkey_registry() -> Vec<WireEntry> {
-    // An Android passkey / hmac-secret security key: correctly `Fido2`.
     let mut hmac_secret = blank("e-fido2", kinds::FIDO2, 5_000);
     hmac_secret.fido2_credential_id = Some(hex(b"fixture-credential"));
     hmac_secret.fido2_salt = Some(hex(&[0x22u8; 32]));
     hmac_secret.fido2_rp_id = Some("ragewarden".into());
 
-    // The browser extension's WebAuthn-PRF passkey. Same fields, different
-    // stanza -- hence a different kind.
     let mut prf = blank("e-browser-passkey", kinds::PASSKEY_PRF, 8_000);
     prf.display_name = "Browser passkey".into();
     prf.device_label = "Browser extension".into();
@@ -175,8 +163,6 @@ fn browser_passkey_prf_is_a_different_recipient_than_fido2_hmac() {
         "the PRF label is the entry's displayName; a client shows it to the user",
     );
 
-    // Retagging the browser's entry as `Fido2` -- the bug -- silently changes the
-    // stanza it will be wrapped into. Nothing else about the entry moves.
     let mut mistagged = registry[1].clone();
     mistagged.kind = kinds::FIDO2.into();
     assert!(
@@ -187,8 +173,6 @@ fn browser_passkey_prf_is_a_different_recipient_than_fido2_hmac() {
         "the mistag is silent at the registry layer, which is why it survived",
     );
 
-    // And it is not cosmetic: the fingerprints differ, so an item wrapped under
-    // one tag names a recipient the other cannot match.
     assert_ne!(
         fingerprint(&[prf]),
         fingerprint(&[mistagged.to_recipient().unwrap()]),
@@ -202,8 +186,7 @@ fn browser_passkey_prf_is_a_different_recipient_than_fido2_hmac() {
 fn holding_one_prf_authenticator_never_reaches_the_other() {
     let registry = browser_passkey_registry();
 
-    let nothing_local =
-        policy::select_for_encrypt(&registry, &[], &LocalAuthenticators::none());
+    let nothing_local = policy::select_for_encrypt(&registry, &[], &LocalAuthenticators::none());
     assert!(
         nothing_local.recipients.is_empty(),
         "no authenticator here, so neither PRF entry may be wrapped to: {:?}",
@@ -220,7 +203,6 @@ fn holding_one_prf_authenticator_never_reaches_the_other() {
         "both coverage holes must be reported, not just the one that decodes",
     );
 
-    // The browser: holds its own passkey, cannot reach the hmac-secret key.
     let browser = policy::select_for_encrypt(
         &registry,
         &[],
@@ -256,6 +238,12 @@ fn fingerprint(recipients: &[Recipient]) -> BTreeSet<String> {
                 public_key,
                 serial,
                 slot,
+                ..
+            } => format!("piv:{}:{serial}:{slot}", hex(public_key)),
+            Recipient::YubiKeyPivP256 {
+                public_key,
+                serial,
+                slot,
             } => format!("piv:{}:{serial}:{slot}", hex(public_key)),
             Recipient::Fido2HmacSecret {
                 credential_id,
@@ -275,6 +263,7 @@ fn fingerprint(recipients: &[Recipient]) -> BTreeSet<String> {
             Recipient::AndroidKeystore {
                 public_key,
                 key_handle,
+                ..
             } => format!("keystore:{}:{key_handle}", hex(public_key)),
             Recipient::SoftwarePassphrase { armored_pubkey } => {
                 format!("software:{}", armored_pubkey.as_str())
@@ -282,10 +271,6 @@ fn fingerprint(recipients: &[Recipient]) -> BTreeSet<String> {
         })
         .collect()
 }
-
-// ---------------------------------------------------------------------------
-// The three legacy filters, reproduced as they were before this change.
-// ---------------------------------------------------------------------------
 
 /// rageterm `recipients.rs::load_active_recipients_for_encrypt`: registry
 /// entries via `to_recipient_if_active`, then `encryptable_from_this_device`
@@ -340,7 +325,6 @@ fn the_three_legacy_filters_disagreed_on_one_registry() {
     assert_ne!(term, droid);
     assert_ne!(manifest, droid);
 
-    // The concrete data-loss cases, spelled out.
     let sw = "software:age1nukguzqzgkpd087j2ju3v54x9rdhzfq6gwms9cw35lvdwq3chpuq6xz32k";
     assert!(
         !droid.iter().any(|f| f == sw),
@@ -387,26 +371,19 @@ fn the_three_legacy_filters_disagreed_on_one_registry() {
 /// called the policy three times with identical arguments, which of course
 /// could never fail.
 #[test]
-fn three_client_routes_agree_except_for_the_named_prf_exception() {
+fn policy_is_deterministic_across_order_json_hops_and_local_copies_except_the_reachable_prf() {
     let registry = fixture_registry();
 
-    // rageterm: direct link, plus its own local copy of the software entry.
-    // Same id and same key material, different device label -- the merge must
-    // collapse it to one recipient, not wrap the key twice.
     let mut terminal_local = blank("e-software", kinds::SOFTWARE, 1_000);
     terminal_local.device_label = "rageterm-laptop".into();
-    terminal_local.recovery_armored_pubkey = Some(
-        "age1nukguzqzgkpd087j2ju3v54x9rdhzfq6gwms9cw35lvdwq3chpuq6xz32k".into(),
-    );
-    // A terminal has no WebAuthn stack, so it can never evaluate a passkey PRF.
+    terminal_local.recovery_armored_pubkey =
+        Some("age1nukguzqzgkpd087j2ju3v54x9rdhzfq6gwms9cw35lvdwq3chpuq6xz32k".into());
     let rageterm = policy::select_for_encrypt(
         &registry,
         std::slice::from_ref(&terminal_local),
         &LocalAuthenticators::none(),
     );
 
-    // ragemanifest: through wasm, which in practice means through JSON -- and it
-    // is the one client sitting in front of the enrolled passkey.
     let serialized = serde_json::to_string(&WireDocument {
         schema: ragewarden_core::registry::SCHEMA_VERSION,
         entries: registry.clone(),
@@ -419,11 +396,6 @@ fn three_client_routes_agree_except_for_the_named_prf_exception() {
         &LocalAuthenticators::from_ids(["e-fido2"]),
     );
 
-    // ragedroid: over JNI, entries in whatever order the Kotlin side iterated.
-    // It names its StrongBox entry as locally reachable, which is true but
-    // inert: StrongBox is an asymmetric wrap, not a PRF. A client must not be
-    // able to talk itself into a passkey it does not hold by listing something
-    // else it does.
     let mut jni_order = registry.clone();
     jni_order.reverse();
     let ragedroid = policy::select_for_encrypt(
@@ -436,16 +408,12 @@ fn three_client_routes_agree_except_for_the_named_prf_exception() {
     let manifest = fingerprint(&ragemanifest.recipients);
     let droid = fingerprint(&ragedroid.recipients);
 
-    // Route, entry order and an inert LocalAuthenticators id must change
-    // nothing -- not the set, and not the order core hands to the age wrapper.
     assert_eq!(term, droid, "route/order changed the recipient set");
     assert_eq!(
         rageterm.recipients, ragedroid.recipients,
         "recipient ORDER diverged; clients must wrap in the same sequence",
     );
 
-    // The documented divergence, and only it: the browser keeps the PRF
-    // recipient that the terminal and the phone must skip.
     let extra: Vec<&String> = manifest.difference(&term).collect();
     assert_eq!(
         extra.len(),
@@ -458,8 +426,6 @@ fn three_client_routes_agree_except_for_the_named_prf_exception() {
         "reaching an authenticator must never REMOVE a recipient",
     );
 
-    // ... and the two clients that skipped it are told so, by id. This is what
-    // makes the exception an exception rather than the old silent data loss.
     for (name, sel) in [("rageterm", &rageterm), ("ragedroid", &ragedroid)] {
         let unreachable: Vec<&str> = sel
             .unreachable_authenticators()
@@ -477,7 +443,6 @@ fn three_client_routes_agree_except_for_the_named_prf_exception() {
         "the client holding the passkey has no coverage hole to report",
     );
 
-    // The pinned answer all three share.
     assert_eq!(
         term.len(),
         4,
@@ -494,13 +459,9 @@ fn three_client_routes_agree_except_for_the_named_prf_exception() {
 fn the_only_divergence_is_a_named_reported_exception() {
     let entries = fixture_registry();
 
-    let no_authenticator =
-        policy::select_for_encrypt(&entries, &[], &LocalAuthenticators::none());
-    let holds_passkey = policy::select_for_encrypt(
-        &entries,
-        &[],
-        &LocalAuthenticators::from_ids(["e-fido2"]),
-    );
+    let no_authenticator = policy::select_for_encrypt(&entries, &[], &LocalAuthenticators::none());
+    let holds_passkey =
+        policy::select_for_encrypt(&entries, &[], &LocalAuthenticators::from_ids(["e-fido2"]));
 
     let a = fingerprint(&no_authenticator.recipients);
     let b = fingerprint(&holds_passkey.recipients);
@@ -513,9 +474,6 @@ fn the_only_divergence_is_a_named_reported_exception() {
         "holding an authenticator must never remove a recipient",
     );
 
-    // A client that cannot reach the authenticator is told which coverage it
-    // is missing -- this is the property that makes the exception explicit
-    // rather than an accident of three separate filters.
     let unreachable: Vec<&str> = no_authenticator
         .unreachable_authenticators()
         .map(|s| s.id.as_str())
@@ -526,13 +484,12 @@ fn the_only_divergence_is_a_named_reported_exception() {
 
 #[test]
 fn every_skip_carries_a_reason() {
-    let sel = policy::select_for_encrypt(
-        &fixture_registry(),
-        &[],
-        &LocalAuthenticators::none(),
-    );
-    let mut by_id: Vec<(&str, SkipReason)> =
-        sel.skipped.iter().map(|s| (s.id.as_str(), s.reason)).collect();
+    let sel = policy::select_for_encrypt(&fixture_registry(), &[], &LocalAuthenticators::none());
+    let mut by_id: Vec<(&str, SkipReason)> = sel
+        .skipped
+        .iter()
+        .map(|s| (s.id.as_str(), s.reason))
+        .collect();
     by_id.sort_by_key(|(id, _)| *id);
     assert_eq!(
         by_id,
@@ -577,14 +534,6 @@ fn wire_vectors_match_the_checked_in_file() {
         entries: browser.clone(),
     };
 
-    // The `browser_passkey_*` fields are ADDED, never folded into the four
-    // above. `registry` / `no_local_authenticator` / `holds_fido2` are read by
-    // name from Kotlin, which asserts their exact recipient counts and skip
-    // list; retagging `e-fido2` in place -- the obvious "fix" -- would both break
-    // that reader and be wrong, because `Fido2` is the correct kind for the
-    // Android passkeys ragedroid publishes. What was actually broken is that no
-    // vector pinned the *browser's* kind at all, so nothing failed when
-    // ragemanifest published its PRF passkey as `Fido2`.
     #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
     struct Vectors {
         policy_version: u32,
@@ -637,6 +586,6 @@ fn wire_vectors_match_the_checked_in_file() {
         .unwrap_or_else(|e| panic!("{VECTOR_PATH} does not parse: {e}"));
     assert_eq!(
         parsed, actual,
-        "{VECTOR_PATH} is stale; the Kotlin and JS conformance tests read it",
+        "{VECTOR_PATH} is stale; the ragedroid and ragemanifest conformance tests read it",
     );
 }

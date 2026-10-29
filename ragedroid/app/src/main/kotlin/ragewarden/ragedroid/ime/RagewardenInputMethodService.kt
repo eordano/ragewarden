@@ -1,11 +1,14 @@
 package ragewarden.ragedroid.ime
 
+import androidx.compose.ui.res.stringResource
+import ragewarden.ragedroid.R
+import ragewarden.ragedroid.ui.components.rejectObscuredTouches
+import ragewarden.ragedroid.ui.components.buttonTarget
 import android.inputmethodservice.InputMethodService
 import android.util.Log
 import android.view.View
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,6 +23,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Recomposer
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -27,6 +31,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.AndroidUiDispatcher
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
@@ -39,7 +44,13 @@ import androidx.savedstate.SavedStateRegistryController
 import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import kotlinx.collections.immutable.ImmutableList
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import android.text.InputType
+import android.view.inputmethod.EditorInfo
 import ragewarden.ragedroid.data.LockState
 import ragewarden.ragedroid.data.VaultBridge
 import ragewarden.ragedroid.di.appEntryPoint
@@ -50,27 +61,11 @@ import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
 
 /**
- * Keyboard delivery for **unprotected** items only, and only while the vault is
- * unlocked.
- *
- * An `InputMethodService` is not an Activity: it cannot host `BiometricPrompt`,
- * cannot show Credential Manager's sheet, and cannot start NFC reader-mode
- * discovery. So it cannot run the hardware ceremony, and it must not pretend to.
- *
- * An earlier version filtered `rage` items out of the list -- correctly -- and
- * then ran the full `InlineTapReveal` "tap to authorize" ceremony over the
- * items that were left, i.e. a hardware-consent dialog for credentials that had
- * no hardware protection and required no authorization. That is worse than no
- * prompt: it teaches the user that the ceremony is decorative. It is replaced
- * here by a plain confirmation that says what it is, plus an honest count of the
- * protected items this surface deliberately will not touch.
- *
- * The version after that still contained no reference to the vault lock at all.
- * It read [VaultBridge]'s in-process cache, which stays populated while locked,
- * so locking the vault did not stop the keyboard listing its contents or typing
- * a password out of it. Both the listing and the delivery now go through
- * [ImeDelivery], which consults [LockState] on every call; nothing in this class
- * reaches the backend directly.
+ * Keyboard delivery, only while the vault is unlocked. Unprotected items are
+ * typed after a plain confirmation; a protected item opens [ImeAuthActivity]
+ * for the hardware tap, and is typed once the same field has focus again.
+ * Every listing and delivery goes through [ImeDelivery], which consults
+ * [LockState] on every call; nothing in this class reaches the backend directly.
  */
 class RagewardenInputMethodService :
     InputMethodService(),
@@ -81,8 +76,40 @@ class RagewardenInputMethodService :
 
     private val lockState: LockState by lazy { applicationContext.appEntryPoint().lockState() }
 
+    private val bound = MutableStateFlow<Pair<Long, ImeSession>?>(null)
+    private var boundSeq = 0L
+
+    private val broker = object : ImeAuthBroker {
+        private var authStartedAt = 0L
+
+        override suspend fun authorize(item: VaultItem, session: ImeSession): ByteArray? {
+            val (nonce, result) = ImeAuthChannel.open()
+            authStartedAt = boundSeq
+            return try {
+                startActivity(
+                    ImeAuthActivity.intent(
+                        this@RagewardenInputMethodService,
+                        nonce,
+                        item.id,
+                        targetAppLabel.value ?: session.packageName,
+                    ),
+                )
+                withTimeoutOrNull(AUTH_TIMEOUT_MS) { result.await() }
+            } finally {
+                ImeAuthChannel.close(nonce)
+            }
+        }
+
+        override suspend fun awaitReturn(session: ImeSession): Boolean {
+            val next = withTimeoutOrNull(RETURN_TIMEOUT_MS) {
+                bound.filterNotNull().first { (seq, s) -> seq > authStartedAt && s.packageName != packageName }
+            }
+            return next?.second == session
+        }
+    }
+
     private val delivery: ImeDelivery by lazy {
-        ImeDelivery(lockState, VaultBridge.ensureBackend(applicationContext))
+        ImeDelivery(lockState, VaultBridge.ensureBackend(applicationContext), broker)
     }
 
     override val lifecycle: Lifecycle get() = lifecycleRegistry
@@ -95,12 +122,33 @@ class RagewardenInputMethodService :
         lifecycleRegistry.currentState = Lifecycle.State.CREATED
     }
 
+    /**
+     * Shown with a hardware keyboard attached too. The stock answer hides an IME
+     * whenever a physical keyboard is present (and the emulator always reports
+     * one), but this keyboard is a credential picker, not a key layout: a phone
+     * with a Bluetooth keyboard would otherwise never see it.
+     */
+    override fun onEvaluateInputViewShown(): Boolean = true
+
+    /**
+     * The keyboard's own recomposer. Without one, Compose builds a window
+     * recomposer from the IME window's root view and looks for the lifecycle
+     * owner there; the owner is set on the ComposeView, so the first show
+     * crashed with "ViewTreeLifecycleOwner not found from ... parentPanel".
+     */
+    private val recomposer: Recomposer by lazy {
+        Recomposer(AndroidUiDispatcher.CurrentThread).also { r ->
+            lifecycleScope.launch(AndroidUiDispatcher.CurrentThread) { r.runRecomposeAndApplyChanges() }
+        }
+    }
+
     override fun onCreateInputView(): View {
-        lifecycleRegistry.currentState = Lifecycle.State.STARTED
+        moveTo(Lifecycle.State.STARTED)
         val composeView = ComposeView(this).apply {
             filterTouchesWhenObscured = true
             setViewTreeLifecycleOwner(this@RagewardenInputMethodService)
             setViewTreeSavedStateRegistryOwner(this@RagewardenInputMethodService)
+            setParentCompositionContext(recomposer)
             setContent {
                 RageTheme {
                     // Collected, not read once: "Lock now" or an ON_STOP lock in
@@ -108,32 +156,75 @@ class RagewardenInputMethodService :
                     // while the keyboard is still on screen.
                     val locked by lockState.locked.collectAsState()
                     val offer = remember(locked) { delivery.offer() }
-                    ImeSurface(
-                        locked = offer.locked,
-                        items = offer.deliverable,
-                        protectedCount = offer.protectedCount,
-                        onDeliver = { itemId -> deliverPlaintext(itemId) },
-                        onCancel = { switchAwayQuietly() },
-                    )
+                    if (ownPinField.value) {
+                        DigitPad(
+                            onDigit = { d -> currentInputConnection?.commitText(d.toString(), 1) },
+                            onBackspace = { currentInputConnection?.deleteSurroundingText(1, 0) },
+                            onDone = { requestHideSelf(0) },
+                        )
+                    } else {
+                        ImeSurface(
+                            locked = offer.locked,
+                            items = offer.deliverable,
+                            protectedCount = offer.protectedCount,
+                            onDeliver = { itemId -> deliverPlaintext(itemId) },
+                            onCancel = { switchAwayQuietly() },
+                            onUnlock = {
+                                startActivity(
+                                    android.content.Intent(this@RagewardenInputMethodService, ragewarden.ragedroid.MainActivity::class.java)
+                                        .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                                )
+                            },
+                        )
+                    }
                 }
             }
         }
         return composeView
     }
 
-    override fun onStartInputView(info: android.view.inputmethod.EditorInfo?, restarting: Boolean) {
+    override fun onStartInput(attribute: EditorInfo?, restarting: Boolean) {
+        super.onStartInput(attribute, restarting)
+        val pkg = attribute?.packageName
+        bound.value = if (attribute == null || pkg == null) null else (++boundSeq to ImeSession(pkg, attribute.fieldId))
+        ownPinField.value = attribute != null && pkg == packageName &&
+            (attribute.inputType and InputType.TYPE_MASK_CLASS) == InputType.TYPE_CLASS_NUMBER
+    }
+
+    override fun onFinishInput() {
+        super.onFinishInput()
+        bound.value = null
+    }
+
+    override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
-        lifecycleRegistry.currentState = Lifecycle.State.RESUMED
+        targetAppLabel.value = info?.packageName?.let { pkg ->
+            runCatching {
+                packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
+            }.getOrDefault(pkg)
+        }
+        moveTo(Lifecycle.State.RESUMED)
     }
 
     override fun onFinishInputView(finishingInput: Boolean) {
         super.onFinishInputView(finishingInput)
-        lifecycleRegistry.currentState = Lifecycle.State.STARTED
+        moveTo(Lifecycle.State.STARTED)
     }
 
     override fun onDestroy() {
-        lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
         super.onDestroy()
+        lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
+        recomposer.cancel()
+    }
+
+    /**
+     * Lifecycle moves end at DESTROYED. InputMethodService.onDestroy finishes a
+     * shown input view, so onFinishInputView can arrive during or after it;
+     * moving a destroyed registry back to STARTED throws and takes the app's
+     * process down with it.
+     */
+    private fun moveTo(state: Lifecycle.State) {
+        if (lifecycleRegistry.currentState != Lifecycle.State.DESTROYED) lifecycleRegistry.currentState = state
     }
 
     /**
@@ -147,8 +238,9 @@ class RagewardenInputMethodService :
      * the IME's main thread on a decrypt that can wait on a network sync.
      */
     private fun deliverPlaintext(itemId: String) {
+        val session = bound.value?.second
         lifecycleScope.launch {
-            val outcome = delivery.deliver(itemId) { text ->
+            val outcome = delivery.deliver(itemId, session) { text ->
                 currentInputConnection?.commitText(text, 1)
             }
             if (outcome is ImeDelivery.Outcome.Refused) {
@@ -167,6 +259,8 @@ class RagewardenInputMethodService :
 
     private companion object {
         const val TAG = "RagewardenIme"
+        const val AUTH_TIMEOUT_MS = 120_000L
+        const val RETURN_TIMEOUT_MS = 30_000L
     }
 }
 
@@ -187,9 +281,10 @@ internal fun ImeSurface(
     protectedCount: Int,
     onDeliver: (String) -> Unit,
     onCancel: () -> Unit,
+    onUnlock: () -> Unit = {},
 ) {
     if (locked) {
-        LockedKeyboardNotice(onCancel = onCancel)
+        LockedKeyboardNotice(onCancel = onCancel, onUnlock = onUnlock)
     } else {
         KeyboardSurface(
             items = items,
@@ -207,7 +302,7 @@ internal fun ImeSurface(
  * honest instruction is to go and open the app.
  */
 @Composable
-private fun LockedKeyboardNotice(onCancel: () -> Unit) {
+private fun LockedKeyboardNotice(onCancel: () -> Unit, onUnlock: () -> Unit) {
     val c = rageColors
     Column(
         modifier = Modifier
@@ -217,16 +312,14 @@ private fun LockedKeyboardNotice(onCancel: () -> Unit) {
             .padding(horizontal = 12.dp, vertical = 10.dp),
     ) {
         Text(
-            text = "VAULT LOCKED",
+            text = stringResource(R.string.vault_locked),
             style = RageType.eyebrow,
             color = c.fgSecondary,
             modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
         )
         Spacer(modifier = Modifier.height(6.dp))
         Text(
-            text = "Ragewarden is locked, so this keyboard will not list or type any " +
-                "credential. Open Ragewarden and unlock it first -- a keyboard cannot " +
-                "host the unlock prompt.",
+            text = stringResource(R.string.ragewarden_is_locked_so_this_keyboard),
             style = RageType.caption,
             color = c.fgSecondary,
             modifier = Modifier.padding(horizontal = 4.dp),
@@ -239,10 +332,20 @@ private fun LockedKeyboardNotice(onCancel: () -> Unit) {
         ) {
             Box(
                 modifier = Modifier
-                    .clickable(onClick = onCancel)
+                    .buttonTarget(onClick = onCancel)
                     .padding(horizontal = 8.dp, vertical = 6.dp),
+                contentAlignment = Alignment.Center,
             ) {
-                Text(text = "Switch back", style = RageType.caption, color = c.fgSecondary)
+                Text(text = stringResource(R.string.switch_back), style = RageType.caption, color = c.fgSecondary)
+            }
+            Box(
+                modifier = Modifier
+                    .rejectObscuredTouches()
+                    .buttonTarget(onClick = onUnlock)
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(text = stringResource(R.string.unlock_ragewarden), style = RageType.caption, color = c.accent)
             }
         }
     }
@@ -268,7 +371,7 @@ private fun KeyboardSurface(
         val current = pending
         if (current == null) {
             Text(
-                text = "UNPROTECTED CREDENTIALS ONLY",
+                text = stringResource(R.string.type_a_credential),
                 style = RageType.eyebrow,
                 color = c.fgSecondary,
                 modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
@@ -288,8 +391,7 @@ private fun KeyboardSurface(
             if (protectedCount > 0) {
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = "$protectedCount Ragewarden-protected item(s) are not shown. A keyboard " +
-                        "cannot host the hardware prompt -- open Ragewarden to use them.",
+                    text = stringResource(R.string.protected_items_open_ragewarden_for_your),
                     style = RageType.meta,
                     color = c.fgSecondary,
                     modifier = Modifier.padding(horizontal = 4.dp),
@@ -303,14 +405,15 @@ private fun KeyboardSurface(
             ) {
                 Box(
                     modifier = Modifier
-                        .clickable(onClick = onCancel)
+                        .buttonTarget(onClick = onCancel)
                         .padding(horizontal = 8.dp, vertical = 6.dp),
+                    contentAlignment = Alignment.Center,
                 ) {
-                    Text(text = "Switch back", style = RageType.caption, color = c.fgSecondary)
+                    Text(text = stringResource(R.string.switch_back), style = RageType.caption, color = c.fgSecondary)
                 }
             }
         } else {
-            UnprotectedDeliveryConfirm(
+            DeliveryConfirm(
                 item = current,
                 onConfirm = {
                     onDeliver(current.id)
@@ -326,11 +429,11 @@ private fun KeyboardSurface(
 }
 
 /**
- * Deliberately not [ragewarden.ragedroid.ui.components.InlineTapReveal]: nothing
- * here is authorized by hardware, and the copy says so.
+ * The hardware tap for a protected item runs in [ImeAuthActivity]; this only
+ * says which of the two paths a tap takes.
  */
 @Composable
-private fun UnprotectedDeliveryConfirm(
+private fun DeliveryConfirm(
     item: VaultItem,
     onConfirm: () -> Unit,
     onCancel: () -> Unit,
@@ -344,13 +447,16 @@ private fun UnprotectedDeliveryConfirm(
             .padding(horizontal = 16.dp, vertical = 14.dp),
     ) {
         Text(
-            text = "Type ${item.name} password into this field?",
+            text = stringResource(R.string.type_password_into, item.name, targetAppLabel.value ?: stringResource(R.string.this_field)),
             style = RageType.rowTitle,
             color = c.fgEmphasis,
         )
         Text(
-            text = "This item is not Ragewarden-protected: no key authorizes this, " +
-                "and the text is committed straight into the app you are in.",
+            text = if (item.rage) {
+                stringResource(R.string.ragewarden_opens_to_ask_for_your)
+            } else {
+                stringResource(R.string.this_item_is_not_ragewarden_protected)
+            },
             style = RageType.caption,
             color = c.fgSecondary,
         )
@@ -361,19 +467,75 @@ private fun UnprotectedDeliveryConfirm(
         ) {
             Box(
                 modifier = Modifier
-                    .clickable(onClick = onCancel)
+                    .buttonTarget(onClick = onCancel)
                     .padding(horizontal = 8.dp, vertical = 6.dp),
+                contentAlignment = Alignment.Center,
             ) {
-                Text(text = "Cancel", style = RageType.caption, color = c.fgSecondary)
+                Text(text = stringResource(R.string.cancel), style = RageType.caption, color = c.fgSecondary)
             }
             Box(
                 modifier = Modifier
                     .background(c.accent, RoundedCornerShape(8.dp))
-                    .clickable(onClick = onConfirm)
+                    .rejectObscuredTouches()
+                    .buttonTarget(onClick = onConfirm)
                     .padding(horizontal = 14.dp, vertical = 8.dp),
+                contentAlignment = Alignment.Center,
             ) {
-                Text(text = "Type it", style = RageType.button, color = c.background, maxLines = 1)
+                Text(
+                    text = if (item.rage) stringResource(R.string.unlock_and_type) else stringResource(R.string.type_it),
+                    style = RageType.button,
+                    color = c.background,
+                    maxLines = 1,
+                )
             }
         }
+    }
+}
+
+private val targetAppLabel = androidx.compose.runtime.mutableStateOf<String?>(null)
+
+private val ownPinField = androidx.compose.runtime.mutableStateOf(false)
+
+/**
+ * Shown when the focused field is a numeric field of Ragewarden itself -- the
+ * PIV PIN prompt of [ImeAuthActivity] -- so the PIN can be typed without switching
+ * keyboards in the middle of a delivery.
+ */
+@Composable
+internal fun DigitPad(onDigit: (Int) -> Unit, onBackspace: () -> Unit, onDone: () -> Unit) {
+    val c = rageColors
+    val rows = listOf(listOf(1, 2, 3), listOf(4, 5, 6), listOf(7, 8, 9))
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(c.background)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        rows.forEach { row ->
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                row.forEach { d -> PadKey(label = d.toString(), modifier = Modifier.weight(1f)) { onDigit(d) } }
+            }
+        }
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            PadKey(label = "⌫", modifier = Modifier.weight(1f), onClick = onBackspace)
+            PadKey(label = "0", modifier = Modifier.weight(1f)) { onDigit(0) }
+            PadKey(label = stringResource(R.string.done), modifier = Modifier.weight(1f), onClick = onDone)
+        }
+    }
+}
+
+@Composable
+private fun PadKey(label: String, modifier: Modifier, onClick: () -> Unit) {
+    val c = rageColors
+    Box(
+        modifier = modifier
+            .height(48.dp)
+            .background(c.surface, RoundedCornerShape(8.dp))
+            .rejectObscuredTouches()
+            .buttonTarget(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(text = label, style = RageType.rowTitle, color = c.fgEmphasis)
     }
 }

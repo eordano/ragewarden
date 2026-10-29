@@ -1,24 +1,26 @@
 package ragewarden.ragedroid.identities
 
+import android.os.Build
 import androidx.fragment.app.FragmentActivity
 
-fun passkeyEnrollmentSupported(): Boolean = false
+private val platformCredentialManager: Boolean get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE
 
-/**
- * F-Droid build: Credential Manager needs `credentials-play-services-auth`,
- * which this flavor deliberately does not ship. Returning null (rather than
- * throwing) lets `IdentityResolver` report the recipient as skipped-with-reason
- * so the tap prompt can say why, instead of the item looking un-decryptable for
- * no stated cause.
- */
-@Suppress("UNUSED_PARAMETER")
+fun passkeyEnrollmentSupported(): Boolean = platformCredentialManager
+
 fun passkeyIdentityForUse(
     credentialId: ByteArray,
     rpId: String,
     label: String,
     activity: FragmentActivity?,
-): KotlinIdentity? = null
+): KotlinIdentity? = if (platformCredentialManager) {
+    PasskeyIdentity(mockPrfKey = null, credentialId = credentialId, rpId = rpId, activity = activity, label = label)
+} else {
+    null
+}
 
-fun passkeyUnavailableReason(): String? =
-    "The F-Droid build has no Credential Manager. Use a YubiKey, this phone's " +
-        "Keystore key, or the paper recovery phrase."
+fun passkeyUnavailableReason(): String? = if (platformCredentialManager) {
+    null
+} else {
+    "Passkeys in the F-Droid build use Android 14's built-in Credential Manager. On this " +
+        "Android version use a YubiKey, this phone's Keystore key, or the paper recovery phrase."
+}

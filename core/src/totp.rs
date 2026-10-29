@@ -5,19 +5,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TotpAlgorithm {
+    #[default]
     Sha1,
 
     Sha256,
 
     Sha512,
-}
-
-impl Default for TotpAlgorithm {
-    fn default() -> Self {
-        TotpAlgorithm::Sha1
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -33,17 +28,19 @@ pub struct TotpConfig {
 
 impl TotpConfig {
     pub fn from_base32_secret(secret: &str) -> Result<Self, TotpError> {
-        let cleaned: String = secret
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .map(|c| c.to_ascii_uppercase())
-            .collect();
+        let cleaned: Zeroizing<String> = Zeroizing::new(
+            secret
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .map(|c| c.to_ascii_uppercase())
+                .collect(),
+        );
         let bytes = decode_base32(&cleaned)?;
         if bytes.is_empty() {
             return Err(TotpError::EmptySecret);
         }
         Ok(Self {
-            secret: Zeroizing::new(bytes),
+            secret: bytes,
             digits: 6,
             period: 30,
             algorithm: TotpAlgorithm::Sha1,
@@ -174,8 +171,9 @@ pub enum TotpError {
     #[error("totp: empty secret")]
     EmptySecret,
 
-    #[error("totp: invalid base32: {0}")]
-    InvalidBase32(String),
+    /// Names the offending position only: the character is part of a seed.
+    #[error("totp: invalid base32 character at position {position}")]
+    InvalidBase32 { position: usize },
 
     #[error("totp: invalid otpauth uri")]
     InvalidUri,
@@ -199,16 +197,20 @@ pub enum TotpError {
     ClockBeforeEpoch,
 }
 
-fn decode_base32(s: &str) -> Result<Vec<u8>, TotpError> {
-    if s.is_empty() {
-        return Ok(Vec::new());
-    }
-    let trimmed = s.trim_end_matches('=');
-    let mut out = Vec::with_capacity(trimmed.len() * 5 / 8);
+/// Decodes a TOTP seed without branching on its characters: every character
+/// is mapped arithmetically and the first invalid position is only reported
+/// after the whole string has been read.
+fn decode_base32(s: &str) -> Result<Zeroizing<Vec<u8>>, TotpError> {
+    let trimmed = s.trim_end_matches('=').as_bytes();
+    let mut out = Zeroizing::new(Vec::with_capacity(trimmed.len() * 5 / 8));
     let mut buf: u32 = 0;
     let mut bits: u32 = 0;
-    for c in trimmed.chars() {
-        let v = base32_value(c).ok_or_else(|| TotpError::InvalidBase32(c.to_string()))?;
+    let mut first_invalid = usize::MAX;
+    for (i, &c) in trimmed.iter().enumerate() {
+        let (v, valid) = base32_value(c);
+        let unseen = 0usize.wrapping_sub((first_invalid == usize::MAX) as usize);
+        let invalid_here = 0usize.wrapping_sub((valid ^ 1) as usize);
+        first_invalid = (i & unseen & invalid_here) | (first_invalid & !(unseen & invalid_here));
         buf = (buf << 5) | v;
         bits += 5;
         if bits >= 8 {
@@ -217,15 +219,24 @@ fn decode_base32(s: &str) -> Result<Vec<u8>, TotpError> {
             buf &= (1 << bits) - 1;
         }
     }
+    if first_invalid != usize::MAX {
+        return Err(TotpError::InvalidBase32 {
+            position: first_invalid,
+        });
+    }
     Ok(out)
 }
 
-fn base32_value(c: char) -> Option<u32> {
-    match c {
-        'A'..='Z' => Some(c as u32 - 'A' as u32),
-        '2'..='7' => Some(c as u32 - '2' as u32 + 26),
-        _ => None,
-    }
+/// RFC 4648 base32 value of `c` and whether it was valid, computed with
+/// masks rather than a branch per character class.
+fn base32_value(c: u8) -> (u32, u32) {
+    let letter = c.wrapping_sub(b'A') as u32;
+    let digit = c.wrapping_sub(b'2') as u32;
+    let is_letter = (letter.wrapping_sub(26) >> 31) & 1;
+    let is_digit = (digit.wrapping_sub(6) >> 31) & 1;
+    let value =
+        (letter & 0u32.wrapping_sub(is_letter)) | ((digit + 26) & 0u32.wrapping_sub(is_digit));
+    (value, is_letter | is_digit)
 }
 
 fn url_decode(s: &str) -> String {
@@ -258,6 +269,30 @@ fn hex(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bad_seed_character_is_reported_by_position_not_by_value() {
+        let err = TotpConfig::from_base32_secret("JBSW Y3DP 1HPK 3PXP").unwrap_err();
+        assert!(matches!(err, TotpError::InvalidBase32 { position: 8 }));
+        let shown = err.to_string();
+        assert!(!shown.contains('1'), "seed character leaked: {shown}");
+    }
+
+    #[test]
+    fn branch_free_base32_matches_rfc4648_for_every_byte() {
+        for c in 0u8..=255 {
+            let want = match c {
+                b'A'..=b'Z' => Some(u32::from(c - b'A')),
+                b'2'..=b'7' => Some(u32::from(c - b'2') + 26),
+                _ => None,
+            };
+            let (v, valid) = base32_value(c);
+            assert_eq!(valid == 1, want.is_some(), "byte {c}");
+            if let Some(w) = want {
+                assert_eq!(v, w, "byte {c}");
+            }
+        }
+    }
 
     #[test]
     fn rfc6238_appendix_b_sha1_vectors() {
@@ -312,7 +347,7 @@ mod tests {
     fn base32_roundtrip() {
         let s = "JBSWY3DPEHPK3PXP";
         let bytes = decode_base32(s).unwrap();
-        assert_eq!(bytes, b"Hello!\xde\xad\xbe\xef");
+        assert_eq!(bytes.as_slice(), b"Hello!\xde\xad\xbe\xef");
     }
 
     #[test]
@@ -361,10 +396,8 @@ mod tests {
 
     #[test]
     fn zero_period_in_uri_is_rejected_not_a_panic() {
-        let err = TotpConfig::from_otpauth_uri(
-            "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP&period=0",
-        )
-        .unwrap_err();
+        let err = TotpConfig::from_otpauth_uri("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP&period=0")
+            .unwrap_err();
         assert!(
             matches!(err, TotpError::InvalidPeriod),
             "expected InvalidPeriod, got {err:?}"
@@ -383,14 +416,16 @@ mod tests {
             generate_at(&cfg, 59).unwrap_err(),
             TotpError::InvalidPeriod
         ));
-        assert!(matches!(generate(&cfg).unwrap_err(), TotpError::InvalidPeriod));
+        assert!(matches!(
+            generate(&cfg).unwrap_err(),
+            TotpError::InvalidPeriod
+        ));
     }
 
     #[test]
     fn zero_digits_is_rejected_not_an_empty_code() {
-        let err =
-            TotpConfig::from_otpauth_uri("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP&digits=0")
-                .unwrap_err();
+        let err = TotpConfig::from_otpauth_uri("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP&digits=0")
+            .unwrap_err();
         assert!(matches!(err, TotpError::InvalidDigits), "got {err:?}");
 
         let cfg = TotpConfig {

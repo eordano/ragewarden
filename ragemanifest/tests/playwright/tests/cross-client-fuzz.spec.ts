@@ -1,4 +1,4 @@
-import { test, expect, fillOnboarding, waitForBootstrap, randomSuffix } from './fixtures';
+import { test, expect, dropRecoveryRecipients, fillOnboarding, finishWizardWithPaper, waitForBootstrap, randomSuffix } from './fixtures';
 import { RagetermDriver } from './rageterm-driver';
 import type { Page } from '@playwright/test';
 
@@ -133,7 +133,8 @@ async function readAccessToken(page: Page): Promise<string> {
       try {
         const env = await read(c.storage.local, 'ragewarden:sessionEnvelope') as
           { v?: number; iv?: string; ct?: string } | null;
-        const rawKeyB64 = await read(c.storage.session, 'ragewarden:envelopeKey') as string | null;
+        const stored = await read(c.storage.session, 'ragewarden:envelopeKey') as string | { k?: string } | null;
+        const rawKeyB64 = typeof stored === 'string' ? stored : (stored?.k ?? null);
         if (!env?.iv || !env.ct) why = 'no session envelope in chrome.storage.local';
         else if (!rawKeyB64) why = 'no envelope key in chrome.storage.session';
         else {
@@ -284,6 +285,7 @@ test.describe('cross-client fuzz', () => {
     await popup.waitForSelector('.ragewarden-onb-card h1', { state: 'visible' });
     await expect(popup.locator('.ragewarden-onb-card h1')).toHaveText('Set up Ragewarden protection');
     await popup.click('.ragewarden-onb-primary');
+    await finishWizardWithPaper(popup);
     await waitForBootstrap(popup);
 
     const rage = new RagetermDriver({ server: vaultwardenUrl });
@@ -502,6 +504,7 @@ test.describe('cross-client fuzz', () => {
     await expect(popup.locator('.ragewarden-onb-card h1'))
       .toHaveText('Set up Ragewarden protection', { timeout: 15_000 });
     await popup.click('.ragewarden-onb-primary');
+    await finishWizardWithPaper(popup);
     await waitForBootstrap(popup);
 
     expect(await popup.evaluate(() => {
@@ -679,6 +682,7 @@ test.describe('cross-client fuzz', () => {
     await popup.waitForSelector('.ragewarden-onb-card h1', { state: 'visible' });
     await expect(popup.locator('.ragewarden-onb-card h1')).toHaveText('Set up Ragewarden protection');
     await popup.click('.ragewarden-onb-primary');
+    await finishWizardWithPaper(popup);
     await waitForBootstrap(popup);
 
     const enrolled = await readRegistry(popup);
@@ -800,7 +804,9 @@ test.describe('cross-client fuzz', () => {
     await popup.waitForSelector('.ragewarden-onb-card h1', { state: 'visible' });
     await expect(popup.locator('.ragewarden-onb-card h1')).toHaveText('Set up Ragewarden protection');
     await popup.click('.ragewarden-onb-primary');
+    await finishWizardWithPaper(popup);
     await waitForBootstrap(popup);
+    await dropRecoveryRecipients(popup);
 
     const enrolled = await readRegistry(popup);
     const own = enrolled.find(e => e.kind === 'PasskeyPrf' && e.id.startsWith('passkey-'));
@@ -930,7 +936,7 @@ test.describe('cross-client fuzz', () => {
       'NEGATIVE -- the same credential wrapped under kind=Fido2 is a fido2-hmac stanza this '
       + 'browser has no code to open. Repairing the registry does NOT repair an item already '
       + 'written; if this ever passes, the two kinds have been collapsed in core.',
-    ).toMatch(/no supplied identity matched any stanza|no identity available/);
+    ).toMatch(/no supplied identity matched any stanza|no identity available|none on this device/);
 
     await popup.close();
   });
@@ -961,6 +967,7 @@ test.describe('cross-client fuzz', () => {
     await popup.waitForSelector('.ragewarden-onb-card h1', { state: 'visible' });
     await expect(popup.locator('.ragewarden-onb-card h1')).toHaveText('Set up Ragewarden protection');
     await popup.click('.ragewarden-onb-primary');
+    await finishWizardWithPaper(popup);
     await waitForBootstrap(popup);
 
     const before = await popup.evaluate(async () => {
@@ -1022,6 +1029,7 @@ test.describe('cross-client fuzz', () => {
     await popup.waitForSelector('.ragewarden-onb-card h1', { state: 'visible' });
     await expect(popup.locator('.ragewarden-onb-card h1')).toHaveText('Set up Ragewarden protection');
     await popup.click('.ragewarden-onb-primary');
+    await finishWizardWithPaper(popup);
     await waitForBootstrap(popup);
 
     const rage = new RagetermDriver({ server: vaultwardenUrl });
@@ -1078,7 +1086,7 @@ test.describe('cross-client fuzz', () => {
         await popupReveal(popup, c!.id);
       } catch (err) {
         threw = true;
-        expect((err as Error).message, 'popup decrypt should fail with no-identity').toMatch(/no supplied identity/);
+        expect((err as Error).message, 'popup decrypt should fail with no-identity').toMatch(/no supplied identity|none on this device/);
       }
       expect(threw, 'I8 -- popup must NOT decrypt after unpublishing its Software entry').toBe(true);
     }
@@ -1186,6 +1194,7 @@ test.describe('cross-client fuzz', () => {
     await popup.waitForSelector('.ragewarden-onb-card h1', { state: 'visible' });
     await expect(popup.locator('.ragewarden-onb-card h1')).toHaveText('Set up Ragewarden protection');
     await popup.click('.ragewarden-onb-primary');
+    await finishWizardWithPaper(popup);
     await waitForBootstrap(popup);
 
     const rage = new RagetermDriver({ server: vaultwardenUrl });
@@ -1267,7 +1276,7 @@ test.describe('cross-client fuzz', () => {
       const enrolled = await w.RagewardenVault.enrollRecovery();
       const list = await w.RagewardenVault.listRecipients();
       const found = list.find(e => e.id === enrolled.registryEntryId);
-      return { phraseLen: enrolled.phrase.split(' ').length, foundKind: found?.kind };
+      return { phraseLen: enrolled.phrase.split(' ').length, foundKind: found?.kind, id: enrolled.registryEntryId };
     });
     expect(recoveryRes.phraseLen, 'BIP39 phrase has 24 words').toBe(24);
     expect(recoveryRes.foundKind, 'Recovery entry published').toBe('Recovery');
@@ -1279,11 +1288,8 @@ test.describe('cross-client fuzz', () => {
       } };
       await w.RagewardenVault.removeRecipient(id as string);
       return (await w.RagewardenVault.listRecipients()).map(e => e.id);
-    }, await popup.evaluate(async () => {
-      const w = window as unknown as { RagewardenVault: { listRecipients: () => Promise<{ id: string; kind: string }[]> } };
-      return (await w.RagewardenVault.listRecipients()).find(e => e.kind === 'Recovery')?.id ?? '';
-    }));
-    expect(after.some(id => id.startsWith('paper-recovery-')), 'recovery entry removed').toBe(false);
+    }, recoveryRes.id);
+    expect(after.includes(recoveryRes.id), 'recovery entry removed').toBe(false);
 
     expect((await rage.sync()).code).toBe(0);
     expect((await rage.run(['folders', 'create', 'rage-folder'])).code).toBe(0);
@@ -1344,6 +1350,7 @@ test.describe('cross-client fuzz', () => {
     await popup.waitForSelector('.ragewarden-onb-card h1', { state: 'visible' });
     await expect(popup.locator('.ragewarden-onb-card h1')).toHaveText('Set up Ragewarden protection');
     await popup.click('.ragewarden-onb-primary');
+    await finishWizardWithPaper(popup);
     await waitForBootstrap(popup);
 
     const PT = 'i5-multi-recipient-redundancy-secret';

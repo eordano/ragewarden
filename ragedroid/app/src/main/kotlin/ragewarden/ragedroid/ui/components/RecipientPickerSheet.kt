@@ -26,28 +26,31 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.collections.immutable.ImmutableList
 import kotlinx.collections.immutable.toImmutableList
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.model.Recipient
 import ragewarden.ragedroid.model.RecipientKind
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
+import ragewarden.ragedroid.ui.uiString
 
-private enum class RecipientGroup(val label: String, val sub: String) {
+private enum class RecipientGroup(@androidx.annotation.StringRes val label: Int, @androidx.annotation.StringRes val sub: Int) {
     Hardware(
-        label = "Hardware · tap to decrypt",
-        sub = "Phishing-resistant. Most secure.",
+        label = R.string.hardware_tap_to_decrypt,
+        sub = R.string.phishing_resistant_most_secure,
     ),
     Device(
-        label = "This device",
-        sub = "Always available while signed in.",
+        label = R.string.this_device,
+        sub = R.string.always_available_while_signed_in,
     ),
     Recovery(
-        label = "Recovery",
-        sub = "Fallback if every other recipient is lost.",
+        label = R.string.recovery,
+        sub = R.string.fallback_if_every_other_recipient_is,
     ),
 }
 
@@ -83,11 +86,10 @@ fun RecipientPickerSheet(
     }
     val includesRecovery = picked.any { it in recoveryIds }
 
-    Sheet(open = open, onDismiss = onDismiss, title = "Recipients") {
+    Sheet(open = open, onDismiss = onDismiss, title = stringResource(R.string.recipients_2)) {
         Column(modifier = Modifier.fillMaxWidth()) {
             Text(
-                text = "Any of the selected recipients can decrypt this item. " +
-                    "Choose at least one -- without recovery you can be locked out.",
+                text = stringResource(R.string.any_of_the_selected_recipients_can),
                 style = RageType.body.copy(fontSize = 14.sp, lineHeight = 21.sp),
                 color = c.fgSecondary,
                 modifier = Modifier.padding(bottom = 16.dp),
@@ -97,13 +99,13 @@ fun RecipientPickerSheet(
                 val members = grouped[group].orEmpty()
                 if (members.isEmpty()) return@forEach
                 Text(
-                    text = group.label.uppercase(),
+                    text = stringResource(group.label).uppercase(),
                     style = RageType.eyebrow,
                     color = c.fgSecondary,
                     modifier = Modifier.padding(start = 2.dp, end = 2.dp, bottom = 6.dp),
                 )
                 Text(
-                    text = group.sub,
+                    text = stringResource(group.sub),
                     style = RageType.body.copy(
                         fontSize = 12.5.sp,
                         lineHeight = 17.sp,
@@ -164,8 +166,7 @@ fun RecipientPickerSheet(
                             .padding(top = 2.dp),
                     )
                     Text(
-                        text = "No recovery identity included. If you lose every other " +
-                            "recipient, this item is gone forever.",
+                        text = stringResource(R.string.no_recovery_identity_included_if_you),
                         style = RageType.body.copy(fontSize = 13.sp, lineHeight = 18.sp),
                         color = c.fgPrimary,
                     )
@@ -180,17 +181,16 @@ fun RecipientPickerSheet(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 RageButton(
-                    label = "Cancel",
+                    label = stringResource(R.string.cancel),
                     onClick = onDismiss,
                     variant = ButtonVariant.Secondary,
                 )
-                val saveLabel = "Save · ${picked.size} " +
-                    if (picked.size == 1) "recipient" else "recipients"
+                val saveLabel = androidx.compose.ui.res.pluralStringResource(R.plurals.save_with_recipients, picked.size, picked.size)
                 RageButton(
                     label = saveLabel,
                     onClick = {
                         onChange(picked)
-                        onToast("Recipients updated · ${picked.size} selected")
+                        onToast(uiString(R.string.recipients_updated_selected, picked.size))
                         onDismiss()
                     },
                     enabled = allowEmpty || picked.isNotEmpty(),
@@ -232,28 +232,34 @@ private fun RecipientPickerRow(
                 modifier = Modifier.padding(top = 2.dp),
             )
         }
-        Box(
-            modifier = Modifier
-                .size(22.dp)
-                .background(
-                    if (on) c.accent else androidx.compose.ui.graphics.Color.Transparent,
-                    RoundedCornerShape(4.dp),
-                )
-                .border(
-                    1.5.dp,
-                    if (on) c.accent else c.border,
-                    RoundedCornerShape(4.dp),
-                ),
-            contentAlignment = Alignment.Center,
-        ) {
-            if (on) {
-                Icon(
-                    imageVector = Icons.Outlined.Check,
-                    contentDescription = null,
-                    tint = c.background,
-                    modifier = Modifier.size(14.dp),
-                )
-            }
+        SelectionBox(on = on)
+    }
+}
+
+@Composable
+internal fun SelectionBox(on: Boolean) {
+    val c = rageColors
+    Box(
+        modifier = Modifier
+            .size(22.dp)
+            .background(
+                if (on) c.accent else androidx.compose.ui.graphics.Color.Transparent,
+                RoundedCornerShape(4.dp),
+            )
+            .border(
+                1.5.dp,
+                if (on) c.accent else c.border,
+                RoundedCornerShape(4.dp),
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (on) {
+            Icon(
+                imageVector = Icons.Outlined.Check,
+                contentDescription = null,
+                tint = c.background,
+                modifier = Modifier.size(14.dp),
+            )
         }
     }
 }

@@ -8,7 +8,7 @@ import SafariServices
 
 #if canImport(AppKit) && canImport(SafariServices)
 final class RagewardenHostAppDelegate: NSObject, NSApplicationDelegate {
-    private let extensionBundleIdentifier = "com.ragewarden.safari.extension"
+    private let extensionBundleIdentifier = "com.ragewarden.safari.Extension"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         SFSafariExtensionManager.getStateOfSafariExtension(withIdentifier: extensionBundleIdentifier) { state, error in

@@ -20,48 +20,60 @@ pub enum RecoveryError {
     #[error("recovery words did not match the printed mnemonic; nothing was written")]
     ConfirmFailed,
 
-    #[error("recovery file already exists at {0}; remove it first to re-enroll")]
-    AlreadyEnrolled(String),
+    #[error(
+        "enroll-recovery needs a terminal so the 24 words can be shown and typed back; \
+         pass `--no-confirm` to print them to stderr without the check"
+    )]
+    NoTerminal,
 }
 
+/// Generate a paper recovery recipient. The secret leaves this process only as
+/// the 24 words: nothing is written to disk (`recover --save` is the explicit
+/// way to put it on a machine that lost its other keys).
 pub fn enroll(auto_confirm: bool) -> Result<EnrolledRecovery, RecoveryError> {
-    let path = config::recovery_path()?;
-    if path.exists() {
-        return Err(RecoveryError::AlreadyEnrolled(path.display().to_string()));
+    let interactive = io::stdin().is_terminal();
+    if !auto_confirm && !interactive {
+        return Err(RecoveryError::NoTerminal);
     }
 
-    let gen = recovery::generate()?;
-    let phrase = gen.mnemonic.to_string();
+    let generated = recovery::generate()?;
+    let phrase = generated.mnemonic.to_string();
 
-    print_mnemonic(&phrase)?;
+    print_mnemonic(&phrase, interactive)?;
 
-    if !auto_confirm && io::stdin().is_terminal() {
+    if !auto_confirm {
         confirm_words(&phrase)?;
     }
 
-    config::ensure_config_dir()?;
-    config::write_private(&path, gen.armored_secret.as_bytes())?;
-
     Ok(EnrolledRecovery {
-        armored_pubkey: gen.armored_pubkey,
-        path,
+        armored_pubkey: generated.armored_pubkey,
     })
 }
 
 pub struct EnrolledRecovery {
     pub armored_pubkey: ragewarden_core::ArmoredAgeRecipient,
-
-    pub path: std::path::PathBuf,
 }
 
-fn print_mnemonic(phrase: &str) -> io::Result<()> {
+/// The words go to the controlling terminal when there is one, so they do not
+/// land in a log that captures stderr.
+fn print_mnemonic(phrase: &str, interactive: bool) -> io::Result<()> {
+    let mut out: Box<dyn Write> = match std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        Ok(tty) if interactive => Box::new(tty),
+        _ => Box::new(io::stderr()),
+    };
     let words: Vec<&str> = phrase.split_whitespace().collect();
-    eprintln!();
-    eprintln!("=== Ragewarden recovery mnemonic ===");
-    eprintln!();
-    eprintln!("Write these 24 words on paper, in order. Anyone who has these words can");
-    eprintln!("decrypt your rage-protected ciphers -- treat them like the master password.");
-    eprintln!();
+    writeln!(out)?;
+    writeln!(out, "=== Ragewarden recovery mnemonic ===")?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "Write these 24 words on paper, in order. Anyone who has these words can"
+    )?;
+    writeln!(
+        out,
+        "decrypt your rage-protected ciphers -- treat them like the master password."
+    )?;
+    writeln!(out)?;
     for row in 0..6 {
         let mut line = String::new();
         for col in 0..4 {
@@ -70,10 +82,10 @@ fn print_mnemonic(phrase: &str) -> io::Result<()> {
                 line.push_str(&format!("  {:>2}. {:<10}", i + 1, words[i]));
             }
         }
-        eprintln!("{line}");
+        writeln!(out, "{line}")?;
     }
-    eprintln!();
-    Ok(())
+    writeln!(out)?;
+    out.flush()
 }
 
 fn confirm_words(expected_phrase: &str) -> Result<(), RecoveryError> {
@@ -94,12 +106,20 @@ fn confirm_words(expected_phrase: &str) -> Result<(), RecoveryError> {
     Ok(())
 }
 
+/// The phrase from the terminal (not echoed), or the first line of stdin when
+/// stdin is not a terminal, the same rule as the master password.
 pub fn recover_from_typed_phrase() -> Result<age::x25519::Identity, RecoveryError> {
-    eprintln!("Type your 24-word recovery phrase (input is not echoed):");
-    eprint!("> ");
-    io::stderr().flush()?;
-    let typed = rpassword::read_password()?;
-    Ok(recovery::from_phrase(&typed)?)
+    let typed = zeroize::Zeroizing::new(if io::stdin().is_terminal() {
+        eprintln!("Type your 24-word recovery phrase (input is not echoed):");
+        eprint!("> ");
+        io::stderr().flush()?;
+        rpassword::read_password()?
+    } else {
+        let mut line = String::new();
+        io::BufRead::read_line(&mut io::stdin().lock(), &mut line)?;
+        line
+    });
+    Ok(recovery::from_phrase(typed.trim())?)
 }
 
 pub fn read_if_enrolled() -> Result<Option<age::x25519::Identity>, RecoveryError> {

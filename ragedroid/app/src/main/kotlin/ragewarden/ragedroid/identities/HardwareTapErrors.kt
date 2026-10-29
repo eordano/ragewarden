@@ -31,6 +31,13 @@ class HardwareTapTimeoutException(message: String, cause: Throwable? = null) :
 class HardwareTapCancelledException(message: String, cause: Throwable? = null) :
     HardwareTapException(message, cause)
 
+/** A YubiKey was presented, but not the one this recipient was enrolled on. */
+class HardwareTapWrongKeyException(
+    val expectedSerial: UInt,
+    val presentedSerial: UInt,
+    message: String,
+) : HardwareTapException(message)
+
 /** The device was present and refused: wrong PIN, wrong slot, wrong credential. */
 class HardwareTapFailedException(message: String, cause: Throwable? = null) :
     HardwareTapException(message, cause)

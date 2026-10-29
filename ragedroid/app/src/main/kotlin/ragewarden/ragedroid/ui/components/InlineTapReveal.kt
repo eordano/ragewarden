@@ -4,7 +4,6 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -36,9 +35,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.CancellationException
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.identities.HardwareTapCoordinator
 import ragewarden.ragedroid.identities.IdentitySet
 import ragewarden.ragedroid.identities.MockHardware
@@ -47,24 +48,25 @@ import ragewarden.ragedroid.ui.theme.MotionTokens
 import ragewarden.ragedroid.ui.theme.RageTheme
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
+import ragewarden.ragedroid.ui.uiString
 
-enum class TapAction(val verb: String, val noun: String, val description: String, val ctaIcon: ImageVector) {
+enum class TapAction(@androidx.annotation.StringRes val verb: Int, @androidx.annotation.StringRes val noun: Int, @androidx.annotation.StringRes val description: Int, val ctaIcon: ImageVector) {
     Autofill(
-        verb = "Autofill into",
-        noun = "fill",
-        description = "Deliver to the active app. Plaintext never on screen.",
+        verb = R.string.autofill_into,
+        noun = R.string.fill_2,
+        description = R.string.fills_the_field_that_asked_not,
         ctaIcon = Icons.Outlined.East,
     ),
     Copy(
-        verb = "Copy",
-        noun = "copy",
-        description = "Auto-clears in 30 seconds, or when the app loses focus.",
+        verb = R.string.copy,
+        noun = R.string.copy_2,
+        description = R.string.cleared_from_the_clipboard_after_30,
         ctaIcon = Icons.Outlined.ContentCopy,
     ),
     Reveal(
-        verb = "Reveal",
-        noun = "reveal",
-        description = "Display until you dismiss. Last-resort path.",
+        verb = R.string.reveal,
+        noun = R.string.reveal_2,
+        description = R.string.shown_for_8_seconds,
         ctaIcon = Icons.Outlined.Visibility,
     );
 }
@@ -89,7 +91,7 @@ data class TapPresentation(
         fun from(set: IdentitySet): TapPresentation {
             val blocked = if (set.isEmpty) {
                 buildString {
-                    append("No key on this device can unlock this item.")
+                    append(uiString(R.string.no_key_on_this_device_can))
                     set.skipped.forEach { append("\n• ${it.label}: ${it.reason}") }
                 }
             } else {
@@ -139,6 +141,7 @@ fun InlineTapReveal(
     initialAction: TapAction? = null,
     pinRequest: PinRequest? = null,
     modifier: Modifier = Modifier,
+    copiesForAutofill: Boolean = false,
 ) {
     var phase by remember { mutableStateOf(if (initialAction != null) Phase.Waiting else Phase.Choose) }
     var chosenAction by remember { mutableStateOf(initialAction) }
@@ -184,6 +187,7 @@ fun InlineTapReveal(
             itemSite = itemSite,
             presentation = presentation,
             action = chosenAction!!,
+            copiesForAutofill = copiesForAutofill,
             contacting = phase == Phase.Contacting,
             onTap = { phase = Phase.Contacting },
             onCancel = onCancel,
@@ -216,7 +220,7 @@ private fun ChooseActions(
             .padding(horizontal = 12.dp, vertical = 12.dp),
     ) {
         Text(
-            text = "PICK AN ACTION -- TAP WILL AUTHORIZE THAT SPECIFIC USE",
+            text = stringResource(R.string.pick_an_action_one_tap_authorizes),
             style = RageType.eyebrow,
             color = c.fgSecondary,
             modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
@@ -229,11 +233,11 @@ private fun ChooseActions(
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable(onClick = onCancel)
+                .buttonTarget(onClick = onCancel)
                 .padding(vertical = 6.dp),
             contentAlignment = Alignment.Center,
         ) {
-            Text(text = "Cancel", style = RageType.caption, color = c.fgSecondary)
+            Text(text = stringResource(R.string.cancel), style = RageType.caption, color = c.fgSecondary)
         }
     }
 }
@@ -244,7 +248,7 @@ private fun ActionRow(action: TapAction, onClick: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .buttonTarget(onClick = onClick)
             .padding(horizontal = 8.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -265,15 +269,15 @@ private fun ActionRow(action: TapAction, onClick: () -> Unit) {
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = when (action) {
-                    TapAction.Autofill -> "Autofill"
-                    TapAction.Copy -> "Copy to clipboard"
-                    TapAction.Reveal -> "Reveal on screen"
+                    TapAction.Autofill -> stringResource(R.string.autofill)
+                    TapAction.Copy -> stringResource(R.string.copy_to_clipboard)
+                    TapAction.Reveal -> stringResource(R.string.reveal_on_screen)
                 },
                 style = RageType.rowTitle,
                 color = c.fgEmphasis,
             )
             Text(
-                text = action.description,
+                text = stringResource(action.description),
                 style = RageType.body,
                 color = c.fgSecondary,
             )
@@ -294,6 +298,7 @@ private fun TapPrompt(
     itemSite: String?,
     presentation: TapPresentation,
     action: TapAction,
+    copiesForAutofill: Boolean,
     contacting: Boolean,
     onTap: () -> Unit,
     onCancel: () -> Unit,
@@ -306,13 +311,13 @@ private fun TapPrompt(
         else -> c.accent
     }
     val target = when (action) {
-        TapAction.Autofill -> itemSite ?: itemName
-        TapAction.Copy, TapAction.Reveal -> "$itemName password"
+        TapAction.Autofill -> itemSite ?: stringResource(R.string.an_app_that_did_not_identify)
+        TapAction.Copy, TapAction.Reveal -> stringResource(R.string.password_2, itemName)
     }
     val pulseAlpha by animateFloatAsState(
         targetValue = if (contacting) 0.35f else 0f,
         animationSpec = tween(durationMillis = MotionTokens.DurBaseMs, easing = MotionTokens.EaseOut),
-        label = "pulse-alpha",
+        label = stringResource(R.string.pulse_alpha),
     )
 
     Column(
@@ -363,10 +368,21 @@ private fun TapPrompt(
             Spacer(modifier = Modifier.width(14.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "${action.verb} $target?",
+                    text = if (action == TapAction.Autofill && copiesForAutofill) {
+                        stringResource(R.string.tap_prompt_copy_for_autofill, target)
+                    } else {
+                        stringResource(R.string.tap_prompt_title, stringResource(action.verb), target)
+                    },
                     style = RageType.rowTitle,
                     color = c.fgEmphasis,
                 )
+                if (action == TapAction.Autofill && copiesForAutofill) {
+                    Text(
+                        text = stringResource(TapAction.Copy.description),
+                        style = RageType.caption,
+                        color = c.fgSecondary,
+                    )
+                }
                 Text(
                     text = promptSubtitle(presentation, action, contacting),
                     style = RageType.caption,
@@ -399,20 +415,23 @@ private fun TapPrompt(
             ) {
                 Box(
                     modifier = Modifier
-                        .clickable(onClick = onCancel)
+                        .buttonTarget(onClick = onCancel)
                         .padding(horizontal = 8.dp, vertical = 6.dp),
+                    contentAlignment = Alignment.Center,
                 ) {
-                    Text(text = "Cancel", style = RageType.caption, color = c.fgSecondary)
+                    Text(text = stringResource(R.string.cancel), style = RageType.caption, color = c.fgSecondary)
                 }
                 if (blocked == null) {
                     Box(
                         modifier = Modifier
                             .background(c.accent, RoundedCornerShape(8.dp))
-                            .clickable(onClick = onTap)
+                            .rejectObscuredTouches()
+                            .buttonTarget(onClick = onTap)
                             .padding(horizontal = 14.dp, vertical = 8.dp),
+                        contentAlignment = Alignment.Center,
                     ) {
                         Text(
-                            text = if (presentation.requiresPhysicalTap) "Authorize with key" else "Authorize",
+                            text = if (presentation.requiresPhysicalTap) stringResource(R.string.authorize_with_key) else stringResource(R.string.authorize),
                             style = RageType.button,
                             color = c.background,
                             maxLines = 1,
@@ -436,13 +455,12 @@ private fun promptSubtitle(
     presentation.blockedReason?.let { return it }
     return when {
         contacting && presentation.requiresPhysicalTap ->
-            "Present ${presentation.recipientLabel} now and hold it until the light stops."
-        contacting -> "Unlocking with ${presentation.recipientLabel}..."
+            uiString(R.string.present_now_and_hold_it_until, presentation.recipientLabel)
+        contacting -> uiString(R.string.unlocking_with, presentation.recipientLabel)
         presentation.requiresPhysicalTap ->
-            "${presentation.recipientLabel} must authorize this ${action.noun}."
+            uiString(R.string.must_authorize_this, presentation.recipientLabel, uiString(action.noun))
         else ->
-            "This item unlocks with ${presentation.recipientLabel}. " +
-                "No separate hardware confirmation is enrolled for it."
+            uiString(R.string.this_item_unlocks_with_no_separate, presentation.recipientLabel)
     }
 }
 
@@ -466,8 +484,7 @@ private fun MockBadge() {
             .padding(horizontal = 10.dp, vertical = 6.dp),
     ) {
         Text(
-            text = "${MockHardware.LABEL_PREFIX}simulated authenticator. " +
-                "No physical device is involved. Debug builds only.",
+            text = stringResource(R.string.simulated_authenticator_no_physical_device_is, MockHardware.LABEL_PREFIX),
             style = RageType.caption,
             color = c.danger,
         )
@@ -498,14 +515,14 @@ private fun TapFailure(
             )
             Spacer(modifier = Modifier.width(10.dp))
             Text(
-                text = "Not authorized",
+                text = stringResource(R.string.not_authorized),
                 style = RageType.rowTitle,
                 color = c.fgEmphasis,
             )
         }
         Spacer(modifier = Modifier.height(8.dp))
         Text(
-            text = failure?.message ?: "The key did not authorize this use.",
+            text = failure?.message ?: stringResource(R.string.the_key_did_not_authorize_this),
             style = RageType.caption,
             color = c.fgSecondary,
         )
@@ -516,20 +533,22 @@ private fun TapFailure(
         ) {
             Box(
                 modifier = Modifier
-                    .clickable(onClick = onCancel)
+                    .buttonTarget(onClick = onCancel)
                     .padding(horizontal = 8.dp, vertical = 6.dp),
+                contentAlignment = Alignment.Center,
             ) {
-                Text(text = "Dismiss", style = RageType.caption, color = c.fgSecondary)
+                Text(text = stringResource(R.string.dismiss), style = RageType.caption, color = c.fgSecondary)
             }
             if (failure?.retryable != false) {
                 Box(
                     modifier = Modifier
                         .background(c.accent, RoundedCornerShape(8.dp))
-                        .clickable(onClick = onRetry)
+                        .buttonTarget(onClick = onRetry)
                         .padding(horizontal = 14.dp, vertical = 8.dp),
+                    contentAlignment = Alignment.Center,
                 ) {
                     Text(
-                        text = "Try again",
+                        text = stringResource(R.string.try_again),
                         style = RageType.button,
                         color = c.background,
                         maxLines = 1,
@@ -542,7 +561,7 @@ private fun TapFailure(
 
 /** PIV PIN entry, driven by [HardwareTapCoordinator]'s pending [PinRequest]. */
 @Composable
-private fun PivPinPrompt(request: PinRequest) {
+internal fun PivPinPrompt(request: PinRequest) {
     val c = rageColors
     val pinState = rememberSecurePinFieldState()
     Column(
@@ -553,12 +572,12 @@ private fun PivPinPrompt(request: PinRequest) {
             .padding(horizontal = 16.dp, vertical = 14.dp),
     ) {
         Text(
-            text = "PIV PIN for ${request.recipientLabel}",
+            text = stringResource(R.string.piv_pin_for, request.recipientLabel),
             style = RageType.rowTitle,
             color = c.fgEmphasis,
         )
         Text(
-            text = "The PIN unlocks the slot; the key still requires a physical touch afterwards.",
+            text = stringResource(R.string.the_pin_unlocks_the_slot_the),
             style = RageType.caption,
             color = c.fgSecondary,
         )
@@ -571,25 +590,27 @@ private fun PivPinPrompt(request: PinRequest) {
         ) {
             Box(
                 modifier = Modifier
-                    .clickable {
+                    .buttonTarget {
                         pinState.zero()
                         request.cancel()
                     }
                     .padding(horizontal = 8.dp, vertical = 6.dp),
+                contentAlignment = Alignment.Center,
             ) {
-                Text(text = "Cancel", style = RageType.caption, color = c.fgSecondary)
+                Text(text = stringResource(R.string.cancel), style = RageType.caption, color = c.fgSecondary)
             }
             Box(
                 modifier = Modifier
                     .background(c.accent, RoundedCornerShape(8.dp))
-                    .clickable {
+                    .buttonTarget {
                         val pin = pinState.submit()
                         pinState.zero()
                         request.submit(pin)
                     }
                     .padding(horizontal = 14.dp, vertical = 8.dp),
+                contentAlignment = Alignment.Center,
             ) {
-                Text(text = "Continue", style = RageType.button, color = c.background, maxLines = 1)
+                Text(text = stringResource(R.string.continue_), style = RageType.button, color = c.background, maxLines = 1)
             }
         }
     }

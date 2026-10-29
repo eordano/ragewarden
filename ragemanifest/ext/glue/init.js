@@ -3,6 +3,7 @@ import * as crypto from './crypto.js';
 import { backendIsMock, backendLabel, selectedBackend, webauthnAvailable } from './hardware-tap.js';
 import { hardwareInventory } from './unlock.js';
 import { assertReleaseSafe } from './build-flags.js';
+import { autoLockMinutes, setAutoLockMinutes } from './storage.js';
 
 function publishInitState(state) {
     window.RagewardenInit = state;
@@ -26,6 +27,17 @@ async function main() {
 
         window.RagewardenVault = {
             status: vault.status,
+            unlock: async (password) => {
+                const r = await vault.unlock(password);
+                triggerDesignReload();
+                return r;
+            },
+            lock: vault.lock,
+            items: vault.items,
+            folders: vault.folders,
+            copySecret: vault.copySecret,
+            staleBrowserRecipients: vault.staleBrowserRecipients,
+            autoLock: { get: autoLockMinutes, set: setAutoLockMinutes },
             revealPassword: vault.revealPassword,
             autofillPassword: vault.autofillPassword,
             copyPassword: vault.copyPassword,
@@ -41,6 +53,16 @@ async function main() {
             renameFolder: vault.renameFolder,
             deleteFolder: vault.deleteFolder,
             enrollRecovery: vault.enrollRecovery,
+            generateRecovery: vault.generateRecovery,
+            totpCode: vault.totpCode,
+            setFolder: vault.setFolder,
+            saveItem: vault.saveItem,
+            itemDetails: vault.itemDetails,
+            stanzaSummary: vault.stanzaSummary,
+            generatePassword: vault.generatePassword,
+            generatePassphrase: vault.generatePassphrase,
+            enrollBackupPasskey: vault.enrollBackupPasskey,
+            publishRecovery: vault.publishRecovery,
             enrollPasskey: vault.enrollPasskey,
             recoverFromPhrase: vault.recoverFromPhrase,
             validateRecoveryPhrase: vault.validateRecoveryPhrase,
@@ -68,7 +90,6 @@ async function main() {
             tapCounters: vault.tapCountersSnapshot,
             audit: {
                 tail: (limit) => vault.audit.tail(limit),
-                clear: () => vault.audit.clear(),
             },
             history: {
                 load: (cipherId) => vault.loadHistory(cipherId),
@@ -76,10 +97,16 @@ async function main() {
                     vault.recordHistoryRevision(cipherId, prior, recipients),
             },
         };
+        let hostPermissionMissing = null;
+        try {
+            hostPermissionMissing = await vault.serverOriginNeedingPermission();
+        } catch {}
         publishInitState({
             phase: 'ready',
             error: null,
             result,
+            hostPermissionMissing,
+            locked: !!(result && result.locked),
             mockTap: backendIsMock(),
             backendLabel: backendLabel(),
         });

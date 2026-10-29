@@ -7,7 +7,7 @@ master-password layer.
 
 The point: a phishing-resistant Bitwarden where the master password leaking does not leak
 any of the actual secrets. A "rage item" is a vault item whose secret fields are wrapped
-in age stanzas for a set of hardware recipients. Every individual *use* of a credential -- autofill, copy, agent
+in age stanzas for a set of hardware recipients. Every individual use of a credential -- autofill, copy, agent
 load, or last-resort reveal -- requires a deliberate physical action, with the destination
 named in the prompt before the tap.
 
@@ -18,77 +18,57 @@ honors them.
 
 ## Three coordinated products, one shared core
 
-| product | runtime | UI source | status |
-|---|---|---|---|
-| [**ragedroid**](ragedroid/DESIGN.md)   | Android (Kotlin + JNI) | native Compose | phases 1-4 done -- autofill, IME, onboarding, JNI bridge, Roborazzi snapshots |
-| [**ragemanifest**](ragemanifest/DESIGN.md) | Browser MV3 (Rust -> WASM) | hosts [`design/`](design/) directly | phases 1-4 done -- WASM API, Chromium/Firefox/Safari builds, content-script autofill, native messaging |
-| [**rageterm**](rageterm/DESIGN.md)     | Native binary (Rust) | CLI + ratatui TUI | phases 1-4 done -- Vaultwarden round-trip, native-host mode, pass-import, ssh-agent, autotype |
+| product | runtime | UI source |
+|---|---|---|
+| [ragedroid](ragedroid/DESIGN.md) | Android (Kotlin + JNI) | native Compose |
+| [ragemanifest](ragemanifest/DESIGN.md) | Browser MV3 (Rust -> WASM) | plain ES-module popup on the [`design/`](design/) tokens |
+| [rageterm](rageterm/DESIGN.md) | Native binary (Rust) | CLI + ratatui TUI |
 
-All three share [**ragewarden-core**](core/DESIGN.md), the Rust crate that owns the age
+All three share [ragewarden-core](core/DESIGN.md), the Rust crate that owns the age
 encryption layer + Bitwarden helpers. One audit surface, one bug fix touches all three.
 
 ## Status
 
-Phases 1-4 of the [5-phase roadmap](DESIGN.md#7-sequencing) are complete or scaffolded.
-Phase 5 (production) is in progress.
+Phases 1-4 of the [roadmap](DESIGN.md#7-sequencing) are done; phase 5 (production) is
+under way: what remains is store distribution and signing, Homebrew and crates.io, a docs
+site, the third-party audit and v1.0.
 
-What works today:
-
-- **ragewarden-core**: X25519 + scrypt round-trips; PBKDF2 / HKDF /
-  Type-2 helpers match Bitwarden's spec; `sync` module ships register / login /
-  fetch_vault / cipher CRUD; TOTP (RFC 6238 SHA1/SHA256/SHA512); all five hardware-stanza
-  paths (`piv-p256`, `fido2-hmac`, `webauthn-prf-v1`, `ragedroid-keystore-v1`, recovery);
-  audit log + history tracking; cross-device recipient registry.
-- **rageterm**: full CLI round-trip against Vaultwarden (`register -> login -> sync -> set ->
-  list -> copy -> get -> reveal -> exec -> totp`); native-host mode for ragemanifest;
-  `pass-import` migration; `agent add` for ssh-agent; `fill --to` autotype (Linux,
-  macOS, Windows; other platforms report it as unimplemented); `pass`-style
-  command aliases. Local file store as offline fallback.
-- **ragedroid**: Compose app with Bitwarden API integration (`BitwardenVaultRepository`),
-  onboarding gate, autofill service (`RagewardenAutofillService`), IME service
-  (`RagewardenInputMethodService`), JNI bridge, TOTP card with countdown, identity
-  dispatch (Keystore/PIV/FIDO2 PRF), Hilt DI, baseline profile, Roborazzi snapshots,
-  standard + fdroid flavors. Runs on emulator end-to-end.
-- **ragemanifest**: WASM exports (login, register, vault fetch, cipher CRUD, decrypt
-  with PRF callbacks, TOTP, registry, audit, history). Background service worker handles
-  vault.status/fetch/lookup/unlock. Content-script autofill with Shadow DOM chip.
-  Onboarding overlay for login/registration. Passkey PRF enrollment + per-use ceremony.
-  Chromium, Firefox MV3, and Safari host-app builds. Playwright e2e suite with virtual
-  WebAuthn.
-- **CI/CD**: `ci.yml` runs Rust workspace (Linux + macOS), WASM build, Android matrix,
-  5-target rageterm cross-build, and three e2e tiers (Vaultwarden, Playwright, Gradle
-  Managed Devices). `release.yml` builds all artifacts + reproducible-build verification.
-- **End-to-end harness**: three tiers -- Rust <-> real Vaultwarden (Docker), Playwright +
-  virtual WebAuthn PRF (Chromium), Android emulator (Pixel 6 API 34). See [`E2E.md`](E2E.md).
-
-What remains for phase 5 (production):
-
-- QR enrollment for TOTP (all three frontends).
-- Bulk-protect wizard for existing unprotected items.
-- Live hardware identity ceremonies (currently mock-mode; requires real YubiKey/FIDO2
-  hardware testing).
-- Signed releases (GPG, Android keystore, Apple Developer ID, Authenticode).
-- Store distribution (Play Store, F-Droid, Chrome Web Store, AMO, App Store).
-- Homebrew tap + `cargo install` publication.
-- Docs site.
-- Organization sharing (design-doc level -- separate threat model).
+- ragewarden-core: age encryption to X25519, scrypt and every hardware stanza
+  (`piv-p256` in age-plugin-yubikey's format, `piv-x25519-v2`, `fido2-hmac`,
+  `webauthn-prf-v1`, `ragedroid-keystore-v1`/`-v2`, recovery), per-secret PRF salts and
+  legacy re-wrap; PBKDF2 and Argon2id, Type-2 EncStrings; `sync` with login, KDF pin and
+  upgrade, refresh, and cipher builders that keep every field (login, note, card,
+  identity, SSH key) with single- or multi-field protection; TOTP; the recipient
+  registry, revision history and audit log shared by all three clients.
+- rageterm: the CLI and `--tui` against Vaultwarden (`register`, `login`, `sync`, `set`,
+  `get`, `copy`, `reveal`, `exec`, `totp`, `mv`, `reencrypt`, `restrict`, `generate`);
+  YubiKey PIV (P-256 by default), FIDO2, OS-keyring, software and paper identities; the
+  native-messaging host for the extension, with signed touch proofs; `pass-import`;
+  `agent add`; `fill --to` autotype on Linux, macOS and Windows.
+- ragedroid: Compose app on the Bitwarden API with an offline encrypted cache and a lock
+  that drops the keys; autofill (with inline suggestions) and a keyboard that both unlock
+  and tap; YubiKey PIV and FIDO2 over NFC and USB, Android Keystore (StrongBox or TEE),
+  Credential Manager passkeys; TOTP with QR scan; typed items; standard and fdroid
+  flavours.
+- ragemanifest: Chromium, Firefox and Safari builds; passkeys with PRF, phone passkeys
+  through the relay page, PIV and FIDO2 through rageterm; a local lock with auto-lock;
+  origin-pinned autofill in every frame; typed items, TOTP, history and audit.
+- CI and release: `ci.yml` runs the Rust workspace (Linux and macOS), the wasm build, the
+  Android matrix, the rageterm cross-builds and the three e2e tiers (Vaultwarden,
+  Playwright, Android emulator); `release.yml` builds every artifact and verifies
+  reproducibility. See [`E2E.md`](E2E.md).
 
 ## Layout
 
-```
-ragewarden/
-+-- DESIGN.md                ecosystem design + 5-phase roadmap
-+-- core/                    ragewarden-core: shared Rust crate
-+-- ragedroid/               Android frontend (Kotlin + JNI)
-+-- ragemanifest/            browser extension (Rust -> WASM)
-+-- rageterm/                native CLI / TUI
-+-- design/                  read-only HTML/CSS/JS prototype, source of UI truth
-```
+`DESIGN.md` holds the ecosystem design and 5-phase roadmap; `core/` is
+ragewarden-core, the shared Rust crate; `ragedroid/` the Android frontend
+(Kotlin + JNI); `ragemanifest/` the browser extension (Rust -> WASM);
+`rageterm/` the native CLI / TUI; `design/` the read-only HTML/CSS/JS prototype.
 
-The [`design/`](design/) folder is the canonical UI source. `ragemanifest` consumes it at
-build time (it's a browser extension; design is already browser-shaped). `ragedroid`
-hand-translates it to Compose for security reasons (a WebView with biometric/autofill
-bridges is unacceptable attack surface for a vault app).
+The [`design/`](design/) folder is the canonical UI design. `ragemanifest` implements it as
+plain ES modules and takes only its tokens and fonts at build time; `ragedroid`
+hand-translates it to Compose (a WebView with biometric/autofill bridges is unacceptable
+attack surface for a vault app).
 
 ## Build
 
@@ -99,13 +79,11 @@ cargo build --workspace
 cargo test  --workspace
 ```
 
-On macOS you may hit `ld: library not found for -liconv` from `aws-lc-sys`/`ring`. Work
-around it by pointing `LIBRARY_PATH` at the SDK's lib directory before building:
-
-```sh
-export LIBRARY_PATH="$(xcrun --show-sdk-path)/usr/lib"
-cargo build --workspace
-```
+On macOS, build with Apple's toolchain (Xcode or the Command Line Tools, `/usr/bin/cc`)
+or inside `nix develop <nixos-config>#ragewarden`. Rust's standard library links
+`-liconv`; Apple's linker finds it in the SDK, and the devshell brings nixpkgs' libiconv as
+a build input. nixpkgs' clang outside that shell has neither and stops at
+`ld: library not found for -liconv`, already while linking dependencies' build scripts.
 
 Per-frontend builds and verification: see each frontend subdirectory's `README.md`
 (`rageterm/`, `ragedroid/`, `ragemanifest/`; the shared crate is documented in

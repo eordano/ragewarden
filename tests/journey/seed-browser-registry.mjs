@@ -80,7 +80,8 @@ async function seed(server, statePath) {
     // weaken your master password"), and lowering it here would only be
     // discovered as a register-time error anyway.
     await wasm.wasm_register(server, email, 'Browser', password, 600_000);
-    const session = await wasm.wasm_login(server, email, password, 'ragemanifest-seed');
+    const deviceId = crypto.randomUUID();
+    const session = await wasm.wasm_login(server, email, password, 'ragemanifest-seed', deviceId, null, false);
 
     // 1. The browser's software identity, shaped exactly as ext/glue/vault.js's
     //    softwareIdentityToRegistryEntry() shapes it.
@@ -147,6 +148,7 @@ async function seed(server, statePath) {
     }
 
     writeFileSync(statePath, JSON.stringify({
+        deviceId,
         server, email, password,
         item, secret, itemId: created.id,
         swEntryId, swArmoredPubkey: sw.armored_pubkey, swSecret,
@@ -159,7 +161,8 @@ async function seed(server, statePath) {
 async function audit(statePath) {
     const state = JSON.parse(readFileSync(statePath, 'utf8'));
     const session = await wasm.wasm_login(
-        state.server, state.email, state.password, 'ragemanifest-audit',
+        state.server, state.email, state.password, 'ragemanifest-audit', state.deviceId ?? crypto.randomUUID(),
+        null, false,
     );
 
     const vault = await wasm.wasm_fetch_vault(session);

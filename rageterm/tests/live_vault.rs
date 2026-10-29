@@ -5,8 +5,7 @@ fn opted_in() -> bool {
 }
 
 fn server() -> String {
-    std::env::var("RAGEWARDEN_LIVE_SERVER")
-        .unwrap_or_else(|_| "https://vault.example.com".into())
+    std::env::var("RAGEWARDEN_LIVE_SERVER").unwrap_or_else(|_| "https://vault.example.com".into())
 }
 
 fn email() -> Option<String> {
@@ -34,7 +33,7 @@ fn live_recovery_round_trip() {
     let server = server();
 
     let tmp = tempfile::TempDir::new().unwrap();
-    std::env::set_var("RAGEWARDEN_CONFIG_DIR", tmp.path());
+    unsafe { std::env::set_var("RAGEWARDEN_CONFIG_DIR", tmp.path()) };
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -48,7 +47,7 @@ fn live_recovery_round_trip() {
                 .await
                 .expect("login");
 
-        let gen = ragewarden_core::recovery::generate().expect("generate");
+        let generated = ragewarden_core::recovery::generate().expect("generate");
         let plaintext = format!(
             "live-recovery-{}",
             SystemTime::now()
@@ -57,7 +56,7 @@ fn live_recovery_round_trip() {
                 .as_millis()
         );
         let recipient = ragewarden_core::Recipient::SoftwarePassphrase {
-            armored_pubkey: gen.armored_pubkey.clone(),
+            armored_pubkey: generated.armored_pubkey.clone(),
         };
         let blob = ragewarden_core::encrypt(plaintext.as_bytes(), &[recipient])
             .expect("encrypt to recovery");
@@ -85,7 +84,7 @@ fn live_recovery_round_trip() {
             .expect("rage blob present");
         let blob = ragewarden_core::AgeBlob::from_bytes(blob_armored.into_bytes());
 
-        let id = ragewarden_core::recovery::from_mnemonic(&gen.mnemonic).expect("recover");
+        let id = ragewarden_core::recovery::from_mnemonic(&generated.mnemonic).expect("recover");
         use age::secrecy::ExposeSecret;
         let armored_secret = ragewarden_core::ArmoredAgeSecret::from_trusted(
             id.to_string().expose_secret().to_string(),
@@ -98,7 +97,7 @@ fn live_recovery_round_trip() {
 
         eprintln!("Live test passed. Manual cleanup of `{name}` recommended.");
 
-        std::env::remove_var("RAGEWARDEN_CONFIG_DIR");
+        unsafe { std::env::remove_var("RAGEWARDEN_CONFIG_DIR") };
     });
 
     drop(tmp);

@@ -9,7 +9,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Parcelable
 import android.service.autofill.Dataset
-import android.service.autofill.FillResponse
 import android.view.autofill.AutofillId
 import android.view.autofill.AutofillManager
 import android.view.autofill.AutofillValue
@@ -38,6 +37,7 @@ import ragewarden.ragedroid.ui.components.TapPresentation
 import ragewarden.ragedroid.ui.secureWindow
 import ragewarden.ragedroid.ui.theme.RageTheme
 import ragewarden.ragedroid.ui.theme.rageColors
+import ragewarden.ragedroid.ui.uiString
 
 class AutofillAuthActivity : FragmentActivity() {
 
@@ -48,7 +48,6 @@ class AutofillAuthActivity : FragmentActivity() {
         // The tap IS the consent gesture, so an overlay that supplies the touch
         // is a full bypass of it. Reject any touch delivered while another
         // window is on top of ours.
-        window.decorView.filterTouchesWhenObscured = true
         // This sheet names the item being unlocked and sits directly in front of
         // a plaintext delivery.
         secureWindow()
@@ -95,7 +94,7 @@ class AutofillAuthActivity : FragmentActivity() {
         val presentation = if (item.rage) {
             TapPresentation.from(coordinator.identitySet())
         } else {
-            TapPresentation.softwareOnly("this vault's server-side key (item not Ragewarden-protected)")
+            TapPresentation.softwareOnly(uiString(R.string.this_vault_s_server_side_key))
         }
 
         setContent {
@@ -112,7 +111,7 @@ class AutofillAuthActivity : FragmentActivity() {
                     if (!dismissed) {
                         InlineTapReveal(
                             itemName = item.name.ifBlank { itemId },
-                            itemSite = domain.ifBlank { item.site.ifBlank { null } },
+                            itemSite = domain.ifBlank { null },
                             presentation = presentation,
                             initialAction = TapAction.Autofill,
                             pinRequest = pinRequest,
@@ -156,13 +155,13 @@ class AutofillAuthActivity : FragmentActivity() {
         displayLabel: String,
     ) {
         val backend = VaultBridge.ensureBackend(this)
-        val target = displayLabel.substringAfter("into ").ifBlank { "this app" }
+        val target = intent.getStringExtra(EXTRA_DOMAIN).orEmpty().ifBlank { uiString(R.string.this_app) }
         val plaintext: ByteArray = if (isRage) {
-            coordinator.authorize(purpose = "Autofill into $target") { identities ->
-                backend.decrypt(itemId, identities)
+            coordinator.authorize(purpose = uiString(R.string.autofill_into_2, target)) { identities ->
+                backend.decrypt(itemId, identities, ragewarden.ragedroid.data.audit.AuditAction.Autofill)
             }
         } else {
-            backend.decrypt(itemId, emptyList())
+            backend.decrypt(itemId, emptyList(), ragewarden.ragedroid.data.audit.AuditAction.Autofill)
         }
         // The tap ceremony and the decrypt both suspend, and the user can lock
         // the vault from the main app while this sheet is up. Re-check before
@@ -172,8 +171,10 @@ class AutofillAuthActivity : FragmentActivity() {
         // `finish()` would tear the sheet down before the message was readable.
         if (lockState.isLocked) {
             plaintext.fill(0)
-            error("The vault locked while this was authorizing. Unlock Ragewarden and try again.")
+            error(uiString(R.string.the_vault_locked_while_this_was))
         }
+        val chars = ragewarden.ragedroid.data.SecretText.chars(plaintext)
+        plaintext.fill(0)
         try {
             val datasetBuilder = freshDatasetBuilder(displayLabel)
             usernameId?.let { id ->
@@ -183,18 +184,22 @@ class AutofillAuthActivity : FragmentActivity() {
                 attachValue(
                     datasetBuilder,
                     id,
-                    AutofillValue.forText(String(plaintext, Charsets.UTF_8)),
+                    AutofillValue.forText(java.nio.CharBuffer.wrap(chars)),
                     displayLabel,
                 )
             }
-            val response = FillResponse.Builder().addDataset(datasetBuilder.build()).build()
+            // The dataset authenticated, not the response, so the result is the
+            // Dataset: Android fills it at once. A FillResponse here is taken as a
+            // new response and offered in the dropdown again, unfilled.
             val resultIntent = Intent().apply {
-                putExtra(AutofillManager.EXTRA_AUTHENTICATION_RESULT, response)
+                putExtra(AutofillManager.EXTRA_AUTHENTICATION_RESULT, datasetBuilder.build())
             }
             setResult(Activity.RESULT_OK, resultIntent)
         } finally {
-            plaintext.fill(0)
+            // finish() hands the result to the system in a synchronous binder
+            // call, which parcels the value; only then are the characters zeroed.
             finish()
+            chars.fill('\u0000')
         }
     }
 
@@ -202,8 +207,8 @@ class AutofillAuthActivity : FragmentActivity() {
         val rv = RemoteViews(packageName, R.layout.ragedroid_autofill_chip).apply {
             setTextViewText(R.id.ragedroid_autofill_label, label)
         }
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            Dataset.Builder()
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Dataset.Builder(android.service.autofill.Presentations.Builder().setMenuPresentation(rv).build())
         } else {
             @Suppress("DEPRECATION")
             Dataset.Builder(rv)
@@ -216,11 +221,8 @@ class AutofillAuthActivity : FragmentActivity() {
         value: AutofillValue,
         label: String,
     ) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val rv = RemoteViews(packageName, R.layout.ragedroid_autofill_chip).apply {
-                setTextViewText(R.id.ragedroid_autofill_label, label)
-            }
-            builder.setValue(id, value, rv)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            builder.setField(id, android.service.autofill.Field.Builder().setValue(value).build())
         } else {
             @Suppress("DEPRECATION")
             builder.setValue(id, value)
@@ -250,7 +252,6 @@ class AutofillAuthActivity : FragmentActivity() {
             usernameId: AutofillId?,
             passwordId: AutofillId?,
         ): Intent = Intent(context, AutofillAuthActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             putExtra(EXTRA_ITEM_ID, itemId)
             putExtra(EXTRA_DISPLAY_LABEL, displayLabel)
             putExtra(EXTRA_DOMAIN, domain)

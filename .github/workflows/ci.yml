@@ -5,36 +5,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  # release.yml calls this workflow on a `v*` tag, so the artifacts that get
-  # published are gated by the same suites that gate main. Before this existed a
-  # tag ran *zero* tests: the two triggers above match branches only, a tag push
-  # matches neither, and release.yml had no test step in any of its jobs -- so
-  # every suite in this file gated main and gated nothing that users could
-  # actually download.
-  #
-  # Consequences for edits here: every job below now also runs on a release, so
-  # a job that is too slow or too flaky for a tag is too slow or too flaky for
-  # main. Do not "fix" a slow release by carving jobs out of the tag path;
-  # that re-opens the hole. No inputs and no secrets are declared, so the
-  # called workflow gets none -- keep it that way, none of these jobs needs one.
   workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  # wasm-pack is pinned, and release.yml pins the same version -- the two must
-  # agree, because a hash this workflow could have recorded is a hash the
-  # release workflow re-verifies. It used to be installed by
-  # `curl ... init.sh | sh`, which takes whatever the latest release happens to be
-  # on the day the job runs, so two runners in one release could install two
-  # different wasm-pack versions and emit two different ragemanifest_bg.wasm
-  # files. That is precisely the difference
-  # scripts/repro/verify-ragemanifest-wasm.sh exists to catch, so the
-  # reproducible-build gate would have gone red with no source change behind it.
-  # wasm-bindgen is already pinned at 0.2.120 by Cargo.lock (wasm-pack fetches
-  # the matching wasm-bindgen-cli), which made wasm-pack the last free variable.
-  # Bumping this value can change the emitted bytecode: re-seed
-  # scripts/repro/EXPECTED_HASHES.txt in the same commit that bumps it.
   WASM_PACK_VERSION: "0.13.1"
 
 jobs:
@@ -63,6 +38,9 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-targets
 
+      - name: core without the Bitwarden layers
+        run: cargo test -p ragewarden-core --no-default-features --all-targets
+
       - name: cargo doc
         run: cargo doc --workspace --no-deps
 
@@ -75,29 +53,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: install cargo-deny and cargo-audit
-        # RUSTFLAGS is cleared for the same reason the wasm-pack install clears
-        # it (see the env block at the top): `-D warnings` must not reach a
-        # third-party crate build, or an unrelated upstream warning fails the
-        # tool install.
         env:
           RUSTFLAGS: ""
         run: |
           cargo install --locked cargo-deny
           cargo install --locked cargo-audit
 
-      # Hard gate. `sources` is deterministic and offline (reads Cargo.lock, no
-      # advisory DB) and verified green today -- every dependency resolves from
-      # crates.io. It blocks a future dependency arriving from an arbitrary git
-      # repo or private registry. `bans` is warn-only (see deny.toml), so it
-      # reports duplicates/wildcards here without failing.
       - name: cargo deny (sources + bans)
         run: cargo deny check sources bans
 
-      # Reported, NOT gated. Advisories grow with every new upstream CVE and the
-      # license allowlist is still being confirmed; neither may wedge a release
-      # tag with no source change (this workflow runs on tags via
-      # workflow_call). Read the annotations, then pin/patch. Flip licenses into
-      # the gating step above once a clean run confirms the allowlist.
       - name: cargo deny (advisories + licenses) -- report only
         continue-on-error: true
         run: cargo deny check advisories licenses
@@ -116,12 +80,12 @@ jobs:
       - name: install pcsc-lite
         run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev
       - name: pre-pull vaultwarden
-        run: docker pull vaultwarden/server:1.32.7
+        run: docker pull docker.io/vaultwarden/server:1.37.3
       - name: run e2e harness
         env:
           RAGEWARDEN_E2E: "1"
           RUST_LOG: warn
-        run: cargo test -p rageterm --test e2e_vaultwarden -- --ignored --nocapture --test-threads=1
+        run: cargo test -p rageterm --test e2e_vaultwarden --test e2e_protocol -- --nocapture --test-threads=1
 
   ragemanifest-wasm:
     name: ragemanifest wasm-pack
@@ -135,19 +99,31 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Pinned via WASM_PACK_VERSION (see the env block at the top of this file
-      # for why an unpinned installer was a reproducibility hazard).
       - name: install wasm-pack (pinned)
         env:
-          # This workflow sets RUSTFLAGS=-D warnings for *our* code. Letting it
-          # reach a third-party crate build turns any warning anywhere in
-          # wasm-pack's dependency tree into a failed install, on a version bump
-          # nobody in this repo made.
           RUSTFLAGS: ""
         run: cargo install --locked wasm-pack --version "$WASM_PACK_VERSION"
 
       - name: wasm-pack build
         run: wasm-pack build --target web ragemanifest
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.9.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: ragemanifest/pnpm-lock.yaml
+
+      - name: extension builds, smoke and unit tests
+        working-directory: ragemanifest
+        run: |
+          pnpm install --frozen-lockfile
+          for target in chromium firefox safari; do node build.mjs "$target"; done
+          node tests/smoke-firefox.mjs --static-only
+          pnpm run test:unit
 
       - uses: actions/upload-artifact@v4
         with:
@@ -160,11 +136,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.9.0
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
-          cache-dependency-path: ragemanifest/tests/playwright/package-lock.json
+          cache: pnpm
+          cache-dependency-path: ragemanifest/tests/playwright/pnpm-lock.yaml
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -172,31 +152,25 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Pinned via WASM_PACK_VERSION (see the env block at the top of this file
-      # for why an unpinned installer was a reproducibility hazard).
       - name: install wasm-pack (pinned)
         env:
-          # This workflow sets RUSTFLAGS=-D warnings for *our* code. Letting it
-          # reach a third-party crate build turns any warning anywhere in
-          # wasm-pack's dependency tree into a failed install, on a version bump
-          # nobody in this repo made.
           RUSTFLAGS: ""
         run: cargo install --locked wasm-pack --version "$WASM_PACK_VERSION"
 
       - name: pre-pull vaultwarden
-        run: docker pull vaultwarden/server:1.32.7
+        run: docker pull docker.io/vaultwarden/server:1.37.3
 
       - name: install playwright deps
         working-directory: ragemanifest/tests/playwright
         run: |
-          npm ci
-          npx playwright install --with-deps chromium
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
 
       - name: run playwright harness
         working-directory: ragemanifest/tests/playwright
         env:
           CI: "1"
-        run: npx playwright test
+        run: pnpm exec playwright test
 
       - name: upload report on failure
         if: failure()
@@ -205,6 +179,38 @@ jobs:
           name: playwright-report
           path: ragemanifest/tests/playwright/playwright-report/
           if-no-files-found: ignore
+
+  safari:
+    name: Safari app (xcodebuild, unsigned)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install wasm-pack (pinned)
+        env:
+          RUSTFLAGS: ""
+        run: cargo install --locked wasm-pack --version "$WASM_PACK_VERSION"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: build the Safari bundle
+        run: |
+          wasm-pack build --target web ragemanifest
+          node ragemanifest/build.mjs safari
+
+      - name: host app Swift package
+        run: swift build --package-path ragemanifest/safari-host-app
+
+      - name: Safari app via the web-extension converter
+        run: bash ragemanifest/safari-host-app/build.sh
 
   ragedroid-android:
     name: ragedroid android build
@@ -215,7 +221,7 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: zulu
-          java-version: 17
+          java-version: 21
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -234,21 +240,19 @@ jobs:
 
       - name: gradle wrapper
         working-directory: ragedroid
-        # The version comes out of the committed gradle-wrapper.properties, never
-        # a literal in this file. ragedroid/gradle/libs.versions.toml pins
-        # agp = 8.13.2, and AGP's own version-check plugin refuses anything below
-        # 8.13 ("Minimum supported Gradle version is 8.13"), so the 8.10.2 that
-        # used to be hardcoded here rewrote the properties file down to a Gradle
-        # that could not even configure the project -- every job died at
-        # `apply plugin: com.android.application`, before compiling a line.
         run: |
           version="$(sed -n 's|.*/gradle-\(.*\)-bin\.zip|\1|p' gradle/wrapper/gradle-wrapper.properties)"
           if [ -z "$version" ]; then
             echo "::error::no distributionUrl version in ragedroid/gradle/wrapper/gradle-wrapper.properties"
             exit 1
           fi
-          echo "gradle wrapper version (from gradle-wrapper.properties): $version"
-          gradle wrapper --gradle-version "$version"
+          sum="$(sed -n 's|^distributionSha256Sum=||p' gradle/wrapper/gradle-wrapper.properties)"
+          if [ -z "$sum" ]; then
+            echo "::error::no distributionSha256Sum in ragedroid/gradle/wrapper/gradle-wrapper.properties"
+            exit 1
+          fi
+          echo "gradle wrapper version (from gradle-wrapper.properties): $version, sha256 $sum"
+          gradle wrapper --gradle-version "$version" --gradle-distribution-sha256-sum "$sum"
 
       - name: assemble debug (both flavors)
         working-directory: ragedroid
@@ -269,55 +273,6 @@ jobs:
             ragedroid/app/build/outputs/apk/standard/debug/*.apk
             ragedroid/app/build/outputs/apk/fdroid/debug/*.apk
 
-  # WHAT THIS JOB DOES NOT COVER: tests/journey/run.sh.
-  #
-  # `ragedroid/app/build.gradle.kts` sets
-  # `testInstrumentationRunnerArguments["notPackage"] = "ragewarden.ragedroid.journey"`
-  # on every instrumentation run that does not pass `journeyServer`, and this job
-  # does not pass it. So the two-client journey -- rageterm writes a secret on the
-  # host, the phone reads it back from 24 typed words, with a decoy phrase as the
-  # negative control -- is filtered OUT of the run below. Nothing in this workflow
-  # executes JourneyTest. Its assertions are real and they gate nothing.
-  #
-  # That is a gap, not an oversight, and closing it is not a matter of adding a
-  # `run: bash tests/journey/run.sh` step. Three things break, concretely:
-  #
-  #   1. run.sh needs a NATIVE Vaultwarden binary. It execs it, backgrounds it,
-  #      keeps the pid and kills it in a trap, and points DATA_FOLDER at a host
-  #      directory. The only Vaultwarden this repo pins is a Docker IMAGE
-  #      (vaultwarden/server:1.32.7, used by e2e-vaultwarden and e2e-playwright),
-  #      and a container cannot satisfy that contract. There is no apt package
-  #      and no release tarball consumed anywhere here. A Nix-based dev environment supplies the
-  #      binary from a Nix devshell (RAGEWARDEN_VAULTWARDEN_BIN, see
-  #      a ragewarden devshell in the maintainer's own config repo); reproducing that on a
-  #      runner means installing Nix solely for this job, or unpacking a
-  #      Debian-linked binary out of the image and hoping its shared-library
-  #      closure resolves on the runner image.
-  #
-  #   2. run.sh invokes bare `gradle`, not `./gradlew`. Every Android job in this
-  #      file deliberately regenerates the wrapper first, because the Gradle on
-  #      the runner image is not the version AGP 8.13.2 accepts (see the comment
-  #      on the `gradle wrapper` steps). A journey job would need a
-  #      `gradle` -> `gradlew` shim on PATH, which is a workaround for a
-  #      hardcoded command, not a fix.
-  #
-  #   3. run.sh needs a PERSISTENT attached device: it calls `adb get-state`,
-  #      `adb reverse`, `adb uninstall` and then `connectedFdroidDebugAndroidTest`.
-  #      The job below uses a Gradle Managed Device, which owns its emulator's
-  #      lifecycle and leaves nothing attached between tasks. A journey job needs
-  #      its own AVD created, booted and waited on.
-  #
-  # None of that is impossible. All of it is a second full emulator job on every
-  # push, every pull request and -- because of the `workflow_call` trigger at the
-  # top of this file -- every release tag, written blind. The header of this file
-  # already states the rule that settles it: "a job that is too slow or too flaky
-  # for a tag is too slow or too flaky for main." A journey job that has never
-  # been observed to pass is exactly that, and a green-by-construction one would
-  # be worse than none.
-  #
-  # What IS gated, cheaply and on every run, is that the journey stays RUNNABLE:
-  # see the `journey-contract` job below. It does not execute the journey and
-  # does not pretend to.
   e2e-android:
     name: e2e (ragedroid emulator on Pixel 6 API 34)
     runs-on: ubuntu-latest
@@ -327,7 +282,7 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: zulu
-          java-version: 17
+          java-version: 21
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -355,21 +310,19 @@ jobs:
 
       - name: gradle wrapper
         working-directory: ragedroid
-        # The version comes out of the committed gradle-wrapper.properties, never
-        # a literal in this file. ragedroid/gradle/libs.versions.toml pins
-        # agp = 8.13.2, and AGP's own version-check plugin refuses anything below
-        # 8.13 ("Minimum supported Gradle version is 8.13"), so the 8.10.2 that
-        # used to be hardcoded here rewrote the properties file down to a Gradle
-        # that could not even configure the project -- every job died at
-        # `apply plugin: com.android.application`, before compiling a line.
         run: |
           version="$(sed -n 's|.*/gradle-\(.*\)-bin\.zip|\1|p' gradle/wrapper/gradle-wrapper.properties)"
           if [ -z "$version" ]; then
             echo "::error::no distributionUrl version in ragedroid/gradle/wrapper/gradle-wrapper.properties"
             exit 1
           fi
-          echo "gradle wrapper version (from gradle-wrapper.properties): $version"
-          gradle wrapper --gradle-version "$version"
+          sum="$(sed -n 's|^distributionSha256Sum=||p' gradle/wrapper/gradle-wrapper.properties)"
+          if [ -z "$sum" ]; then
+            echo "::error::no distributionSha256Sum in ragedroid/gradle/wrapper/gradle-wrapper.properties"
+            exit 1
+          fi
+          echo "gradle wrapper version (from gradle-wrapper.properties): $version, sha256 $sum"
+          gradle wrapper --gradle-version "$version" --gradle-distribution-sha256-sum "$sum"
 
       - name: pixel6Api34 standardDebug androidTest
         working-directory: ragedroid
@@ -397,18 +350,6 @@ jobs:
         with:
           node-version: 20
 
-      # tests/journey/run.sh is the ONLY thing that ever executes JourneyTest --
-      # the notPackage filter in ragedroid/app/build.gradle.kts keeps it out of
-      # every other instrumentation run -- and no job in this workflow invokes it
-      # (see the block above e2e-android for why). That makes its wiring the
-      # kind of thing that rots silently: rename an instrumentation argument on
-      # one side and the journey does not go red, it stops existing, and the
-      # person who finds out is whoever next runs it by hand locally.
-      #
-      # This job asserts the wiring, not the behaviour. It runs no emulator, no
-      # Vaultwarden and no gradle, takes seconds, and can only fail on a real
-      # drift between three files. It is explicitly NOT a substitute for running
-      # the journey and must never be described as one.
       - name: journey wiring contract
         run: |
           set -euo pipefail

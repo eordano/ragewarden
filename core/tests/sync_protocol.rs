@@ -2,17 +2,17 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use base64::{
-    engine::general_purpose::STANDARD as B64, engine::general_purpose::URL_SAFE_NO_PAD as B64URL,
-    Engine,
+    Engine, engine::general_purpose::STANDARD as B64,
+    engine::general_purpose::URL_SAFE_NO_PAD as B64URL,
 };
 use ragewarden_core::bitwarden::{
     derive_master_key, encrypt_type2, make_user_key, master_password_hash, stretch_master_key,
 };
 use ragewarden_core::sync::{
-    self, build_rage_cipher, create_cipher, create_folder, delete_cipher, delete_folder,
-    encrypt_string, extract_rage_blob, fetch_vault, login, login_pinned, name_index, register,
-    set_folder, set_folder_on, update_cipher, update_folder, Cipher, CipherIn, HttpBody, HttpClient,
-    HttpError, HttpResponse, SecureUrl, Server, Session,
+    self, Cipher, CipherIn, HttpBody, HttpClient, HttpError, HttpResponse, SecureUrl, Server,
+    Session, build_rage_cipher, create_cipher, create_folder, delete_cipher, delete_folder,
+    encrypt_string, extract_rage_blob, fetch_vault, login, login_with_options, name_index,
+    register, set_folder, set_folder_on, update_cipher, update_folder,
 };
 
 #[derive(Debug, Clone)]
@@ -23,8 +23,10 @@ struct RecordedRequest {
     headers: Vec<(String, String)>,
 }
 
+type Route = (&'static str, String, u16, Vec<u8>);
+
 struct MockClient {
-    routes: Mutex<Vec<(&'static str, String, u16, Vec<u8>)>>,
+    routes: Mutex<Vec<Route>>,
     log: Mutex<Vec<RecordedRequest>>,
 }
 
@@ -110,22 +112,22 @@ impl HttpClient for MockClient {
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake};
+    use std::task::{Context, Poll, Waker};
 
-    struct Noop;
-    impl Wake for Noop {
-        fn wake(self: Arc<Self>) {}
-    }
-    let waker = Arc::new(Noop).into();
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     let mut fut = Box::pin(fut);
-    loop {
-        match Pin::new(&mut fut).as_mut().poll(&mut cx) {
-            Poll::Ready(v) => return v,
-            Poll::Pending => continue,
-        }
+    match Pin::new(&mut fut).as_mut().poll(&mut cx) {
+        Poll::Ready(v) => v,
+        Poll::Pending => panic!(
+            "block_on drives only futures that never wait: the mock HttpClient answers synchronously"
+        ),
     }
+}
+
+#[test]
+#[should_panic(expected = "never wait")]
+fn block_on_refuses_a_future_that_would_wait_instead_of_spinning() {
+    block_on(std::future::pending::<()>());
 }
 
 const TEST_ITERS: u32 = ragewarden_core::bitwarden::KDF_ITERATIONS_MIN;
@@ -143,7 +145,23 @@ fn fake_token_response(
     user_key_raw: &[u8; 64],
     user_id: &str,
 ) -> Vec<u8> {
-    let master_key = derive_master_key(password, email, iters);
+    fake_token_response_kdf(
+        email,
+        password,
+        &sync::KdfParams::pbkdf2(iters),
+        user_key_raw,
+        user_id,
+    )
+}
+
+fn fake_token_response_kdf(
+    email: &str,
+    password: &str,
+    kdf: &sync::KdfParams,
+    user_key_raw: &[u8; 64],
+    user_id: &str,
+) -> Vec<u8> {
+    let master_key = kdf.derive_master_key(password, email).unwrap();
     let (stretch_enc, stretch_mac) = stretch_master_key(&master_key);
     let protected = encrypt_type2(user_key_raw, &stretch_enc, &stretch_mac);
 
@@ -168,19 +186,40 @@ fn make_session(user_enc: [u8; 32], user_mac: [u8; 32]) -> Session {
         email: "test@example.com".into(),
         user_enc_key: user_enc.to_vec().into(),
         user_mac_key: user_mac.to_vec().into(),
-        kdf_iterations: 100,
+        kdf: ragewarden_core::sync::KdfParams::pbkdf2(100),
         device_id: "test-device".into(),
     }
 }
 
+/// The two-step registration a current Bitwarden or Vaultwarden (1.37+)
+/// server expects: the first call returns the token the second one carries.
+fn register_mock() -> MockClient {
+    MockClient::new(vec![
+        (
+            "POST",
+            "/identity/accounts/register/send-verification-email",
+            200,
+            br#""verify-token""#.to_vec(),
+        ),
+        (
+            "POST",
+            "/identity/accounts/register/finish",
+            200,
+            b"".to_vec(),
+        ),
+    ])
+}
+
+fn json_body(req: &RecordedRequest) -> serde_json::Value {
+    match &req.body {
+        Some(HttpBody::Json(b)) => serde_json::from_slice(b).unwrap(),
+        other => panic!("expected JSON body, got {other:?}"),
+    }
+}
+
 #[test]
-fn register_posts_to_identity_accounts_register() {
-    let mock = MockClient::new(vec![(
-        "POST",
-        "/identity/accounts/register",
-        200,
-        b"".to_vec(),
-    )]);
+fn register_asks_for_a_verification_token_then_finishes_with_it() {
+    let mock = register_mock();
     let out = block_on(register(
         &mock,
         &server(),
@@ -191,23 +230,33 @@ fn register_posts_to_identity_accounts_register() {
     ))
     .expect("register ok");
     assert_eq!(out.email, "test@example.com");
-    assert_eq!(out.kdf_iterations, REGISTER_ITERS);
+    assert_eq!(out.kdf.iterations, REGISTER_ITERS);
     assert_eq!(out.user_enc_key.len(), 32);
     assert_eq!(out.user_mac_key.len(), 32);
 
     let reqs = mock.requests();
-    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs.len(), 2);
     assert_eq!(reqs[0].method, "POST");
     assert_eq!(
         reqs[0].url,
-        "https://bitwarden.example.test/identity/accounts/register"
+        "https://bitwarden.example.test/identity/accounts/register/send-verification-email"
     );
+    assert!(
+        reqs[0]
+            .headers
+            .contains(&("Accept".to_string(), "application/json".to_string()))
+    );
+    let verify = json_body(&reqs[0]);
+    assert_eq!(verify["email"], "test@example.com");
+    assert_eq!(verify["name"], "Test User");
 
-    let body = match &reqs[0].body {
-        Some(HttpBody::Json(b)) => b.clone(),
-        other => panic!("expected JSON body, got {other:?}"),
-    };
-    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(reqs[1].method, "POST");
+    assert_eq!(
+        reqs[1].url,
+        "https://bitwarden.example.test/identity/accounts/register/finish"
+    );
+    let v = json_body(&reqs[1]);
+    assert_eq!(v["emailVerificationToken"], "verify-token");
     assert_eq!(v["email"], "test@example.com");
     assert_eq!(v["name"], "Test User");
     assert_eq!(v["kdf"], 0);
@@ -218,12 +267,70 @@ fn register_posts_to_identity_accounts_register() {
     assert!(v["key"].as_str().unwrap().starts_with("2."));
 
     assert!(!v["keys"]["publicKey"].as_str().unwrap().is_empty());
-    assert!(v["keys"]["encryptedPrivateKey"]
-        .as_str()
-        .unwrap()
-        .starts_with("2."));
+    assert!(
+        v["keys"]["encryptedPrivateKey"]
+            .as_str()
+            .unwrap()
+            .starts_with("2.")
+    );
 
     assert!(v["referenceData"].is_null());
+}
+
+#[test]
+fn register_falls_back_to_the_single_step_endpoint_on_an_older_server() {
+    let mock = MockClient::new(vec![
+        (
+            "POST",
+            "/identity/accounts/register/send-verification-email",
+            404,
+            b"<!DOCTYPE html>".to_vec(),
+        ),
+        ("POST", "/identity/accounts/register", 200, b"".to_vec()),
+    ]);
+    block_on(register(
+        &mock,
+        &server(),
+        "old@example.com",
+        "hunter2",
+        "Old Server",
+        REGISTER_ITERS,
+    ))
+    .expect("register ok");
+
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(
+        reqs[1].url,
+        "https://bitwarden.example.test/identity/accounts/register"
+    );
+    let v = json_body(&reqs[1]);
+    assert!(v.get("emailVerificationToken").is_none(), "{v}");
+    assert_eq!(v["name"], "Old Server");
+}
+
+#[test]
+fn register_explains_a_server_that_emails_the_verification_link() {
+    let mock = MockClient::new(vec![(
+        "POST",
+        "/identity/accounts/register/send-verification-email",
+        204,
+        b"".to_vec(),
+    )]);
+    let err = block_on(register(
+        &mock,
+        &server(),
+        "mail@example.com",
+        "hunter2",
+        "Mail",
+        REGISTER_ITERS,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, sync::SyncError::State(m) if m.contains("verification link")),
+        "{err:?}"
+    );
+    assert_eq!(mock.requests().len(), 1, "must not post the keys anywhere");
 }
 
 #[test]
@@ -255,7 +362,7 @@ fn login_form_encodes_and_decrypts_user_key() {
 
     assert_eq!(session.user_id, user_id);
     assert_eq!(session.email, email);
-    assert_eq!(session.kdf_iterations, iters);
+    assert_eq!(session.kdf.iterations, iters);
     assert_eq!(session.user_enc_key.as_slice(), &user_key_raw[..32]);
     assert_eq!(session.user_mac_key.as_slice(), &user_key_raw[32..]);
 
@@ -290,11 +397,13 @@ fn login_form_encodes_and_decrypts_user_key() {
 
 #[test]
 fn fetch_vault_handles_pascalcase_and_camelcase() {
+    let session = make_session([0xAA; 32], [0xBB; 32]);
+    let folder_name = encrypt_string(&session, "Work").unwrap();
     let body = serde_json::to_vec(&serde_json::json!({
         "Profile": {
             "Organizations": [{"Id": "org-1", "Name": "2.aaaa|bbbb|cccc"}],
         },
-        "Folders": [{"Id": "f-1", "Name": "2.x|y|z"}],
+        "Folders": [{"Id": "f-1", "Name": folder_name}],
         "Ciphers": [
             {
                 "Id": "c-1",
@@ -313,7 +422,6 @@ fn fetch_vault_handles_pascalcase_and_camelcase() {
     .unwrap();
 
     let mock = MockClient::new(vec![("GET", "/api/sync", 200, body)]);
-    let session = make_session([0xAA; 32], [0xBB; 32]);
     let vault = block_on(fetch_vault(&mock, &server(), &session)).expect("vault");
 
     assert_eq!(vault.organizations.len(), 1);
@@ -371,6 +479,7 @@ fn create_cipher_posts_to_api_ciphers_with_bearer() {
     };
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["type"], 2);
+    assert_eq!(v["encryptedFor"], session.user_id.as_str());
 
     assert!(v["name"].as_str().unwrap().starts_with("2."));
 
@@ -380,6 +489,27 @@ fn create_cipher_posts_to_api_ciphers_with_bearer() {
 
     assert!(fields[0]["name"].as_str().unwrap().starts_with("2."));
     assert!(fields[0]["value"].as_str().unwrap().starts_with("2."));
+}
+
+#[test]
+fn update_cipher_names_the_user_it_is_encrypted_for() {
+    let response_body = serde_json::to_vec(&serde_json::json!({
+        "Id": "c-1",
+        "Type": 2,
+        "Name": "2.iv|ct|mac",
+        "Favorite": false,
+        "Reprompt": 0,
+    }))
+    .unwrap();
+    let mock = MockClient::new(vec![("PUT", "/api/ciphers/c-1", 200, response_body)]);
+    let session = make_session([0xCC; 32], [0xDD; 32]);
+    let cipher = build_rage_cipher(&session, "github", "-----BEGIN AGE...END AGE-----")
+        .expect("build cipher");
+    block_on(update_cipher(&mock, &server(), &session, "c-1", &cipher)).expect("update cipher");
+
+    let v = json_body(&mock.requests()[0]);
+    assert_eq!(v["encryptedFor"], session.user_id.as_str());
+    assert_eq!(v["type"], 2);
 }
 
 #[test]
@@ -433,10 +563,177 @@ fn extract_rage_blob_none_for_plain_login() {
             name: other_field_name,
             value: Some(other_field_value),
             field_type: 0,
+            extra: Default::default(),
         }]),
         ..Cipher::default()
     };
     assert!(extract_rage_blob(&session, &cipher).unwrap().is_none());
+}
+
+fn sync_body(ciphers: serde_json::Value, folders: serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({ "ciphers": ciphers, "folders": folders })).unwrap()
+}
+
+#[test]
+fn a_vault_under_another_key_is_an_error_not_an_empty_vault() {
+    let owner = make_session([0x10; 32], [0x11; 32]);
+    let stranger = make_session([0x20; 32], [0x21; 32]);
+    let body = sync_body(
+        serde_json::json!([
+            {"id": "c-1", "type": 2, "name": encrypt_string(&owner, "a").unwrap()},
+            {"id": "c-2", "type": 2, "name": encrypt_string(&owner, "b").unwrap()}
+        ]),
+        serde_json::json!([{"id": "f-1", "name": encrypt_string(&owner, "Work").unwrap()}]),
+    );
+    let mock = MockClient::new(vec![("GET", "/api/sync", 200, body)]);
+    match block_on(fetch_vault(&mock, &server(), &stranger)) {
+        Err(sync::SyncError::WrongUserKey { items }) => assert_eq!(items, 3),
+        other => panic!("expected WrongUserKey, got {other:?}"),
+    }
+    let vault = block_on(fetch_vault(&mock, &server(), &owner)).expect("owner's key works");
+    assert_eq!(name_index(&owner, &vault).len(), 2);
+}
+
+#[test]
+fn organization_ciphers_and_an_empty_vault_are_not_key_evidence() {
+    let session = make_session([0x10; 32], [0x11; 32]);
+    let org_only = sync_body(
+        serde_json::json!([{"id": "c-1", "type": 2, "organizationId": "o-1", "name": "2.aaaa|bbbb|cccc"}]),
+        serde_json::json!([]),
+    );
+    let mock = MockClient::new(vec![("GET", "/api/sync", 200, org_only)]);
+    block_on(fetch_vault(&mock, &server(), &session)).expect("org-only vault");
+
+    let empty = sync_body(serde_json::json!([]), serde_json::json!([]));
+    let mock = MockClient::new(vec![("GET", "/api/sync", 200, empty)]);
+    block_on(fetch_vault(&mock, &server(), &session)).expect("empty vault");
+
+    let one_good = sync_body(
+        serde_json::json!([
+            {"id": "c-1", "type": 2, "name": "2.aaaa|bbbb|cccc"},
+            {"id": "c-2", "type": 2, "name": encrypt_string(&session, "ok").unwrap()}
+        ]),
+        serde_json::json!([]),
+    );
+    let mock = MockClient::new(vec![("GET", "/api/sync", 200, one_good)]);
+    block_on(fetch_vault(&mock, &server(), &session)).expect("one corrupt item is not a wrong key");
+}
+
+#[test]
+fn a_rage_field_name_that_does_not_decrypt_is_an_error() {
+    let owner = make_session([0x10; 32], [0x11; 32]);
+    let other = make_session([0x20; 32], [0x21; 32]);
+    let cipher = Cipher {
+        cipher_type: 2,
+        name: encrypt_string(&owner, "n").unwrap(),
+        fields: Some(vec![sync::CipherField {
+            name: encrypt_string(&other, "rage:v1").unwrap(),
+            value: Some(encrypt_string(&other, "blob").unwrap()),
+            field_type: 1,
+            extra: Default::default(),
+        }]),
+        ..Cipher::default()
+    };
+    assert!(extract_rage_blob(&owner, &cipher).is_err());
+}
+
+#[test]
+fn refresh_presents_the_sessions_device_and_keeps_the_rotated_refresh_token() {
+    let mut session = make_session([1; 32], [2; 32]);
+    let mock = MockClient::new(vec![(
+        "POST",
+        "/identity/connect/token",
+        200,
+        br#"{"access_token":"fresh","refresh_token":"rotated"}"#.to_vec(),
+    )]);
+    block_on(sync::refresh_session(&mock, &server(), &mut session)).expect("refresh");
+    assert_eq!(session.access_token.expose(), "fresh");
+    assert_eq!(session.refresh_token.expose(), "rotated");
+
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 1);
+    let Some(HttpBody::Form(form)) = &reqs[0].body else {
+        panic!("form body")
+    };
+    let form: std::collections::HashMap<String, String> =
+        serde_urlencoded::from_bytes(form).unwrap();
+    assert_eq!(form["grant_type"], "refresh_token");
+    assert_eq!(form["refresh_token"], "refresh");
+    assert_eq!(form["client_id"], "cli");
+    assert_eq!(form["deviceIdentifier"], "test-device");
+    assert!(
+        !reqs[0].headers.iter().any(|(k, _)| k == "Authorization"),
+        "the expired bearer is not sent"
+    );
+
+    let mock = MockClient::new(vec![(
+        "POST",
+        "/identity/connect/token",
+        200,
+        br#"{"access_token":"fresher"}"#.to_vec(),
+    )]);
+    block_on(sync::refresh_session(&mock, &server(), &mut session)).expect("refresh");
+    assert_eq!(session.access_token.expose(), "fresher");
+    assert_eq!(
+        session.refresh_token.expose(),
+        "rotated",
+        "a response without one keeps the old refresh token"
+    );
+}
+
+#[test]
+fn an_expired_token_is_recognisable_and_a_retry_after_refresh_succeeds() {
+    let mut session = make_session([1; 32], [2; 32]);
+    let empty = sync_body(serde_json::json!([]), serde_json::json!([]));
+    let expired = MockClient::new(vec![("GET", "/api/sync", 401, b"{}".to_vec())]);
+    let err = block_on(fetch_vault(&expired, &server(), &session)).unwrap_err();
+    assert!(sync::is_unauthorized(&err), "{err:?}");
+    assert!(!sync::is_unauthorized(&sync::SyncError::Server {
+        status: 500,
+        body: String::new()
+    }));
+
+    let mock = MockClient::new(vec![
+        (
+            "POST",
+            "/identity/connect/token",
+            200,
+            br#"{"access_token":"fresh"}"#.to_vec(),
+        ),
+        ("GET", "/api/sync", 200, empty),
+    ]);
+    block_on(sync::refresh_session(&mock, &server(), &mut session)).unwrap();
+    block_on(fetch_vault(&mock, &server(), &session)).expect("retry with the fresh token");
+    let get = mock
+        .requests()
+        .into_iter()
+        .find(|r| r.method == "GET")
+        .unwrap();
+    assert!(
+        get.headers
+            .contains(&("Authorization".to_string(), "Bearer fresh".to_string()))
+    );
+}
+
+#[test]
+fn a_long_error_body_cut_inside_a_multibyte_character_does_not_panic() {
+    let mut body = vec![b'x'; 4095];
+    body.extend("\u{e9}".repeat(10).as_bytes());
+    let mock = MockClient::new(vec![("GET", "/api/sync", 500, body)]);
+    let err = block_on(fetch_vault(
+        &mock,
+        &server(),
+        &make_session([1; 32], [2; 32]),
+    ))
+    .expect_err("500 must fail");
+    match err {
+        sync::SyncError::Server { status, body } => {
+            assert_eq!(status, 500);
+            assert!(body.ends_with("... <truncated>"), "{body}");
+            assert!(body.starts_with("xxxx"));
+        }
+        other => panic!("expected Server error, got {other:?}"),
+    }
 }
 
 #[test]
@@ -486,6 +783,34 @@ fn make_user_key_round_trip_under_master_key() {
     assert_eq!(decoded.len(), 32);
 }
 
+fn folder_routes(
+    id: &str,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> Vec<(&'static str, String, u16, Vec<u8>)> {
+    vec![
+        (
+            "PUT",
+            format!("/ciphers/{id}/partial"),
+            200,
+            folder_response(id, after),
+        ),
+        (
+            "GET",
+            format!("/ciphers/{id}"),
+            200,
+            folder_response(id, before),
+        ),
+    ]
+}
+
+fn mock_from(routes: Vec<(&'static str, String, u16, Vec<u8>)>) -> MockClient {
+    MockClient {
+        routes: Mutex::new(routes),
+        log: Mutex::new(Vec::new()),
+    }
+}
+
 fn folder_response(id: &str, folder_id: Option<&str>) -> Vec<u8> {
     let folder_value = match folder_id {
         Some(f) => serde_json::Value::String(f.to_string()),
@@ -496,20 +821,15 @@ fn folder_response(id: &str, folder_id: Option<&str>) -> Vec<u8> {
         "FolderId": folder_value,
         "Type": 2,
         "Name": "2.iv|ct|mac",
-        "Favorite": false,
+        "Favorite": true,
         "Reprompt": 0,
     }))
     .unwrap()
 }
 
 #[test]
-fn set_folder_puts_folder_id_to_cipher_folder_endpoint() {
-    let mock = MockClient::new(vec![(
-        "PUT",
-        "/api/ciphers/cipher-1/folder",
-        200,
-        folder_response("cipher-1", Some("folder-42")),
-    )]);
+fn set_folder_puts_folder_id_and_the_current_favourite_to_the_partial_endpoint() {
+    let mock = mock_from(folder_routes("cipher-1", None, Some("folder-42")));
     let session = make_session([0xEE; 32], [0xFF; 32]);
 
     let updated = block_on(set_folder(
@@ -524,18 +844,21 @@ fn set_folder_puts_folder_id_to_cipher_folder_endpoint() {
     assert_eq!(updated.folder_id.as_deref(), Some("folder-42"));
 
     let reqs = mock.requests();
-    assert_eq!(reqs.len(), 1);
-    assert_eq!(reqs[0].method, "PUT");
-    assert!(reqs[0].url.ends_with("/api/ciphers/cipher-1/folder"));
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[0].method, "GET");
+    assert!(reqs[0].url.ends_with("/api/ciphers/cipher-1"));
+    assert_eq!(reqs[1].method, "PUT");
+    assert!(reqs[1].url.ends_with("/api/ciphers/cipher-1/partial"));
 
-    let body = match &reqs[0].body {
+    let body = match &reqs[1].body {
         Some(HttpBody::Json(b)) => b.clone(),
         other => panic!("expected JSON body, got {other:?}"),
     };
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["folderId"], serde_json::json!("folder-42"));
+    assert_eq!(v["favorite"], serde_json::json!(true), "favourite is kept");
 
-    let auth = reqs[0]
+    let auth = reqs[1]
         .headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
@@ -546,12 +869,7 @@ fn set_folder_puts_folder_id_to_cipher_folder_endpoint() {
 
 #[test]
 fn set_folder_clears_folder_when_id_is_none() {
-    let mock = MockClient::new(vec![(
-        "PUT",
-        "/api/ciphers/cipher-7/folder",
-        200,
-        folder_response("cipher-7", None),
-    )]);
+    let mock = mock_from(folder_routes("cipher-7", Some("folder-1"), None));
     let session = make_session([0x01; 32], [0x02; 32]);
 
     let updated = block_on(set_folder(
@@ -565,8 +883,8 @@ fn set_folder_clears_folder_when_id_is_none() {
     assert!(updated.folder_id.is_none());
 
     let reqs = mock.requests();
-    assert_eq!(reqs.len(), 1);
-    let body = match &reqs[0].body {
+    assert_eq!(reqs.len(), 2);
+    let body = match &reqs[1].body {
         Some(HttpBody::Json(b)) => b.clone(),
         other => panic!("expected JSON body, got {other:?}"),
     };
@@ -580,8 +898,8 @@ fn set_folder_clears_folder_when_id_is_none() {
 #[test]
 fn set_folder_surfaces_http_error_as_server_variant() {
     let mock = MockClient::new(vec![(
-        "PUT",
-        "/api/ciphers/missing/folder",
+        "GET",
+        "/api/ciphers/missing",
         404,
         br#"{"error":"cipher not found"}"#.to_vec(),
     )]);
@@ -607,24 +925,34 @@ fn set_folder_surfaces_http_error_as_server_variant() {
 
 #[test]
 fn require_secure_accepts_https_and_loopback() {
-    assert!(Server::self_hosted("https://vault.example.test")
-        .require_secure()
-        .is_ok());
+    assert!(
+        Server::self_hosted("https://vault.example.test")
+            .require_secure()
+            .is_ok()
+    );
 
-    assert!(Server::self_hosted("http://vault.example.test")
-        .require_secure()
-        .is_err());
+    assert!(
+        Server::self_hosted("http://vault.example.test")
+            .require_secure()
+            .is_err()
+    );
 
-    assert!(Server::self_hosted("http://localhost:8080")
-        .require_secure()
-        .is_ok());
-    assert!(Server::self_hosted("http://127.0.0.1")
-        .require_secure()
-        .is_ok());
+    assert!(
+        Server::self_hosted("http://localhost:8080")
+            .require_secure()
+            .is_ok()
+    );
+    assert!(
+        Server::self_hosted("http://127.0.0.1")
+            .require_secure()
+            .is_ok()
+    );
 
-    assert!(Server::self_hosted("http://localhost.evil.example")
-        .require_secure()
-        .is_err());
+    assert!(
+        Server::self_hosted("http://localhost.evil.example")
+            .require_secure()
+            .is_err()
+    );
 }
 
 #[test]
@@ -744,7 +1072,13 @@ fn login_rejects_a_server_supplied_kdf_iteration_count_below_the_floor() {
         *b = i as u8;
     }
 
-    for hostile_iters in [0u32, 1, 2, 100, ragewarden_core::bitwarden::KDF_ITERATIONS_MIN - 1] {
+    for hostile_iters in [
+        0u32,
+        1,
+        2,
+        100,
+        ragewarden_core::bitwarden::KDF_ITERATIONS_MIN - 1,
+    ] {
         let prelogin_body = serde_json::to_vec(&serde_json::json!({
             "Kdf": 0,
             "KdfIterations": hostile_iters,
@@ -761,9 +1095,14 @@ fn login_rejects_a_server_supplied_kdf_iteration_count_below_the_floor() {
         match err {
             sync::SyncError::KdfIterationsTooLow { got, min } => {
                 assert_eq!(got, hostile_iters);
+                assert_eq!(min, ragewarden_core::kdf::KDF_ITERATIONS_LEGACY_MIN);
+            }
+            sync::SyncError::LegacyKdfNeedsConsent { got, min } => {
+                assert_eq!(got, hostile_iters);
+                assert!(got >= ragewarden_core::kdf::KDF_ITERATIONS_LEGACY_MIN);
                 assert_eq!(min, ragewarden_core::bitwarden::KDF_ITERATIONS_MIN);
             }
-            other => panic!("expected KdfIterationsTooLow for {hostile_iters}, got {other:?}"),
+            other => panic!("expected a KDF floor refusal for {hostile_iters}, got {other:?}"),
         }
 
         let hit_token = mock
@@ -802,19 +1141,20 @@ fn register_rejects_a_kdf_iteration_count_below_the_floor() {
 }
 
 #[test]
-fn login_fails_loudly_on_argon2id_rather_than_silently_misderiving() {
+fn login_derives_an_argon2id_master_key() {
     let email = "argon@example.com";
     let password = "hunter2";
     let mut user_key_raw = [0u8; 64];
     for (i, b) in user_key_raw.iter_mut().enumerate() {
         *b = i as u8;
     }
-    let token_body = fake_token_response(email, password, TEST_ITERS, &user_key_raw, "u");
+    let kdf = sync::KdfParams::argon2id(3, 16, 2);
+    let token_body = fake_token_response_kdf(email, password, &kdf, &user_key_raw, "u");
     let prelogin_body = serde_json::to_vec(&serde_json::json!({
-        "Kdf": 1,
-        "KdfIterations": 3,
-        "KdfMemory": 64,
-        "KdfParallelism": 4,
+        "kdf": 1,
+        "kdfIterations": 3,
+        "kdfMemory": 16,
+        "kdfParallelism": 2,
     }))
     .unwrap();
     let mock = MockClient::new(vec![
@@ -822,20 +1162,147 @@ fn login_fails_loudly_on_argon2id_rather_than_silently_misderiving() {
         ("POST", "/identity/connect/token", 200, token_body),
     ]);
 
-    let err = block_on(login(&mock, &server(), email, password, "dev")).unwrap_err();
-    match err {
-        sync::SyncError::UnsupportedKdfType { got, supported } => {
-            assert_eq!(got, ragewarden_core::bitwarden::KDF_ARGON2ID);
-            assert_eq!(supported, ragewarden_core::bitwarden::KDF_PBKDF2);
-        }
-        other => panic!("expected UnsupportedKdfType, got {other:?}"),
+    let session =
+        block_on(login(&mock, &server(), email, password, "dev")).expect("argon2id login");
+    assert_eq!(session.kdf, kdf);
+    assert_eq!(session.user_enc_key.as_slice(), &user_key_raw[..32]);
+
+    let expected_hash =
+        master_password_hash(&kdf.derive_master_key(password, email).unwrap(), password);
+    let token = mock
+        .requests()
+        .into_iter()
+        .find(|r| r.url.contains("/connect/token"))
+        .unwrap();
+    let Some(HttpBody::Form(form)) = token.body else {
+        panic!("token body")
+    };
+    let form: std::collections::HashMap<String, String> =
+        serde_urlencoded::from_bytes(&form).unwrap();
+    assert_eq!(form["password"], expected_hash);
+}
+
+#[test]
+fn argon2id_parameters_out_of_range_are_refused_before_the_token_request() {
+    for (memory, parallelism, iterations) in [
+        (Some(2048), Some(4), 3),
+        (None, Some(4), 3),
+        (Some(64), Some(4), 1),
+        (Some(64), Some(64), 3),
+    ] {
+        let prelogin_body = serde_json::to_vec(&serde_json::json!({
+            "kdf": 1,
+            "kdfIterations": iterations,
+            "kdfMemory": memory,
+            "kdfParallelism": parallelism,
+        }))
+        .unwrap();
+        let mock = MockClient::new(vec![(
+            "POST",
+            "/identity/accounts/prelogin",
+            200,
+            prelogin_body,
+        )]);
+        let err = block_on(login(&mock, &server(), "a@example.com", "pw", "dev")).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                sync::SyncError::KdfOutOfRange { .. } | sync::SyncError::Kdf(_)
+            ),
+            "{memory:?}/{parallelism:?}/{iterations}: {err:?}"
+        );
+        assert!(
+            !mock
+                .requests()
+                .iter()
+                .any(|r| r.url.contains("/connect/token"))
+        );
     }
+}
+
+#[test]
+fn an_unknown_kdf_type_is_refused() {
+    let prelogin_body =
+        serde_json::to_vec(&serde_json::json!({ "kdf": 7, "kdfIterations": 3 })).unwrap();
+    let mock = MockClient::new(vec![(
+        "POST",
+        "/identity/accounts/prelogin",
+        200,
+        prelogin_body,
+    )]);
+    let err = block_on(login(&mock, &server(), "a@example.com", "pw", "dev")).unwrap_err();
     assert!(
-        !mock
-            .requests()
-            .iter()
-            .any(|r| r.url.contains("/connect/token")),
-        "a PBKDF2 hash was sent to an Argon2id account"
+        matches!(err, sync::SyncError::UnsupportedKdfType { got: 7 }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_legacy_account_logs_in_once_the_user_consents() {
+    let email = "legacy@example.com";
+    let password = "hunter2";
+    let user_key_raw = [7u8; 64];
+    let prelogin_body =
+        serde_json::to_vec(&serde_json::json!({ "Kdf": 0, "KdfIterations": 5_000 })).unwrap();
+    let token_body = fake_token_response(email, password, 5_000, &user_key_raw, "u");
+    let mock = MockClient::new(vec![
+        ("POST", "/identity/accounts/prelogin", 200, prelogin_body),
+        ("POST", "/identity/connect/token", 200, token_body),
+    ]);
+    let err = block_on(login(&mock, &server(), email, password, "dev")).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            sync::SyncError::LegacyKdfNeedsConsent { got: 5_000, .. }
+        ),
+        "{err:?}"
+    );
+
+    let session = block_on(login_with_options(
+        &mock,
+        &server(),
+        email,
+        password,
+        "dev",
+        &sync::LoginOptions {
+            allow_legacy_kdf: true,
+            ..Default::default()
+        },
+    ))
+    .expect("consented legacy login");
+    assert_eq!(session.kdf, sync::KdfParams::pbkdf2(5_000));
+    assert!(session.kdf.below_recommended());
+}
+
+#[test]
+fn register_with_argon2id_sends_its_memory_and_parallelism() {
+    let mock = register_mock();
+    let out = block_on(sync::register_with_kdf(
+        &mock,
+        &server(),
+        "a@example.com",
+        "pw",
+        "n",
+        sync::KdfParams::argon2id_default(),
+    ))
+    .expect("register");
+    assert_eq!(out.kdf, sync::KdfParams::argon2id_default());
+    let v = json_body(&mock.requests()[1]);
+    assert_eq!(v["kdf"], 1);
+    assert_eq!(v["kdfMemory"], 64);
+    assert_eq!(v["kdfParallelism"], 4);
+
+    let weak = block_on(sync::register_with_kdf(
+        &mock,
+        &server(),
+        "a@example.com",
+        "pw",
+        "n",
+        sync::KdfParams::argon2id(2, 16, 1),
+    ));
+    assert!(
+        matches!(weak, Err(sync::SyncError::KdfOutOfRange { .. })),
+        "{weak:?}"
     );
 }
 
@@ -858,7 +1325,7 @@ fn login_accepts_an_explicit_pbkdf2_kdf_discriminator() {
         ("POST", "/identity/connect/token", 200, token_body),
     ]);
     let session = block_on(login(&mock, &server(), email, password, "dev")).expect("login ok");
-    assert_eq!(session.kdf_iterations, TEST_ITERS);
+    assert_eq!(session.kdf.iterations, TEST_ITERS);
 }
 
 #[test]
@@ -884,12 +1351,7 @@ fn session_debug_does_not_dump_the_vault_keys() {
 
 #[test]
 fn register_output_debug_does_not_dump_the_vault_keys() {
-    let mock = MockClient::new(vec![(
-        "POST",
-        "/identity/accounts/register",
-        200,
-        b"".to_vec(),
-    )]);
+    let mock = register_mock();
     let out = block_on(register(
         &mock,
         &server(),
@@ -917,10 +1379,6 @@ fn register_output_debug_does_not_dump_the_vault_keys() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Transport: the defect this round fixes, plus the whole-surface audit.
-// ---------------------------------------------------------------------------
-
 const HOSTILE_URLS: [&str; 12] = [
     "http://127.evil.example",
     "http://127.0.0.1.evil.example",
@@ -947,7 +1405,13 @@ fn set_folder_refuses_to_send_the_bearer_token_over_a_plaintext_url() {
             folder_response("cipher-1", Some("folder-42")),
         )]);
         let api = format!("{base}/api");
-        let err = match block_on(set_folder(&mock, &api, &session, "cipher-1", Some("folder-42"))) {
+        let err = match block_on(set_folder(
+            &mock,
+            &api,
+            &session,
+            "cipher-1",
+            Some("folder-42"),
+        )) {
             Ok(c) => panic!("set_folder accepted plaintext base {base}, returned {c:?}"),
             Err(e) => e,
         };
@@ -972,15 +1436,10 @@ fn set_folder_still_works_over_https_and_loopback_http() {
         "http://127.0.0.1:8080/api",
         "http://[::1]:8080/api",
     ] {
-        let mock = MockClient::new(vec![(
-            "PUT",
-            "/ciphers/c/folder",
-            200,
-            folder_response("c", Some("f")),
-        )]);
+        let mock = mock_from(folder_routes("c", None, Some("f")));
         block_on(set_folder(&mock, base, &session, "c", Some("f")))
             .unwrap_or_else(|e| panic!("set_folder rejected legitimate base {base}: {e:?}"));
-        assert_eq!(mock.requests().len(), 1);
+        assert_eq!(mock.requests().len(), 2);
     }
 }
 
@@ -993,9 +1452,10 @@ fn set_folder_on_validates_the_whole_server_not_just_the_api_url() {
         200,
         folder_response("c", None),
     )]);
-    // api side is https, identity side is not: the full-Server entry point
-    // must still refuse, exactly like every other &Server function.
-    let half = Server::new("https://vault.example.test/api", "http://evil.example/identity");
+    let half = Server::new(
+        "https://vault.example.test/api",
+        "http://evil.example/identity",
+    );
     let err = block_on(set_folder_on(&mock, &half, &session, "c", None))
         .expect_err("half-plaintext server must be refused");
     assert!(
@@ -1048,9 +1508,54 @@ fn every_network_entry_point_refuses_an_insecure_server() {
     );
     refuses!("login", mock, login(&mock, &evil, "a@b.test", "pw", "dev"));
     refuses!(
-        "login_pinned",
+        "login_with_options",
         mock,
-        login_pinned(&mock, &evil, "a@b.test", "pw", "dev", "test-device", Some(600_000))
+        login_with_options(
+            &mock,
+            &evil,
+            "a@b.test",
+            "pw",
+            "dev",
+            &sync::LoginOptions {
+                device_id: Some("test-device".into()),
+                kdf_pin: Some(sync::KdfParams::default()),
+                allow_legacy_kdf: false,
+            }
+        )
+    );
+    refuses!(
+        "upgrade_kdf",
+        mock,
+        sync::upgrade_kdf(
+            &mock,
+            &evil,
+            &session,
+            "pw",
+            "dev",
+            sync::KdfParams::default()
+        )
+    );
+    refuses!(
+        "refresh_session",
+        mock,
+        sync::refresh_session(&mock, &evil, &mut session.clone())
+    );
+    refuses!(
+        "get_cipher",
+        mock,
+        sync::get_cipher(&mock, &evil, &session, "c-1")
+    );
+    refuses!(
+        "update_preserving",
+        mock,
+        sync::update_preserving(
+            &mock,
+            &evil,
+            &session,
+            "c-1",
+            None,
+            &sync::CipherEdit::default()
+        )
     );
     refuses!("fetch_vault", mock, fetch_vault(&mock, &evil, &session));
     refuses!(
@@ -1129,7 +1634,10 @@ fn secure_url_parse_agrees_with_require_secure() {
         "http://localhost",
         "http://[::1]:8080",
     ] {
-        assert!(SecureUrl::parse(url).is_ok(), "SecureUrl::parse rejected {url}");
+        assert!(
+            SecureUrl::parse(url).is_ok(),
+            "SecureUrl::parse rejected {url}"
+        );
     }
 }
 
@@ -1140,10 +1648,6 @@ fn try_constructors_reject_a_plaintext_base_at_configuration_time() {
     assert!(Server::try_new("https://a.test/api", "http://evil.test/identity").is_err());
     assert!(Server::try_new("https://a.test/api", "https://a.test/identity").is_ok());
 }
-
-// ---------------------------------------------------------------------------
-// KDF
-// ---------------------------------------------------------------------------
 
 #[test]
 fn register_rejects_a_count_that_clears_the_login_floor_but_not_the_new_account_floor() {
@@ -1186,7 +1690,6 @@ fn login_rejects_a_downgrade_that_stays_above_the_floor() {
         *b = i as u8;
     }
 
-    // Above the hard floor, so only the pin can catch it.
     let offered = ragewarden_core::bitwarden::KDF_ITERATIONS_MIN;
     let pinned = ragewarden_core::bitwarden::KDF_ITERATIONS_DEFAULT;
     assert!(offered >= ragewarden_core::bitwarden::KDF_ITERATIONS_MIN);
@@ -1202,22 +1705,24 @@ fn login_rejects_a_downgrade_that_stays_above_the_floor() {
         ("POST", "/identity/connect/token", 200, token_body),
     ]);
 
-    let err = block_on(login_pinned(
+    let err = block_on(login_with_options(
         &mock,
         &server(),
         email,
         password,
         "dev",
-        "test-device",
-        Some(pinned),
+        &sync::LoginOptions {
+            kdf_pin: Some(sync::KdfParams::pbkdf2(pinned)),
+            ..Default::default()
+        },
     ))
     .expect_err("a 600k -> 100k downgrade must be refused");
     match err {
-        sync::SyncError::KdfIterationsDowngraded { got, pinned: p } => {
-            assert_eq!(got, offered);
-            assert_eq!(p, pinned);
+        sync::SyncError::KdfDowngraded { got, pinned: p } => {
+            assert_eq!(got, sync::KdfParams::pbkdf2(offered).describe());
+            assert_eq!(p, sync::KdfParams::pbkdf2(pinned).describe());
         }
-        other => panic!("expected KdfIterationsDowngraded, got {other:?}"),
+        other => panic!("expected KdfDowngraded, got {other:?}"),
     }
     assert!(
         !mock
@@ -1227,7 +1732,6 @@ fn login_rejects_a_downgrade_that_stays_above_the_floor() {
         "a downgraded master-password hash was sent to the server"
     );
 
-    // Plain `login` has no pin and therefore cannot see this.
     assert!(
         sync::check_kdf_iterations(offered).is_ok(),
         "the floor alone does not catch this downgrade, which is the point of the pin"
@@ -1253,31 +1757,48 @@ fn login_accepts_an_unchanged_or_raised_count_against_the_pin() {
             ("POST", "/identity/accounts/prelogin", 200, prelogin_body),
             ("POST", "/identity/connect/token", 200, token_body),
         ]);
-        let session = block_on(login_pinned(
+        let session = block_on(login_with_options(
             &mock,
             &server(),
             email,
             password,
             "dev",
-            "test-device",
-            Some(pinned),
+            &sync::LoginOptions {
+                device_id: Some("test-device".into()),
+                kdf_pin: Some(sync::KdfParams::pbkdf2(pinned)),
+                ..Default::default()
+            },
         ))
         .unwrap_or_else(|e| panic!("pin {pinned} vs offered {offered} should pass: {e:?}"));
-        assert_eq!(session.kdf_iterations, offered);
+        assert_eq!(session.kdf.iterations, offered);
+        assert_eq!(session.device_id, "test-device");
     }
 }
 
 #[test]
-fn check_kdf_not_downgraded_is_trust_on_first_use_when_unpinned() {
-    assert!(sync::check_kdf_not_downgraded(1, None).is_ok());
-    assert!(sync::check_kdf_not_downgraded(600_000, Some(600_000)).is_ok());
-    assert!(sync::check_kdf_not_downgraded(600_001, Some(600_000)).is_ok());
-    assert!(sync::check_kdf_not_downgraded(599_999, Some(600_000)).is_err());
+fn the_pin_is_trust_on_first_use_and_only_blocks_a_decrease() {
+    let p = |n| sync::KdfParams::pbkdf2(n);
+    assert!(sync::check_server_kdf(&p(100_000), None, false).is_ok());
+    assert!(sync::check_server_kdf(&p(600_000), Some(&p(600_000)), false).is_ok());
+    assert!(sync::check_server_kdf(&p(600_001), Some(&p(600_000)), false).is_ok());
+    assert!(sync::check_server_kdf(&p(599_999), Some(&p(600_000)), false).is_err());
+    assert!(
+        sync::check_server_kdf(&p(2_000_001), None, false).is_err(),
+        "a stalling count"
+    );
+    assert!(
+        sync::check_server_kdf(
+            &p(600_000),
+            Some(&sync::KdfParams::argon2id_default()),
+            false
+        )
+        .is_err(),
+        "Argon2id -> PBKDF2 is a downgrade"
+    );
 }
 
 #[test]
 fn the_login_floor_rejects_the_2013_era_default() {
-    // The value the 2023 disclosure found still live on real accounts.
     assert!(
         sync::check_kdf_iterations(5_000).is_err(),
         "5000 PBKDF2 iterations must not be accepted"

@@ -1,0 +1,9 @@
+# Design mockups: fictional persona data; the OpenSSH key strings are placeholders, not keys.
+^design/data\.jsx:[0-9]+:.*privateKey: '-----BEGIN OPENSSH PRIVATE[ ]KEY-----\\nb3BlbnNzaC1rZXktdjEAAAAA\(redacted; reveal to copy\)
+^design/screens-misc\.jsx:[0-9]+:.*-----BEGIN OPENSSH PRIVATE[ ]KEY-----(\.\.\.|\\n\.\.\.generated on device\.\.\.)
+# age secret-key prefix used as a format check and in fake test literals (no key material).
+^core/src/armored\.rs:[0-9]+:.*AGE-SECRET-KEY[-]1("|FAKE"|xyz")
+^core/src/bech32\.rs:[0-9]+:.*starts_with\("AGE-SECRET-KEY[-]1"\)
+^ragedroid/app/src/androidTest/kotlin/ragewarden/ragedroid/jni/RageNativeShapeTest\.kt:[0-9]+:.*AGE-SECRET-KEY[-]1NOTAREALSECRET
+# Throwaway ed25519 test fixture (comment: ragewarden-test-fixture-not-a-real-key).
+^rageterm/src/agent_add_test_data/ed25519:1:-----BEGIN OPENSSH PRIVATE[ ]KEY-----$

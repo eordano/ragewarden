@@ -117,7 +117,7 @@ class RegistryPushInstrumentedTest {
         InstrumentationRegistry.getArguments().getString(name)?.takeIf { it.isNotBlank() }
 
     @Test
-    fun enrolling_into_a_browser_seeded_vault_leaves_exactly_one_registry_marker() = runBlocking {
+    fun enrolling_into_a_browser_seeded_vault_leaves_exactly_one_registry_marker() {
         val server = arg("registryServer")
         assumeTrue(
             "registryServer/registryEmail/registryPassword/registryBrowserEntryIds were not " +
@@ -125,6 +125,10 @@ class RegistryPushInstrumentedTest {
                 "it; tests/journey/run.sh builds that and passes them.",
             server != null,
         )
+        runBlocking { enrolIntoSeededVault(server!!) }
+    }
+
+    private suspend fun enrolIntoSeededVault(server: String) {
         val email = requireArg("registryEmail")
         val password = requireArg("registryPassword")
         val browserEntryIds = requireArg("registryBrowserEntryIds")
@@ -161,9 +165,17 @@ class RegistryPushInstrumentedTest {
             rotationTracker = RotationTracker(ctx, recipientStore),
             historyStore = HistoryStore(ctx),
             recipientRegistry = registry,
+            lockState = ragewarden.ragedroid.data.LockState(
+                ctx,
+                ragewarden.ragedroid.data.LockPolicy(ctx),
+                hasSession = { false },
+            ),
+            vaultCache = ragewarden.ragedroid.data.VaultCache(ctx),
+            deviceIdentity = ragewarden.ragedroid.data.DeviceIdentity(ctx),
+            kdfPins = ragewarden.ragedroid.data.KdfPinStore(ctx),
         )
 
-        repo.login(server!!, email, password).getOrThrow()
+        repo.login(server, email, password).getOrThrow()
         val accountId = repo.accountId
         assertTrue("login produced no userId, so there is no account to enrol into", accountId.isNotBlank())
 

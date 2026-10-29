@@ -2,6 +2,7 @@
 name = "ragewarden-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
@@ -12,9 +13,17 @@ name = "ragewarden_core"
 crate-type = ["rlib"]
 
 [features]
-default = []
+default = ["bitwarden", "sync", "history", "registry", "policy"]
 
-reqwest-client = ["dep:reqwest"]
+# Master-password KDFs, Type-2 strings, account keys and tokens.
+bitwarden = ["dep:pbkdf2", "dep:argon2", "dep:rsa", "dep:aes", "dep:cbc", "dep:rand_core06"]
+# The Bitwarden/Vaultwarden HTTP protocol.
+sync = ["bitwarden", "dep:async-trait", "dep:serde_urlencoded", "dep:uuid"]
+history = ["sync"]
+registry = ["sync"]
+policy = ["registry"]
+
+reqwest-client = ["sync", "dep:reqwest"]
 
 [dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
@@ -23,10 +32,11 @@ age-core = { workspace = true }
 hkdf = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
-pbkdf2 = { workspace = true }
+pbkdf2 = { workspace = true, optional = true }
+argon2 = { workspace = true, optional = true }
 hmac = { workspace = true }
-aes = { workspace = true }
-cbc = { workspace = true }
+aes = { workspace = true, optional = true }
+cbc = { workspace = true, optional = true }
 subtle = { workspace = true }
 zeroize = { workspace = true }
 secrecy = { workspace = true }
@@ -35,15 +45,34 @@ serde_json = { workspace = true }
 base64 = { workspace = true }
 rand = { workspace = true }
 rand_core = { workspace = true }
-rand_core06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }
+rand_core06 = { package = "rand_core", version = "0.6", features = ["getrandom"], optional = true }
 thiserror = { workspace = true }
-async-trait = { workspace = true }
-rsa = { workspace = true }
-serde_urlencoded = { workspace = true }
-uuid = { workspace = true }
+async-trait = { workspace = true, optional = true }
+rsa = { workspace = true, optional = true }
+serde_urlencoded = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
 chrono = { workspace = true }
 
 chacha20poly1305 = { workspace = true }
 x25519-dalek = { workspace = true }
 p256 = { workspace = true }
 bip39 = { workspace = true }
+
+[[test]]
+name = "sync_protocol"
+required-features = ["sync"]
+
+[[test]]
+name = "cipher_merge"
+required-features = ["sync"]
+
+[[test]]
+name = "kdf_upgrade"
+required-features = ["sync"]
+
+[[test]]
+name = "recipient_policy_cross_client"
+required-features = ["policy"]
+
+[dev-dependencies]
+proptest = "1"

@@ -3,13 +3,13 @@ use std::fs;
 use std::io;
 
 use chrono::{DateTime, Utc};
-use ragewarden_core::sync::{
-    self, create_cipher, decrypt_string, encrypt_string, fetch_vault, update_cipher, Cipher,
-    Session, Vault,
-};
+use ragewarden_core::Recipient;
 use ragewarden_core::policy;
 use ragewarden_core::registry::WireEntry;
-use ragewarden_core::Recipient;
+use ragewarden_core::sync::{
+    self, Cipher, Session, Vault, create_cipher, decrypt_string, encrypt_string, fetch_vault,
+    update_cipher,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -48,6 +48,20 @@ pub struct RecipientEntry {
     pub last_used: Option<DateTime<Utc>>,
 
     pub recipient: Recipient,
+
+    /// Whether new writes wrap to this entry. The registry copy wins when both
+    /// exist, since the registry is where every client toggles it.
+    #[serde(default = "default_true")]
+    pub default_encrypt: bool,
+
+    /// Enrolled with the software stand-in: only a machine running with the
+    /// stand-ins enabled may wrap to it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mock: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -69,8 +83,6 @@ impl RecipientList {
         v.into_iter()
     }
 
-    // Test-only since pass-import stopped selecting recipients by hand (it now
-    // goes through load_encrypt_plan like cmd_set). Kept as a test helper.
     #[cfg(test)]
     pub fn recipients(&self) -> Vec<Recipient> {
         self.iter_chronological()
@@ -81,7 +93,7 @@ impl RecipientList {
 
 pub async fn load() -> Result<RecipientList, RecipientListError> {
     if let Some(open) = crate::session::load()
-        .map_err(|e| RecipientListError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?
+        .map_err(|e| RecipientListError::Io(io::Error::other(e.to_string())))?
     {
         if let Some(cached) = vault_cache::load()? {
             if let Some(list) = extract_from_vault(&open.session, &cached)? {
@@ -100,7 +112,7 @@ pub async fn load() -> Result<RecipientList, RecipientListError> {
 
 pub async fn save(list: &RecipientList) -> Result<(), RecipientListError> {
     if let Some(open) = crate::session::load()
-        .map_err(|e| RecipientListError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?
+        .map_err(|e| RecipientListError::Io(io::Error::other(e.to_string())))?
     {
         let serialized = serde_json::to_string_pretty(list)?;
 
@@ -112,26 +124,11 @@ pub async fn save(list: &RecipientList) -> Result<(), RecipientListError> {
             .and_then(|v| find_recipient_cipher(&open.session, v));
 
         let cipher_in = build_recipients_cipher(&open.session, &serialized)?;
-        let saved: Cipher = if let Some(existing) = existing {
-            update_cipher(
-                &client,
-                &open.server,
-                &open.session,
-                existing.id.as_deref().unwrap_or(""),
-                &cipher_in,
-            )
-            .await?
-        } else {
-            create_cipher(&client, &open.server, &open.session, &cipher_in).await?
-        };
+        let saved =
+            sync::save_cipher(&client, &open.server, &open.session, existing, &cipher_in).await?;
 
         let mut vault = cached.unwrap_or_default();
-        if let Some(id) = &saved.id {
-            vault
-                .ciphers
-                .retain(|c| c.id.as_deref() != Some(id.as_str()));
-        }
-        vault.ciphers.push(saved);
+        vault.upsert_cipher(saved);
         vault_cache::save(&vault)?;
         Ok(())
     } else {
@@ -140,12 +137,6 @@ pub async fn save(list: &RecipientList) -> Result<(), RecipientListError> {
 }
 
 pub async fn add(entry: RecipientEntry) -> Result<(), RecipientListError> {
-    // Fetch fresh before the read-modify-write. The account-wide RecipientList
-    // is ONE cipher every device edits and `save` below is last-write-wins, so
-    // building the new list off a stale cached copy would drop a sibling
-    // device's concurrently-added recipient -- the same clobber
-    // open_with_fresh_vault fixes for the registry marker. Fetching fresh also
-    // refreshes the cache that `save` then reads to find the cipher id.
     if let Some((open, _client, vault)) = open_with_fresh_vault().await? {
         let mut list = extract_from_vault(&open.session, &vault)?.unwrap_or_default();
         list.entries.insert(entry.id.clone(), entry);
@@ -171,10 +162,10 @@ pub async fn add(entry: RecipientEntry) -> Result<(), RecipientListError> {
 /// client both sync-then-read-modify-write for exactly this reason; this is
 /// rageterm joining them. Never read the registry doc from a cache a remote
 /// device can stale.
-async fn open_with_fresh_vault(
-) -> Result<Option<(crate::session::OpenSession, ReqwestClient, Vault)>, RecipientListError> {
+async fn open_with_fresh_vault()
+-> Result<Option<(crate::session::OpenSession, ReqwestClient, Vault)>, RecipientListError> {
     let Some(open) = crate::session::load()
-        .map_err(|e| RecipientListError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?
+        .map_err(|e| RecipientListError::Io(io::Error::other(e.to_string())))?
     else {
         return Ok(None);
     };
@@ -187,12 +178,83 @@ async fn open_with_fresh_vault(
 /// Replace any prior copy of `saved` in the cache and add it back, so the local
 /// vault reflects the cipher we just wrote server-side.
 fn persist_saved_cipher(mut vault: Vault, saved: Cipher) -> Result<(), RecipientListError> {
-    if let Some(id) = &saved.id {
-        vault.ciphers.retain(|c| c.id.as_deref() != Some(id.as_str()));
-    }
-    vault.ciphers.push(saved);
+    vault.upsert_cipher(saved);
     vault_cache::save(&vault)?;
     Ok(())
+}
+
+/// The registry ids and attestation keys of this machine's real devices that
+/// can sign native-host proofs: P-256 PIV slots and FIDO2 credentials whose
+/// public key is known.
+fn local_attestation_keys() -> Result<Vec<(String, String)>, RecipientListError> {
+    use crate::identities::{Identities, IdentityKind, fido_public_key};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
+    let ids =
+        Identities::load().map_err(|e| RecipientListError::Io(io::Error::other(e.to_string())))?;
+    Ok(ids
+        .items
+        .values()
+        .filter_map(|e| match &e.kind {
+            IdentityKind::YubiKeyPiv {
+                public_key_hex,
+                serial,
+                slot,
+                mock: false,
+            } if public_key_hex.len() == 66 => Some((
+                stable_piv_recipient_id(*serial, *slot),
+                crate::native_proof::attestation_key(&hex::decode(public_key_hex).ok()?)?,
+            )),
+            IdentityKind::Fido2HmacSecret {
+                credential_id_b64,
+                rp_id,
+                mock: false,
+                public_key_hex,
+                ..
+            } => Some((
+                stable_fido2_recipient_id(rp_id, &B64URL.decode(credential_id_b64).ok()?),
+                crate::native_proof::attestation_key(&fido_public_key(public_key_hex)?)?,
+            )),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Write the attestation key into each of this machine's published registry
+/// entries that lacks it -- an entry published before the key was known, or
+/// rewritten by a client that dropped the field. Entries keep every other
+/// field. Returns how many changed.
+pub async fn publish_missing_attestation_keys() -> Result<usize, RecipientListError> {
+    use ragewarden_core::registry::{self, MARKER_NAME};
+    let wanted = local_attestation_keys()?;
+    if wanted.is_empty() {
+        return Ok(0);
+    }
+    let Some((open, client, vault)) = open_with_fresh_vault().await? else {
+        return Ok(0);
+    };
+    let Some(mut doc) = registry::extract_document(&open.session, &vault)? else {
+        return Ok(0);
+    };
+    let mut changed = 0;
+    for e in doc.entries.iter_mut() {
+        if let Some((_, key)) = wanted.iter().find(|(id, _)| *id == e.id) {
+            if e.attestation_public_key.as_deref() != Some(key.as_str()) {
+                e.attestation_public_key = Some(key.clone());
+                changed += 1;
+            }
+        }
+    }
+    if changed == 0 {
+        return Ok(0);
+    }
+    let Some(id) = registry::marker_cipher_id(&open.session, &vault).map(str::to_owned) else {
+        return Ok(0);
+    };
+    let payload = serde_json::to_string(&doc)?;
+    let cipher_in = sync::build_meta_cipher(&open.session, MARKER_NAME, &payload)?;
+    let saved = update_cipher(&client, &open.server, &open.session, &id, &cipher_in).await?;
+    persist_saved_cipher(vault, saved)?;
+    Ok(changed)
 }
 
 pub async fn publish_wire_entry_to_registry(
@@ -248,8 +310,14 @@ pub async fn unpublish_from_registry(entry_id: &str) -> Result<(), RecipientList
     else {
         return Ok(());
     };
-    let saved = update_cipher(&client, &open.server, &open.session, &existing_id, &cipher_in)
-        .await?;
+    let saved = update_cipher(
+        &client,
+        &open.server,
+        &open.session,
+        &existing_id,
+        &cipher_in,
+    )
+    .await?;
 
     persist_saved_cipher(vault, saved)
 }
@@ -260,18 +328,14 @@ pub async fn publish_local_identity_to_registry() -> Result<(), RecipientListErr
         return Ok(());
     }
     let armored = crate::idfile::read_public_key_armored(&id_path)
-        .map_err(|e| RecipientListError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+        .map_err(|e| RecipientListError::Io(io::Error::other(e.to_string())))?;
     publish_wire_entry_to_registry(software_wire_entry(&armored, "Terminal")).await
 }
 
-pub fn software_wire_entry(
-    armored_pubkey: &str,
-    display_name: &str,
-) -> ragewarden_core::registry::WireEntry {
-    use ragewarden_core::registry::{kinds, WireEntry};
+fn wire_entry(id: String, kind: &str, display_name: &str) -> WireEntry {
     WireEntry {
-        id: stable_software_recipient_id(armored_pubkey),
-        kind: kinds::SOFTWARE.into(),
+        id,
+        kind: kind.into(),
         display_name: display_name.into(),
         device_label: format!("rageterm@{}", hostname_or_unknown()),
         created_at: chrono::Utc::now().timestamp_millis(),
@@ -284,33 +348,42 @@ pub fn software_wire_entry(
         fido2_credential_id: None,
         fido2_rp_id: None,
         fido2_salt: None,
-        recovery_armored_pubkey: Some(armored_pubkey.to_string()),
+        recovery_armored_pubkey: None,
+        stanza_version: None,
+        attestation_public_key: None,
     }
 }
 
-pub fn piv_wire_entry(
-    public_key: &[u8; 32],
-    serial: u32,
-    slot: u8,
-    display_name: &str,
-) -> ragewarden_core::registry::WireEntry {
-    use ragewarden_core::registry::{kinds, WireEntry};
+pub fn software_wire_entry(armored_pubkey: &str, display_name: &str) -> WireEntry {
     WireEntry {
-        id: stable_piv_recipient_id(serial, slot),
-        kind: kinds::YUBIKEY.into(),
-        display_name: display_name.into(),
-        device_label: format!("rageterm@{}", hostname_or_unknown()),
-        created_at: chrono::Utc::now().timestamp_millis(),
-        default_encrypt: true,
+        recovery_armored_pubkey: Some(armored_pubkey.to_string()),
+        ..wire_entry(
+            stable_software_recipient_id(armored_pubkey),
+            ragewarden_core::registry::kinds::SOFTWARE,
+            display_name,
+        )
+    }
+}
+
+/// A P-256 slot's SPKI, which the native host signs unwrap proofs with; an
+/// X25519 slot (32 bytes) cannot sign and has none.
+fn piv_attestation_key(public_key: &[u8]) -> Option<String> {
+    (public_key.len() == 33)
+        .then(|| crate::native_proof::attestation_key(public_key))
+        .flatten()
+}
+
+pub fn piv_wire_entry(public_key: &[u8], serial: u32, slot: u8, display_name: &str) -> WireEntry {
+    WireEntry {
         piv_pubkey: Some(hex::encode(public_key)),
         piv_serial: Some(serial as i32),
         piv_slot: Some(slot as i32),
-        keystore_pubkey: None,
-        keystore_handle: None,
-        fido2_credential_id: None,
-        fido2_rp_id: None,
-        fido2_salt: None,
-        recovery_armored_pubkey: None,
+        attestation_public_key: piv_attestation_key(public_key),
+        ..wire_entry(
+            stable_piv_recipient_id(serial, slot),
+            ragewarden_core::registry::kinds::YUBIKEY,
+            display_name,
+        )
     }
 }
 
@@ -319,54 +392,33 @@ pub fn fido2_wire_entry(
     salt: &[u8; 32],
     rp_id: &str,
     display_name: &str,
-) -> ragewarden_core::registry::WireEntry {
-    use ragewarden_core::registry::{kinds, WireEntry};
+    public_key: Option<&[u8]>,
+) -> WireEntry {
     WireEntry {
-        id: stable_fido2_recipient_id(rp_id, credential_id),
-        kind: kinds::FIDO2.into(),
-        display_name: display_name.into(),
-        device_label: format!("rageterm@{}", hostname_or_unknown()),
-        created_at: chrono::Utc::now().timestamp_millis(),
-        default_encrypt: true,
-        piv_pubkey: None,
-        piv_serial: None,
-        piv_slot: None,
-        keystore_pubkey: None,
-        keystore_handle: None,
         fido2_credential_id: Some(hex::encode(credential_id)),
         fido2_rp_id: Some(rp_id.to_string()),
         fido2_salt: Some(hex::encode(salt)),
-        recovery_armored_pubkey: None,
+        attestation_public_key: public_key.and_then(crate::native_proof::attestation_key),
+        ..wire_entry(
+            stable_fido2_recipient_id(rp_id, credential_id),
+            ragewarden_core::registry::kinds::FIDO2,
+            display_name,
+        )
     }
 }
 
-pub fn recovery_wire_entry(
-    armored_pubkey: &str,
-    display_name: &str,
-) -> ragewarden_core::registry::WireEntry {
-    use ragewarden_core::registry::{kinds, WireEntry};
+pub fn recovery_wire_entry(armored_pubkey: &str, display_name: &str) -> WireEntry {
     WireEntry {
-        id: stable_recovery_recipient_id(armored_pubkey),
-        kind: kinds::RECOVERY.into(),
-        display_name: display_name.into(),
-        device_label: format!("rageterm@{}", hostname_or_unknown()),
-        created_at: chrono::Utc::now().timestamp_millis(),
-        default_encrypt: true,
-        piv_pubkey: None,
-        piv_serial: None,
-        piv_slot: None,
-        keystore_pubkey: None,
-        keystore_handle: None,
-        fido2_credential_id: None,
-        fido2_rp_id: None,
-        fido2_salt: None,
         recovery_armored_pubkey: Some(armored_pubkey.to_string()),
+        ..wire_entry(
+            stable_recovery_recipient_id(armored_pubkey),
+            ragewarden_core::registry::kinds::RECOVERY,
+            display_name,
+        )
     }
 }
 
-pub fn registry_id_for_enrolled_identity(
-    kind: &crate::identities::IdentityKind,
-) -> Option<String> {
+pub fn registry_id_for_enrolled_identity(kind: &crate::identities::IdentityKind) -> Option<String> {
     use crate::identities::IdentityKind;
     match kind {
         IdentityKind::YubiKeyPiv { serial, slot, .. } => {
@@ -377,7 +429,7 @@ pub fn registry_id_for_enrolled_identity(
             rp_id,
             ..
         } => {
-            use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine};
+            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
             let credential_id = B64URL.decode(credential_id_b64.as_bytes()).ok()?;
             Some(stable_fido2_recipient_id(rp_id, &credential_id))
         }
@@ -441,25 +493,26 @@ pub fn local_entry_as_wire(entry: &RecipientEntry) -> WireEntry {
     use ragewarden_core::registry::kinds;
 
     let mut wire = WireEntry {
-        id: entry.id.clone(),
-        kind: "Unmapped".into(),
-        display_name: entry.label.clone(),
-        device_label: format!("rageterm@{}", hostname_or_unknown()),
         created_at: entry.created.timestamp_millis(),
-        default_encrypt: true,
-        piv_pubkey: None,
-        piv_serial: None,
-        piv_slot: None,
-        keystore_pubkey: None,
-        keystore_handle: None,
-        fido2_credential_id: None,
-        fido2_rp_id: None,
-        fido2_salt: None,
-        recovery_armored_pubkey: None,
+        default_encrypt: entry.default_encrypt,
+        ..wire_entry(entry.id.clone(), "Unmapped", &entry.label)
     };
 
     match &entry.recipient {
         Recipient::YubiKeyPiv {
+            public_key,
+            serial,
+            slot,
+            stanza_version,
+        } => {
+            wire.id = stable_piv_recipient_id(*serial, *slot);
+            wire.kind = kinds::YUBIKEY.into();
+            wire.piv_pubkey = Some(hex::encode(public_key));
+            wire.piv_serial = Some(*serial as i32);
+            wire.piv_slot = Some(*slot as i32);
+            wire.stanza_version = (*stanza_version != 1).then_some(*stanza_version);
+        }
+        Recipient::YubiKeyPivP256 {
             public_key,
             serial,
             slot,
@@ -469,6 +522,7 @@ pub fn local_entry_as_wire(entry: &RecipientEntry) -> WireEntry {
             wire.piv_pubkey = Some(hex::encode(public_key));
             wire.piv_serial = Some(*serial as i32);
             wire.piv_slot = Some(*slot as i32);
+            wire.attestation_public_key = piv_attestation_key(public_key);
         }
         Recipient::Fido2HmacSecret {
             credential_id,
@@ -481,10 +535,6 @@ pub fn local_entry_as_wire(entry: &RecipientEntry) -> WireEntry {
             wire.fido2_salt = Some(hex::encode(salt));
             wire.fido2_rp_id = Some(rp_id.clone());
         }
-        // NOT kinds::FIDO2 -- a WebAuthn-PRF passkey wraps into the
-        // `webauthn-prf-v1` stanza, not `fido2-hmac`. Publishing it as Fido2
-        // would hand every other client a recipient it wraps with the wrong
-        // tag and HKDF info.
         Recipient::PasskeyPrf {
             credential_id,
             salt,
@@ -506,10 +556,12 @@ pub fn local_entry_as_wire(entry: &RecipientEntry) -> WireEntry {
         Recipient::AndroidKeystore {
             public_key,
             key_handle,
+            stanza_version,
         } => {
             wire.kind = kinds::STRONG_BOX.into();
             wire.keystore_pubkey = Some(hex::encode(public_key));
             wire.keystore_handle = Some(key_handle.clone());
+            wire.stanza_version = (*stanza_version != 1).then_some(*stanza_version);
         }
         Recipient::X25519 { public_key } => {
             wire.id = stable_software_recipient_id(&hex::encode(public_key));
@@ -572,11 +624,6 @@ pub fn skip_reason_str(reason: policy::SkipReason) -> &'static str {
 /// write *and* for the prior revision it folds into history, and warning from
 /// inside the accessor printed the same block back to back.
 pub fn warn_about_skips(skips: &[SkipNote]) {
-    // `DefaultEncryptOff` is left out on purpose. It is a setting its owner
-    // chose, so it is not news; shouting about it in the same voice and
-    // directly above a real `NoLocalAuthenticator` hole is how the warning that
-    // matters gets skimmed past. `rageterm recipients` still lists every skip,
-    // that one included.
     let holes: Vec<&SkipNote> = skips
         .iter()
         .filter(|s| s.reason != policy::SkipReason::DefaultEncryptOff)
@@ -616,21 +663,47 @@ pub fn warn_about_skips(skips: &[SkipNote]) {
 /// `IdentityKind`. A WebAuthn-PRF passkey is never enrolled through rageterm
 /// (it cannot evaluate one -- see `commands::build_prf_outputs_for`), so leaving
 /// it unclaimed here is correct rather than an omission.
-fn local_prf_authenticators() -> Result<policy::LocalAuthenticators, RecipientListError> {
+/// The registry entries whose PRF authenticator this machine holds: the
+/// stable id of each enrolled FIDO2 credential, and any registry entry that
+/// names one of those credentials under another id (a client that publishes
+/// its own ids, as the cross-client vectors do).
+fn local_prf_authenticators(
+    registry: &[WireEntry],
+) -> Result<policy::LocalAuthenticators, RecipientListError> {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
     let enrolled = crate::identities::Identities::load()
-        .map_err(|e| RecipientListError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
-    Ok(policy::LocalAuthenticators::from_ids(
-        enrolled
-            .items
-            .values()
-            .filter(|e| {
-                matches!(
-                    e.kind,
-                    crate::identities::IdentityKind::Fido2HmacSecret { .. }
-                )
-            })
-            .filter_map(|e| registry_id_for_enrolled_identity(&e.kind)),
-    ))
+        .map_err(|e| RecipientListError::Io(io::Error::other(e.to_string())))?;
+    let held: Vec<(String, String)> = enrolled
+        .items
+        .values()
+        .filter_map(|e| match &e.kind {
+            crate::identities::IdentityKind::Fido2HmacSecret {
+                credential_id_b64,
+                rp_id,
+                ..
+            } => Some((
+                hex::encode(B64URL.decode(credential_id_b64).ok()?),
+                rp_id.clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+    let stable = enrolled.items.values().filter_map(|e| {
+        matches!(
+            e.kind,
+            crate::identities::IdentityKind::Fido2HmacSecret { .. }
+        )
+        .then(|| registry_id_for_enrolled_identity(&e.kind))
+        .flatten()
+    });
+    let named = registry.iter().filter_map(|w| {
+        let cred = w.fido2_credential_id.as_deref()?.to_lowercase();
+        let rp = w.fido2_rp_id.as_deref()?;
+        held.iter()
+            .any(|(c, r)| *c == cred && r == rp)
+            .then(|| w.id.clone())
+    });
+    Ok(policy::LocalAuthenticators::from_ids(stable.chain(named)))
 }
 
 fn describe_skips(
@@ -641,10 +714,6 @@ fn describe_skips(
     skipped
         .iter()
         .map(|s| {
-            // The registry copy names it even though `merge_entries` prefers
-            // the local copy for key material: a local entry's `device_label`
-            // is synthesised from *this* hostname, so on a second terminal it
-            // would report another machine's key as belonging to this one.
             let who = registry
                 .iter()
                 .find(|w| w.id == s.id)
@@ -672,18 +741,33 @@ fn describe_skips(
 /// Returns the skips as well, so callers can warn about the recipients this
 /// machine could not cover.
 pub async fn load_encrypt_plan() -> Result<EncryptPlan, RecipientListError> {
+    let plan = select_plan().await?;
+    if plan.selection.recipients.is_empty() {
+        return Err(RecipientListError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no recipient is enabled for new writes -- run `rageterm \
+             enroll-software-identity` or enroll a device",
+        )));
+    }
+    if !any_readable_on_this_machine(&plan.selection.recipients)? {
+        return Err(RecipientListError::Io(io::Error::other(
+            "none of the recipients enabled for new writes can be opened on this machine \
+             (is this terminal's key turned off for new writes in the registry?); refusing \
+             to write an item this terminal could not read back",
+        )));
+    }
+    Ok(plan)
+}
+
+/// The recipients a write from this machine goes to by the shared policy,
+/// from its own state: the local recipient list, the registry in the synced
+/// vault, `identity.age`, paper recovery and the FIDO2 credentials it holds.
+/// [`load_encrypt_plan`] adds the guards that refuse an unusable plan.
+pub async fn select_plan() -> Result<EncryptPlan, RecipientListError> {
     let local = load().await?;
 
-    let local_entries: Vec<WireEntry> =
-        local.iter_chronological().map(local_entry_as_wire).collect();
-
-    // The one sanctioned per-client divergence: a PRF recipient can only be
-    // wrapped to by a client that can evaluate its authenticator during the
-    // wrap.
-    let local_auth = local_prf_authenticators()?;
-
     let registry_entries: Vec<WireEntry> = if let Some(open) = crate::session::load()
-        .map_err(|e| RecipientListError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?
+        .map_err(|e| RecipientListError::Io(io::Error::other(e.to_string())))?
     {
         let vault = match vault_cache::load()? {
             Some(v) => v,
@@ -702,28 +786,86 @@ pub async fn load_encrypt_plan() -> Result<EncryptPlan, RecipientListError> {
         Vec::new()
     };
 
-    let mut selection = policy::select_for_encrypt(&registry_entries, &local_entries, &local_auth);
-
     let id_path = config::identity_path()?;
-    if id_path.exists() {
-        let pub_armored = crate::idfile::read_public_key_armored(&id_path).map_err(|e| {
-            RecipientListError::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
-        })?;
-        let local_recipient = Recipient::SoftwarePassphrase {
-            armored_pubkey: ragewarden_core::ArmoredAgeRecipient::from_trusted(pub_armored),
-        };
-        if !selection.recipients.contains(&local_recipient) {
-            selection.recipients.push(local_recipient);
-        }
-    } else if selection.recipients.is_empty() {
-        return Err(RecipientListError::Io(io::Error::new(
-            io::ErrorKind::NotFound,
-            "no identity.age and no recipients enrolled -- run `rageterm enroll-software-identity`",
-        )));
-    }
+    let own_software = if id_path.exists() {
+        Some(
+            crate::idfile::read_public_key_armored(&id_path)
+                .map_err(|e| RecipientListError::Io(io::Error::other(e.to_string())))?,
+        )
+    } else {
+        None
+    };
+    let paper = paper_recovery_pubkeys()?;
+    let local_entries = policy_inputs(
+        local.iter_chronological(),
+        own_software.as_deref(),
+        &paper,
+        &registry_entries,
+        crate::hw::mock_enabled(),
+    );
+
+    let local_auth = local_prf_authenticators(&registry_entries)?;
+    let selection = policy::select_for_encrypt(&registry_entries, &local_entries, &local_auth);
 
     let skips = describe_skips(&selection.skipped, &registry_entries, &local_entries);
     Ok(EncryptPlan { selection, skips })
+}
+
+/// The armored public keys of this machine's enrolled paper recovery identities.
+fn paper_recovery_pubkeys() -> Result<Vec<String>, RecipientListError> {
+    let ids = crate::identities::Identities::load()
+        .map_err(|e| RecipientListError::Io(io::Error::other(e.to_string())))?;
+    Ok(ids
+        .items
+        .values()
+        .filter_map(|e| match &e.kind {
+            crate::identities::IdentityKind::PaperRecovery { armored_pubkey } => {
+                Some(armored_pubkey.as_str().to_string())
+            }
+            _ => None,
+        })
+        .collect())
+}
+
+/// This machine's recipients as policy entries: the account-wide local list
+/// plus this terminal's own `identity.age`, with the registry's
+/// `default_encrypt` overriding the local copy, paper recovery entries keyed as
+/// RECOVERY so they collapse with their registry publication, and stand-in
+/// enrollments only where stand-ins work. Nothing is added after the policy.
+pub fn policy_inputs<'a>(
+    local: impl Iterator<Item = &'a RecipientEntry>,
+    own_software: Option<&str>,
+    paper_pubkeys: &[String],
+    registry: &[WireEntry],
+    mocks_usable: bool,
+) -> Vec<WireEntry> {
+    let mut out: Vec<WireEntry> = local
+        .filter(|e| !e.mock || mocks_usable)
+        .map(|e| match &e.recipient {
+            Recipient::SoftwarePassphrase { armored_pubkey }
+                if paper_pubkeys.iter().any(|p| p == armored_pubkey.as_str()) =>
+            {
+                WireEntry {
+                    default_encrypt: e.default_encrypt,
+                    created_at: e.created.timestamp_millis(),
+                    ..recovery_wire_entry(armored_pubkey.as_str(), &e.label)
+                }
+            }
+            _ => local_entry_as_wire(e),
+        })
+        .collect();
+    if let Some(own) = own_software {
+        let w = software_wire_entry(own, "Terminal");
+        if !out.iter().any(|e| e.id == w.id) {
+            out.push(w);
+        }
+    }
+    for e in &mut out {
+        if let Some(r) = registry.iter().find(|r| r.id == e.id) {
+            e.default_encrypt = r.default_encrypt;
+        }
+    }
+    out
 }
 
 /// Whether this machine still holds the private half of at least one of `set`.
@@ -739,28 +881,31 @@ pub async fn load_encrypt_plan() -> Result<EncryptPlan, RecipientListError> {
 /// `mock: true` enrollment in a build with no stand-ins compiled in, where it
 /// cannot decrypt at all.
 pub fn any_readable_on_this_machine(set: &[Recipient]) -> Result<bool, RecipientListError> {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 
     use crate::identities::IdentityKind;
 
     let enrolled = crate::identities::Identities::load()
-        .map_err(|e| RecipientListError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+        .map_err(|e| RecipientListError::Io(io::Error::other(e.to_string())))?;
     let mocks_usable = crate::hw::mock_enabled();
 
     let id_path = config::identity_path()?;
     let own_software: Option<String> = if id_path.exists() {
         Some(
-            crate::idfile::read_public_key_armored(&id_path).map_err(|e| {
-                RecipientListError::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
-            })?,
+            crate::idfile::read_public_key_armored(&id_path)
+                .map_err(|e| RecipientListError::Io(io::Error::other(e.to_string())))?,
         )
     } else {
         None
     };
 
     Ok(set.iter().any(|r| match r {
-        Recipient::YubiKeyPiv { public_key, .. } => {
-            let want = hex::encode(public_key);
+        Recipient::YubiKeyPiv { .. } | Recipient::YubiKeyPivP256 { .. } => {
+            let want = match r {
+                Recipient::YubiKeyPiv { public_key, .. } => hex::encode(public_key),
+                Recipient::YubiKeyPivP256 { public_key, .. } => hex::encode(public_key),
+                _ => unreachable!("matched above"),
+            };
             enrolled.items.values().any(|e| match &e.kind {
                 IdentityKind::YubiKeyPiv {
                     public_key_hex,
@@ -796,24 +941,15 @@ pub fn any_readable_on_this_machine(set: &[Recipient]) -> Result<bool, Recipient
                     _ => false,
                 })
         }
-        // The registry publishes the very same key as `x25519` that the local
-        // list calls a `SoftwarePassphrase`, so compare the armored form rather
-        // than letting the wire shape decide the answer.
         Recipient::X25519 { public_key } => {
             own_software.as_deref()
                 == Some(ragewarden_core::bech32::encode_age_x25519(public_key).as_str())
         }
-        // rageterm can evaluate neither a WebAuthn PRF (see
-        // `commands::build_prf_outputs_for`) nor an Android keystore, so a wrap
-        // to either is never openable here.
         Recipient::PasskeyPrf { .. } | Recipient::AndroidKeystore { .. } => false,
     }))
 }
 
 pub async fn remove(id: &str) -> Result<Option<RecipientEntry>, RecipientListError> {
-    // Fetch fresh before the read-modify-write, same reason as `add`: a stale
-    // cached list would resurrect a sibling's just-removed recipient or drop a
-    // just-added one when `save` writes it back last-write-wins.
     if let Some((open, _client, vault)) = open_with_fresh_vault().await? {
         let mut list = extract_from_vault(&open.session, &vault)?.unwrap_or_default();
         let removed = list.entries.remove(id);
@@ -841,12 +977,8 @@ fn build_recipients_cipher(
         cipher_type: 2,
         name: enc_name,
         notes: Some(enc_notes),
-        login: None,
         secure_note: Some(sync::SecureNote { note_type: 0 }),
-        fields: None,
-        folder_id: None,
-        organization_id: None,
-        favorite: false,
+        ..sync::CipherIn::default()
     })
 }
 
@@ -901,7 +1033,108 @@ mod tests {
             created: Utc::now(),
             last_used: None,
             recipient,
+            default_encrypt: true,
+            mock: false,
         }
+    }
+
+    fn software(pubkey: &str) -> Recipient {
+        Recipient::SoftwarePassphrase {
+            armored_pubkey: ragewarden_core::ArmoredAgeRecipient::from_trusted(pubkey.into()),
+        }
+    }
+
+    #[test]
+    fn this_terminals_key_goes_through_the_policy_and_respects_default_encrypt_off() {
+        let own = "age1ownkey";
+        let mut reg = software_wire_entry(own, "Terminal");
+        reg.default_encrypt = false;
+        let inputs = policy_inputs(std::iter::empty(), Some(own), &[], &[reg.clone()], false);
+        assert_eq!(inputs.len(), 1);
+        assert!(!inputs[0].default_encrypt);
+        let sel = policy::select_for_encrypt(&[reg], &inputs, &Default::default());
+        assert!(!sel.recipients.contains(&software(own)));
+        let alone = policy_inputs(std::iter::empty(), Some(own), &[], &[], false);
+        let sel = policy::select_for_encrypt(&[], &alone, &Default::default());
+        assert_eq!(
+            sel.recipients
+                .iter()
+                .filter(|r| **r == software(own))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_p256_slot_publishes_its_spki_as_the_attestation_key_and_x25519_does_not() {
+        use base64::{Engine, engine::general_purpose::STANDARD as B64};
+        use p256::pkcs8::DecodePublicKey;
+        let secret = p256::SecretKey::from_slice(&[9u8; 32]).unwrap();
+        let compressed: [u8; 33] = {
+            use p256::elliptic_curve::sec1::ToSec1Point;
+            secret
+                .public_key()
+                .to_sec1_point(true)
+                .as_bytes()
+                .try_into()
+                .unwrap()
+        };
+        let wire = piv_wire_entry(&compressed, 7, 0x83, "p256");
+        let der = B64
+            .decode(wire.attestation_public_key.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(
+            p256::PublicKey::from_public_key_der(&der).unwrap(),
+            secret.public_key()
+        );
+        let local = local_entry_as_wire(&entry_for(Recipient::YubiKeyPivP256 {
+            public_key: compressed.to_vec(),
+            serial: 7,
+            slot: 0x83,
+        }));
+        assert_eq!(local.attestation_public_key, wire.attestation_public_key);
+        assert_eq!(
+            piv_wire_entry(&[5u8; 32], 7, 0x82, "x").attestation_public_key,
+            None
+        );
+    }
+
+    #[test]
+    fn the_registry_default_encrypt_wins_over_the_local_copy() {
+        let fido = Recipient::Fido2HmacSecret {
+            credential_id: b"cred".to_vec(),
+            salt: [7u8; 32],
+            rp_id: "ragewarden".into(),
+        };
+        let local = entry_for(fido.clone());
+        let mut reg = local_entry_as_wire(&local);
+        reg.default_encrypt = false;
+        let inputs = policy_inputs([&local].into_iter(), None, &[], &[reg], false);
+        assert!(!inputs[0].default_encrypt);
+    }
+
+    #[test]
+    fn a_paper_recovery_entry_collapses_with_its_registry_publication() {
+        let local = entry_for(software("age1paper"));
+        let inputs = policy_inputs(
+            [&local].into_iter(),
+            None,
+            &["age1paper".to_string()],
+            &[],
+            false,
+        );
+        assert_eq!(inputs[0].id, recovery_wire_entry("age1paper", "x").id);
+    }
+
+    #[test]
+    fn a_stand_in_enrollment_is_not_wrapped_to_where_stand_ins_do_not_work() {
+        let mut local = entry_for(software("age1mock"));
+        local.mock = true;
+        assert!(policy_inputs([&local].into_iter(), None, &[], &[], false).is_empty());
+        assert_eq!(
+            policy_inputs([&local].into_iter(), None, &[], &[], true).len(),
+            1
+        );
     }
 
     /// The local list used to be appended to the encrypt set unfiltered while
@@ -926,6 +1159,7 @@ mod tests {
                     public_key: [1u8; 32],
                     serial: 7,
                     slot: 0x95,
+                    stanza_version: 1,
                 },
                 kinds::YUBIKEY,
             ),
@@ -950,6 +1184,7 @@ mod tests {
                 Recipient::AndroidKeystore {
                     public_key: vec![2u8; 33],
                     key_handle: "h".into(),
+                    stanza_version: 1,
                 },
                 kinds::STRONG_BOX,
             ),
@@ -979,15 +1214,12 @@ mod tests {
         }));
 
         let held = policy::LocalAuthenticators::from_ids([local.id.clone()]);
-        let with_key = policy::select_for_encrypt(&[], &[local.clone()], &held);
+        let with_key = policy::select_for_encrypt(&[], std::slice::from_ref(&local), &held);
         assert_eq!(with_key.recipients.len(), 1);
         assert!(with_key.skipped.is_empty());
 
-        let without = policy::select_for_encrypt(
-            &[local],
-            &[],
-            &policy::LocalAuthenticators::none(),
-        );
+        let without =
+            policy::select_for_encrypt(&[local], &[], &policy::LocalAuthenticators::none());
         assert!(without.recipients.is_empty());
         assert_eq!(
             without.skipped.first().map(|s| s.reason),
@@ -1003,6 +1235,7 @@ mod tests {
             public_key: [5u8; 32],
             serial: 4242,
             slot: 0x95,
+            stanza_version: 1,
         });
         assert_eq!(
             local_entry_as_wire(&piv).id,
@@ -1053,11 +1286,17 @@ mod tests {
         assert_eq!(piv.kind, kinds::YUBIKEY);
         assert_eq!(piv.piv_serial, Some(0xdead_beef_u32 as i32));
         assert_eq!(piv.piv_slot, Some(0x95));
-        assert_eq!(piv.piv_pubkey.as_deref(), Some(hex::encode([7u8; 32]).as_str()));
+        assert_eq!(
+            piv.piv_pubkey.as_deref(),
+            Some(hex::encode([7u8; 32]).as_str())
+        );
 
-        let fido = fido2_wire_entry(b"cred", &[1u8; 32], "ragewarden", "fido");
+        let fido = fido2_wire_entry(b"cred", &[1u8; 32], "ragewarden", "fido", None);
         assert_eq!(fido.kind, kinds::FIDO2);
-        assert_eq!(fido.fido2_credential_id.as_deref(), Some(hex::encode(b"cred").as_str()));
+        assert_eq!(
+            fido.fido2_credential_id.as_deref(),
+            Some(hex::encode(b"cred").as_str())
+        );
         assert_eq!(fido.fido2_rp_id.as_deref(), Some("ragewarden"));
 
         let rec = recovery_wire_entry("age1rec", "paper");
@@ -1081,14 +1320,16 @@ mod tests {
             Some(publish_id),
         );
 
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine};
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
         let fido_kind = IdentityKind::Fido2HmacSecret {
             credential_id_b64: B64URL.encode(b"abc"),
             salt_hex: hex::encode([0u8; 32]),
             rp_id: "ragewarden".into(),
             mock: false,
+            uv: None,
+            public_key_hex: None,
         };
-        let publish_id = fido2_wire_entry(b"abc", &[0u8; 32], "ragewarden", "x").id;
+        let publish_id = fido2_wire_entry(b"abc", &[0u8; 32], "ragewarden", "x", None).id;
         assert_eq!(
             registry_id_for_enrolled_identity(&fido_kind),
             Some(publish_id),
@@ -1121,14 +1362,14 @@ mod tests {
     #[test]
     fn local_authenticators_come_from_this_machines_enrollments_only() {
         use crate::identities::{EnrolledIdentity, Identities, IdentityKind};
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine};
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 
         let _env = crate::tests_lock::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::TempDir::new().expect("tempdir");
         let prev = std::env::var_os("RAGEWARDEN_CONFIG_DIR");
-        std::env::set_var("RAGEWARDEN_CONFIG_DIR", dir.path());
+        crate::tests_lock::set_var("RAGEWARDEN_CONFIG_DIR", dir.path());
 
         let mut ids = Identities::default();
         ids.insert(EnrolledIdentity {
@@ -1138,13 +1379,13 @@ mod tests {
                 salt_hex: hex::encode([1u8; 32]),
                 rp_id: "ragewarden".into(),
                 mock: false,
+                uv: None,
+                public_key_hex: None,
             },
             label: "our key".into(),
             created: Utc::now(),
             last_used: None,
         });
-        // A PIV key is asymmetric: every client can wrap to it, so it must not
-        // show up in the PRF set even though it is enrolled here.
         ids.insert(EnrolledIdentity {
             id: "piv".into(),
             kind: IdentityKind::YubiKeyPiv {
@@ -1158,11 +1399,11 @@ mod tests {
             last_used: None,
         });
         let saved = ids.save();
-        let auth = local_prf_authenticators();
+        let auth = local_prf_authenticators(&[]);
 
         match prev {
-            Some(p) => std::env::set_var("RAGEWARDEN_CONFIG_DIR", p),
-            None => std::env::remove_var("RAGEWARDEN_CONFIG_DIR"),
+            Some(p) => crate::tests_lock::set_var("RAGEWARDEN_CONFIG_DIR", p),
+            None => crate::tests_lock::remove_var("RAGEWARDEN_CONFIG_DIR"),
         }
 
         saved.expect("save identities");
@@ -1216,10 +1457,138 @@ mod tests {
                         "age1xx".into(),
                     ),
                 },
+                default_encrypt: true,
+                mock: false,
             },
         );
         let serialized = serde_json::to_string(&list).unwrap();
         let parsed: RecipientList = serde_json::from_str(&serialized).unwrap();
         assert_eq!(parsed.entries.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod vector_tests {
+    //! rageterm's own route into the recipient policy -- the registry in a
+    //! synced vault, this machine's state on disk, `select_plan` -- against the
+    //! vectors core pins in core/tests/vectors/recipient_policy_v1.json, which
+    //! ragedroid's JNI and Kotlin and the browser's recipient_select also read.
+
+    use super::*;
+    use crate::identities::{EnrolledIdentity, Identities, IdentityKind};
+    use ragewarden_core::registry::MARKER_NAME;
+    use ragewarden_core::sync::{KdfParams, Server, Session, build_meta_cipher};
+    use serde_json::Value;
+
+    const VECTORS: &str = include_str!("../../core/tests/vectors/recipient_policy_v1.json");
+
+    fn session() -> Session {
+        Session {
+            access_token: ragewarden_core::BearerToken::from_trusted("t".into()),
+            refresh_token: ragewarden_core::RefreshToken::from_trusted("r".into()),
+            user_id: "u".into(),
+            email: "a@example.com".into(),
+            user_enc_key: vec![0x11; 32].into(),
+            user_mac_key: vec![0x22; 32].into(),
+            kdf: KdfParams::default(),
+            device_id: "d".into(),
+        }
+    }
+
+    /// The synced vault: the registry, and this account's (empty) local
+    /// recipient list.
+    fn vault_with_registry(session: &Session, registry: &Value) -> Vault {
+        let meta = |name: &str, payload: &str, id: &str| {
+            let body = build_meta_cipher(session, name, payload).unwrap();
+            let mut cipher: Cipher =
+                serde_json::from_value(serde_json::to_value(&body).unwrap()).unwrap();
+            cipher.id = Some(id.into());
+            cipher
+        };
+        let empty = serde_json::to_string(&RecipientList::default()).unwrap();
+        Vault {
+            ciphers: vec![
+                meta(MARKER_NAME, &registry.to_string(), "registry"),
+                meta(RECIPIENT_LIST_NAME, &empty, "recipients"),
+            ],
+            ..Vault::default()
+        }
+    }
+
+    /// Run `select_plan` in a fresh config dir holding a session, the vault with
+    /// `registry_key`'s registry, and (`hold`) the FIDO2 credential of the
+    /// registry entry with that id.
+    fn plan(registry_key: &str, hold: Option<&str>) -> Value {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
+        let vectors: Value = serde_json::from_str(VECTORS).unwrap();
+        let _env = crate::tests_lock::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("RAGEWARDEN_CONFIG_DIR");
+        crate::tests_lock::set_var("RAGEWARDEN_CONFIG_DIR", dir.path());
+
+        let s = session();
+        crate::session::save(&Server::self_hosted("https://vault.test"), &s).unwrap();
+        vault_cache::save(&vault_with_registry(&s, &vectors[registry_key])).unwrap();
+        if let Some(id) = hold {
+            let entry = vectors[registry_key]["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["id"] == id)
+                .unwrap();
+            let credential = hex::decode(entry["fido2CredentialId"].as_str().unwrap()).unwrap();
+            let mut ids = Identities::default();
+            ids.insert(EnrolledIdentity {
+                id: "held".into(),
+                kind: IdentityKind::Fido2HmacSecret {
+                    credential_id_b64: B64URL.encode(credential),
+                    salt_hex: entry["fido2Salt"].as_str().unwrap().into(),
+                    rp_id: entry["fido2RpId"].as_str().unwrap().into(),
+                    mock: false,
+                    uv: None,
+                    public_key_hex: None,
+                },
+                label: "held key".into(),
+                created: Utc::now(),
+                last_used: None,
+            });
+            ids.save().unwrap();
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let plan = rt.block_on(select_plan());
+
+        match prev {
+            Some(p) => crate::tests_lock::set_var("RAGEWARDEN_CONFIG_DIR", p),
+            None => crate::tests_lock::remove_var("RAGEWARDEN_CONFIG_DIR"),
+        }
+        serde_json::to_value(plan.unwrap().selection).unwrap()
+    }
+
+    fn expected(key: &str) -> Value {
+        serde_json::from_str::<Value>(VECTORS).unwrap()[key].clone()
+    }
+
+    #[test]
+    fn no_local_authenticator() {
+        assert_eq!(plan("registry", None), expected("no_local_authenticator"));
+    }
+
+    #[test]
+    fn holding_the_fido2_key() {
+        assert_eq!(plan("registry", Some("e-fido2")), expected("holds_fido2"));
+    }
+
+    #[test]
+    fn browser_passkey_registry_without_the_passkey() {
+        assert_eq!(
+            plan("browser_passkey_registry", None),
+            expected("browser_passkey_no_local_authenticator")
+        );
     }
 }

@@ -55,9 +55,25 @@ export function eyebrow(text) {
     return h('div', { class: 'eyebrow', text });
 }
 
+let fieldSeq = 0;
+
+/**
+ * A labelled control. A single input/select/textarea is wrapped in <label> so
+ * the text names it; anything else (a readout with buttons) becomes a named
+ * group, so the buttons inside keep their own accessible names.
+ */
 export function field(label, control, hint) {
-    return h('label', { class: 'field' },
-        h('span', { class: 'eyebrow', text: label }),
+    const single = control instanceof HTMLInputElement || control instanceof HTMLSelectElement
+        || control instanceof HTMLTextAreaElement;
+    if (single) {
+        return h('label', { class: 'field' },
+            h('span', { class: 'eyebrow', text: label }),
+            control,
+            hint ? h('div', { class: 'hint', text: hint }) : null);
+    }
+    const id = `field-label-${++fieldSeq}`;
+    return h('div', { class: 'field', role: 'group', 'aria-labelledby': id },
+        h('span', { class: 'eyebrow', id, text: label }),
         control,
         hint ? h('div', { class: 'hint', text: hint }) : null);
 }
@@ -131,20 +147,56 @@ export function errorText(err) {
     return err.message || String(err);
 }
 
+let sheetSeq = 0;
+const FOCUSABLE = 'button:not([disabled]), input:not([disabled]), select:not([disabled]), '
+    + 'textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])';
+
+/**
+ * A modal sheet: role=dialog with aria-modal, focus moved inside on open and
+ * trapped there, Escape and a backdrop click close it, and focus returns to
+ * whatever opened it.
+ */
 export function sheet({ title, body, actions, onClose }) {
-    const card = h('div', { class: 'sheet-card', onclick: e => e.stopPropagation() },
+    const titleId = `sheet-title-${++sheetSeq}`;
+    const opener = document.activeElement;
+    const card = h('div', {
+        class: 'sheet-card', role: 'dialog', 'aria-modal': 'true',
+        ...(title ? { 'aria-labelledby': titleId } : {}),
+        onclick: e => e.stopPropagation(),
+    },
         h('div', { class: 'sheet-grab' }),
-        title ? h('div', { class: 'sheet-title', text: title }) : null,
+        title ? h('div', { class: 'sheet-title', id: titleId, text: title }) : null,
         body,
         h('div', { class: 'sheet-actions' }, ...(actions || [])));
-    const root = h('div', {
-        class: 'sheet',
-        onclick: () => { root.remove(); onClose?.(); },
-    }, card);
-    return {
-        el: root,
-        close: () => { root.remove(); onClose?.(); },
+    let closed = false;
+    const close = () => {
+        if (closed) return;
+        closed = true;
+        root.remove();
+        onClose?.();
+        if (opener && typeof opener.focus === 'function' && opener.isConnected) opener.focus();
     };
+    const root = h('div', { class: 'sheet', onclick: close }, card);
+    root.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            close();
+            return;
+        }
+        if (e.key !== 'Tab') return;
+        const items = [...card.querySelectorAll(FOCUSABLE)];
+        if (items.length === 0) { e.preventDefault(); return; }
+        const first = items[0];
+        const last = items[items.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    });
+    setTimeout(() => {
+        if (closed || card.contains(document.activeElement)) return;
+        const target = card.querySelector(FOCUSABLE);
+        if (target) target.focus();
+    }, 0);
+    return { el: root, close };
 }
 
 export function relTime(ms) {

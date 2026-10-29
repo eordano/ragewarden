@@ -1,5 +1,5 @@
 use jni::objects::{Global, JByteArray, JObject, JString, JValue};
-use jni::{jni_sig, jni_str, Env, JavaVM};
+use jni::{Env, JavaVM, jni_sig, jni_str};
 use ragewarden_core::{FileKey, Identity, IdentityError, Stanza};
 
 pub struct JniIdentity {
@@ -77,7 +77,7 @@ impl JniIdentity {
             Err(e) => {
                 return Err(IdentityError::Hardware(format!(
                     "call_method tryUnwrapBlocking: {e}"
-                )))
+                )));
             }
         };
 

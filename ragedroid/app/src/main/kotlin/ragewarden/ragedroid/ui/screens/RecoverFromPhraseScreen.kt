@@ -17,7 +17,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.LockOpen
 import androidx.compose.material.icons.outlined.VisibilityOff
@@ -34,22 +33,24 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.data.BitwardenVaultRepository
 import ragewarden.ragedroid.data.VaultBridge
-import ragewarden.ragedroid.model.VaultItem
 import ragewarden.ragedroid.ui.components.AppBar
+import ragewarden.ragedroid.ui.components.BackButton
 import ragewarden.ragedroid.ui.components.ButtonVariant
-import ragewarden.ragedroid.ui.components.IconBtn
 import ragewarden.ragedroid.ui.components.Mono
 import ragewarden.ragedroid.ui.components.RageButton
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
+import ragewarden.ragedroid.ui.uiString
 
 private const val REVEAL_AUTO_CLEAR_SECS = 8
 
@@ -86,7 +87,7 @@ fun RecoverFromPhraseScreen(
         pt.fill(0)
         revealedPlaintext = null
         openItemId = null
-        onToast("Plaintext cleared from screen")
+        onToast(uiString(R.string.plaintext_cleared_from_screen))
     }
 
     val wordCount = remember(phrase) {
@@ -96,14 +97,8 @@ fun RecoverFromPhraseScreen(
 
     Column(modifier = Modifier.fillMaxSize().background(c.background)) {
         AppBar(
-            title = "Recover from paper backup",
-            leading = {
-                IconBtn(
-                    icon = Icons.AutoMirrored.Outlined.ArrowBack,
-                    contentDescription = "Back",
-                    onClick = onBack,
-                )
-            },
+            title = stringResource(R.string.recover_from_paper_backup),
+            leading = { BackButton(onBack) },
         )
 
         LazyColumn(
@@ -113,13 +108,13 @@ fun RecoverFromPhraseScreen(
         ) {
             item("intro") {
                 Text(
-                    text = "Type the 24-word recovery phrase you printed when you enrolled the paper backup.",
+                    text = stringResource(R.string.type_the_24_word_recovery_phrase),
                     style = RageType.body.copy(fontSize = 14.5.sp, lineHeight = 21.sp),
                     color = c.fgPrimary,
                 )
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
-                    text = "Nothing is saved. The derived identity stays in memory only long enough to unwrap the secrets you ask for.",
+                    text = stringResource(R.string.nothing_is_saved_the_derived_identity),
                     style = RageType.caption.copy(fontSize = 12.5.sp, lineHeight = 18.sp),
                     color = c.fgSecondary,
                 )
@@ -150,7 +145,7 @@ fun RecoverFromPhraseScreen(
                         decorationBox = { inner ->
                             if (phrase.isEmpty()) {
                                 Text(
-                                    text = "abandon ability able about above ...",
+                                    text = stringResource(R.string.abandon_ability_able_about_above),
                                     style = RageType.mono.copy(
                                         fontFamily = FontFamily.Monospace,
                                         fontSize = 13.5.sp,
@@ -164,13 +159,13 @@ fun RecoverFromPhraseScreen(
                 }
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
-                    text = "$wordCount of 24 words",
+                    text = stringResource(R.string.of_24_words, wordCount),
                     style = RageType.caption.copy(fontSize = 12.sp),
                     color = if (wordCount == 24) c.success else c.fgSecondary,
                 )
                 Spacer(modifier = Modifier.height(14.dp))
                 RageButton(
-                    label = if (working) "Working..." else "Recover",
+                    label = if (working) stringResource(R.string.working) else stringResource(R.string.recover),
                     onClick = onRecover@{
                         val r = repo ?: return@onRecover
                         if (!canRecover) return@onRecover
@@ -185,7 +180,7 @@ fun RecoverFromPhraseScreen(
                                     val isPhraseError = msg.contains("recovery::from_phrase") ||
                                         msg.contains("mnemonic", ignoreCase = true)
                                     if (isPhraseError) {
-                                        onToast("That phrase isn't a valid 24-word backup")
+                                        onToast(uiString(R.string.that_phrase_isn_t_a_valid))
                                     }
                                 }
                             }
@@ -202,7 +197,7 @@ fun RecoverFromPhraseScreen(
             if (items.isEmpty()) {
                 item("empty") {
                     Text(
-                        text = "No protected items in this vault yet.",
+                        text = stringResource(R.string.no_protected_items_in_this_vault),
                         style = RageType.body.copy(fontSize = 14.sp),
                         color = c.fgSecondary,
                     )
@@ -210,7 +205,7 @@ fun RecoverFromPhraseScreen(
             } else {
                 item("items_header") {
                     Text(
-                        text = "Tap an item to reveal its plaintext using the typed phrase.",
+                        text = stringResource(R.string.tap_an_item_to_reveal_its),
                         style = RageType.caption.copy(fontSize = 12.sp),
                         color = c.fgSecondary,
                     )
@@ -251,11 +246,11 @@ fun RecoverFromPhraseScreen(
                                         val msg = e.message.orEmpty()
                                         val hint = when {
                                             msg.contains("mnemonic", ignoreCase = true) ->
-                                                "Phrase is not a valid 24-word backup"
+                                                uiString(R.string.phrase_is_not_a_valid_24)
                                             msg.contains("no matching key", ignoreCase = true) ||
                                                 msg.contains("decrypt", ignoreCase = true) ->
-                                                "${it.name} can't be unlocked by this phrase"
-                                            else -> "Recover failed: ${e.message}"
+                                                uiString(R.string.can_t_be_unlocked_by_this, it.name.orEmpty())
+                                            else -> uiString(R.string.recover_failed, e.message.orEmpty())
                                         }
                                         onToast(hint)
                                     }
@@ -321,7 +316,7 @@ fun RecoverFromPhraseScreen(
                                         .background(c.success, RoundedCornerShape(50)),
                                 )
                                 Text(
-                                    text = "Auto-clear in ${revealSecsLeft}s",
+                                    text = stringResource(R.string.auto_clear_in_s, revealSecsLeft),
                                     style = RageType.meta,
                                     color = c.fgSecondary,
                                 )
@@ -345,7 +340,7 @@ fun RecoverFromPhraseScreen(
                                         tint = c.fgPrimary,
                                         modifier = Modifier.size(13.dp),
                                     )
-                                    Text(text = "Hide", style = RageType.caption, color = c.fgPrimary)
+                                    Text(text = stringResource(R.string.hide), style = RageType.caption, color = c.fgPrimary)
                                 }
                             }
                         }
@@ -356,7 +351,7 @@ fun RecoverFromPhraseScreen(
             item("footer") {
                 Spacer(modifier = Modifier.height(18.dp))
                 RageButton(
-                    label = "Done",
+                    label = stringResource(R.string.done),
                     onClick = onBack,
                     variant = ButtonVariant.Secondary,
                     fullWidth = true,

@@ -50,7 +50,22 @@ class AuditFeed @Inject constructor(
         site: String? = null,
         reason: String? = null,
         cleared: Boolean = false,
+        result: AuditResult = AuditResult.Ok,
     ) {
+        recordReturningId(action, item, recipient, site, reason, cleared, result)
+    }
+
+    /** [record], returning the entry's id so a later [markCleared] can find it. */
+    suspend fun recordReturningId(
+        action: AuditAction,
+        item: String,
+        recipient: String? = null,
+        site: String? = null,
+        reason: String? = null,
+        cleared: Boolean = false,
+        result: AuditResult = AuditResult.Ok,
+    ): String {
+        val id = UUID.randomUUID().toString()
         withContext(Dispatchers.IO) {
             mutex.withLock {
                 val now = clock.millis()
@@ -58,9 +73,10 @@ class AuditFeed @Inject constructor(
                 current.add(
                     0,
                     StoredEntry(
-                        id = UUID.randomUUID().toString(),
+                        id = id,
                         whenEpochMs = now,
-                        action = action,
+                        action = action.name,
+                        result = result,
                         item = item,
                         recipient = recipient,
                         site = site,
@@ -75,6 +91,20 @@ class AuditFeed @Inject constructor(
                 _flow.value = rebuild(current)
             }
         }
+        return id
+    }
+
+    /** The copied secret recorded as [id] has left the clipboard. */
+    suspend fun markCleared(id: String) {
+        withContext(Dispatchers.IO) {
+            mutex.withLock {
+                val current = loadStored()
+                if (current.none { it.id == id }) return@withLock
+                val updated = current.map { if (it.id == id) it.copy(cleared = true) else it }
+                save(updated)
+                _flow.value = rebuild(updated)
+            }
+        }
     }
 
     suspend fun clear() {
@@ -87,7 +117,7 @@ class AuditFeed @Inject constructor(
     }
 
     private fun loadStored(): List<StoredEntry> {
-        val raw = prefs.getString(KEY, null) ?: return emptyList()
+        val raw = runCatching { prefs.getString(KEY, null) }.getOrNull() ?: return emptyList()
         return runCatching { JSON.decodeFromString<List<StoredEntry>>(raw) }.getOrDefault(emptyList())
     }
 
@@ -105,7 +135,8 @@ class AuditFeed @Inject constructor(
     private data class StoredEntry(
         val id: String,
         val whenEpochMs: Long,
-        val action: AuditAction,
+        val action: String,
+        val result: AuditResult? = null,
         val item: String,
         val recipient: String? = null,
         val site: String? = null,
@@ -114,11 +145,13 @@ class AuditFeed @Inject constructor(
     ) {
         fun toAuditEntry(clock: Clock, now: LocalDateTime, today: LocalDate): AuditEntry {
             val time = LocalDateTime.ofInstant(Instant.ofEpochMilli(whenEpochMs), clock.zone)
+            val failedLegacy = action == "Failed"
             return AuditEntry(
                 id = id,
                 timestamp = formatTimestamp(time, now),
                 bucket = bucketFor(time.toLocalDate(), today),
-                action = action,
+                action = AuditAction.parse(action) ?: AuditAction.Reveal,
+                result = result ?: if (failedLegacy) AuditResult.Failed else AuditResult.Ok,
                 item = item,
                 recipient = recipient,
                 site = site,

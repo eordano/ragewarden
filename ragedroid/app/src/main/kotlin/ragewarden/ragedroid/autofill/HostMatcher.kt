@@ -1,20 +1,28 @@
 package ragewarden.ragedroid.autofill
 
+import com.google.common.net.InternetDomainName
 import ragewarden.ragedroid.model.VaultItem
 
 object HostMatcher {
+    private const val ANDROID_APP_SCHEME = "androidapp://"
+
     fun matchVaultItems(
         items: List<VaultItem>,
         webDomain: String?,
         packageName: String?,
     ): List<VaultItem> {
-        val normalisedDomain = normaliseHost(webDomain)
-        val pkg = packageName?.lowercase().orEmpty()
+        val pageSite = registrableDomain(normaliseHost(webDomain))
+        val pkg = packageName?.trim()?.lowercase().orEmpty()
+        val pkgSite = if (pkg.isEmpty()) null else registrableDomain(pkg.split('.').reversed().joinToString("."))
         return items.filter { item ->
-            val itemHost = normaliseHost(item.site)
+            val raw = item.site.trim()
+            if (raw.lowercase().startsWith(ANDROID_APP_SCHEME)) {
+                return@filter pkg.isNotEmpty() && raw.substring(ANDROID_APP_SCHEME.length).lowercase() == pkg
+            }
+            val itemSite = registrableDomain(normaliseHost(raw)) ?: return@filter false
             when {
-                normalisedDomain != null && itemHost != null -> hostsMatch(normalisedDomain, itemHost)
-                pkg.isNotEmpty() && itemHost != null -> hostsMatchPackage(pkg, itemHost)
+                pageSite != null -> pageSite == itemSite
+                pkgSite != null -> pkgSite == itemSite
                 else -> false
             }
         }
@@ -23,26 +31,26 @@ object HostMatcher {
     fun normaliseHost(raw: String?): String? {
         if (raw.isNullOrBlank()) return null
         val stripped = raw
-            .removePrefix("https://")
-            .removePrefix("http://")
-            .substringBefore('/')
-            .substringBefore(':')
             .trim()
             .lowercase()
+            .substringAfter("://")
+            .substringBefore('/')
+            .substringBefore('?')
+            .substringBefore('#')
+            .substringAfterLast('@')
+            .substringBefore(':')
+            .trimEnd('.')
         if (stripped.isEmpty()) return null
         return stripped.removePrefix("www.")
     }
 
-    private fun hostsMatch(a: String, b: String): Boolean {
-        if (a == b) return true
-        if (a.endsWith(".$b") || b.endsWith(".$a")) return true
-        return false
-    }
-
-    private fun hostsMatchPackage(packageName: String, host: String): Boolean {
-        val pkgTokens = packageName.split('.')
-        val hostTokens = host.split('.')
-        if (pkgTokens.isEmpty() || hostTokens.isEmpty()) return false
-        return pkgTokens.any { tok -> tok.length > 2 && hostTokens.any { it == tok } }
+    fun registrableDomain(host: String?): String? {
+        if (host.isNullOrBlank()) return null
+        val name = runCatching { InternetDomainName.from(host) }.getOrNull() ?: return host
+        return when {
+            name.isTopPrivateDomain || name.isUnderPublicSuffix -> name.topPrivateDomain().toString()
+            name.isPublicSuffix -> null
+            else -> host
+        }
     }
 }

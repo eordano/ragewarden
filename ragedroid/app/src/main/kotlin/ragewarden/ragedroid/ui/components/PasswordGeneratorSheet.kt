@@ -1,5 +1,8 @@
 package ragewarden.ragedroid.ui.components
 
+import ragewarden.ragedroid.R
+import androidx.compose.ui.res.stringResource
+import ragewarden.ragedroid.jni.RageNative
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -37,17 +40,8 @@ import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import java.security.SecureRandom
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
-
-private val GENERATOR_WORDS = listOf(
-    "mountain", "pebble", "curtain", "forest", "ocean", "lantern", "velvet", "hollow",
-    "pioneer", "meadow", "cipher", "shelter", "copper", "ember", "garnet", "harbor",
-    "indigo", "jasper", "kestrel", "lichen", "mantle", "nutmeg", "onyx", "pewter",
-    "quartz", "redwood", "sable", "tamarind", "umber", "verdigris", "willow", "xenon",
-    "yarrow", "zephyr",
-)
 
 private enum class GenMode { Chars, Words }
 
@@ -95,36 +89,23 @@ fun PasswordGeneratorSheet(
     var digits by remember { mutableStateOf(true) }
     var symbols by remember { mutableStateOf(true) }
     var pw by remember { mutableStateOf("") }
-    val rng = remember { SecureRandom() }
 
     val regen: () -> Unit = {
-        pw = if (mode == GenMode.Words) {
-            buildString {
-                repeat(wordCount) { idx ->
-                    if (idx > 0) append('-')
-                    append(GENERATOR_WORDS[rng.nextInt(GENERATOR_WORDS.size)])
-                }
-                append('-')
-                append(rng.nextInt(99))
+        pw = runCatching {
+            if (mode == GenMode.Words) {
+                RageNative.generatePassphrase(wordCount.coerceIn(4, 24), "-")
+            } else {
+                val anyClass = lower || upper || digits || symbols
+                RageNative.generatePassword(length.coerceIn(8, 128), lower || !anyClass, upper, digits, symbols)
             }
-        } else {
-            var pool = ""
-            if (lower) pool += "abcdefghjkmnpqrstuvwxyz"
-            if (upper) pool += "ABCDEFGHJKLMNPQRSTUVWXYZ"
-            if (digits) pool += "23456789"
-            if (symbols) pool += "!@#$%^&*-_=+"
-            if (pool.isEmpty()) pool = "abcdefghijklmnopqrstuvwxyz"
-            buildString {
-                repeat(length) { append(pool[rng.nextInt(pool.length)]) }
-            }
-        }
+        }.getOrElse { "" }
     }
 
     LaunchedEffect(open, mode, length, wordCount, upper, lower, digits, symbols) {
         if (open) regen()
     }
 
-    Sheet(open = open, onDismiss = onClose, title = "Generate password") {
+    Sheet(open = open, onDismiss = onClose, title = stringResource(R.string.generate_password)) {
         val c = rageColors
         Column(modifier = Modifier.fillMaxWidth()) {
             Box(
@@ -148,20 +129,20 @@ fun PasswordGeneratorSheet(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 RageButton(
-                    label = "Regenerate",
+                    label = stringResource(R.string.regenerate),
                     onClick = regen,
                     icon = Icons.Outlined.Refresh,
                     variant = ButtonVariant.Secondary,
                 )
                 RageButton(
-                    label = "Copy",
+                    label = stringResource(R.string.copy),
                     onClick = { onCopy(pw) },
                     icon = Icons.Outlined.ContentCopy,
                     variant = ButtonVariant.Secondary,
                 )
                 Box(modifier = Modifier.weight(1f)) {
                     RageButton(
-                        label = "Use",
+                        label = stringResource(R.string.use),
                         onClick = {
                             onUse(pw)
                             onClose()
@@ -179,13 +160,13 @@ fun PasswordGeneratorSheet(
                     .padding(3.dp),
             ) {
                 ModeToggle(
-                    label = "Random characters",
+                    label = stringResource(R.string.random_characters),
                     active = mode == GenMode.Chars,
                     modifier = Modifier.weight(1f),
                     onClick = { mode = GenMode.Chars },
                 )
                 ModeToggle(
-                    label = "Memorable words",
+                    label = stringResource(R.string.memorable_words),
                     active = mode == GenMode.Words,
                     modifier = Modifier.weight(1f),
                     onClick = { mode = GenMode.Words },
@@ -194,7 +175,7 @@ fun PasswordGeneratorSheet(
             Spacer(modifier = Modifier.height(16.dp))
 
             if (mode == GenMode.Chars) {
-                LengthRow(label = "Length", value = length)
+                LengthRow(label = stringResource(R.string.length), value = length)
                 Spacer(modifier = Modifier.height(6.dp))
                 Slider(
                     value = length.toFloat(),
@@ -213,7 +194,7 @@ fun PasswordGeneratorSheet(
                 CharsetToggle(label = "0-9", on = digits, onChange = { digits = it }, last = false)
                 CharsetToggle(label = "!@#%...", on = symbols, onChange = { symbols = it }, last = true)
             } else {
-                LengthRow(label = "Words", value = wordCount)
+                LengthRow(label = stringResource(R.string.words), value = wordCount)
                 Spacer(modifier = Modifier.height(6.dp))
                 Slider(
                     value = wordCount.toFloat(),
@@ -228,7 +209,7 @@ fun PasswordGeneratorSheet(
                 )
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(
-                    text = "Hyphenated wordlists are easier to dictate and type. RageDroid uses the BIP39 wordlist.",
+                    text = stringResource(R.string.hyphenated_words_are_easier_to_dictate),
                     style = WordsHintStyle,
                     color = c.fgSecondary,
                 )

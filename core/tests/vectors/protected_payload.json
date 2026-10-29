@@ -1,0 +1,67 @@
+{
+  "recovery_phrase": "pause cheese brown topple melt tape mad leopard movie insane nurse hawk boat earth color dad trouble cactus thank blouse practice truck session foil",
+  "blobs": [
+    {
+      "cipher_type": 1,
+      "armored": "-----BEGIN AGE ENCRYPTED FILE-----\nYWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBOMDljM2RiNnphQ1k1bzAz\nWnB2WVptUEt6Szk1NWVJMmVIS1RRdUx3MXg0CndUM1JEa3FUTmV2VlBzNy9MbXdi\nb0xLM0YyT1ZVVjF4ZkxYdWZjeDRGN00KLT4gdn4tZ3JlYXNlIHZifi0gbiggSEtq\nClVnCi0tLSBMWHhkbkNSb1RYcjNYY1hDZ1A3ZEdSRUpSUXJ0UmttUlIyamdNVmxR\ndjI0ClQSR2YqjrGmk1eEVXaLAm3sD1kuCcPP7QcTv7qrT5aBEK9PFg8jPE9Jq6c8\nBncLRzG6wY5TGXNW\n-----END AGE ENCRYPTED FILE-----\n",
+      "fields": {
+        "password": "hunter2-from-a-v1-client"
+      }
+    },
+    {
+      "cipher_type": 2,
+      "armored": "-----BEGIN AGE ENCRYPTED FILE-----\nYWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBvOHQwVDRwTUc0RnpWRkVW\nbWJ1bWFVNVdBamZIMnYzeUkxbG9TVHE0VWhFClovVDZ5MlN0bDNNdjBuODhNdGd0\ncWhzZTFmNVU4QXBmOGdMbU12M0YyVzAKLT4gKi1ncmVhc2UgfG1lMFkhdSMgeyBl\nIFgKV1VqaW92ajRMZ0p4SSs4YjNWWmMxb0drTzFKVWlVQ0EKLS0tIDRGdks0ekdX\nbEI2M0J3QmZVWlhIcWhtZ0NHR2czU2N6czBwU2ZuTHphNEEKH6PRNSTjXaJ5MQsU\npoAFT0As0cwlL0rXshBYt60nszuwK6eb2Tt9S16n2Ov035vJZoY0sVcbv1k=\n-----END AGE ENCRYPTED FILE-----\n",
+      "fields": {
+        "notes": "a note written before v2"
+      }
+    },
+    {
+      "cipher_type": 3,
+      "armored": "-----BEGIN AGE ENCRYPTED FILE-----\nYWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBMRitlWFlBTzNWSmlucUFD\nU1lYRFpJclFMdTc3Z0twNHV4MG5Jc2tSM2tjCmxwSER2V2JmV2JHNWhUWEl1M0Jy\nSnNXYmN6WTNrbEVlZEIweFkzSXB1cEEKLT4gfC1ncmVhc2UgdE5qZFEpXiBJYkpi\ndDE3ViBJWzExaVUgfEEnCkJiUlZ2NDhEQk1vY0NJOHQ4ejRFZ2tCZ2wyN0t2Q0FM\nNjNKREJJMmRhaFJHWDVEMTRWSlFYWTlCK0lJVGxpU2MKNC9EV3MrbU53eHZ3Q3VQ\nN0JDZ3Vqa3pQOHQxRlZQeXBaV3hjCi0tLSBFNUVuSWI1dTQ5SlN2c1ZBNGkxZlpF\nb0MxTFB3TS9FRUxpY3JaS0ZMcmVzCrBydzKxkK8aefKZKUHSVw7B+CSpVA8OoDtc\ndJr3uLXZGhE8vr7jIF6h2yBwzQ1U2FzO4QMtPZrHK7TmYg6qdlrTZfi7vYp3dPAh\ndM+F4drUXN2GUxJuiz6vmb302T8WLuEReDrZyT4DtAS9LzzfXEi+\n-----END AGE ENCRYPTED FILE-----\n",
+      "fields": {
+        "code": "123",
+        "number": "4111111111111111"
+      }
+    }
+  ],
+  "kats": [
+    {
+      "cipher_type": 1,
+      "fields": {
+        "password": "hunter2"
+      },
+      "sealed_hex": "68756e74657232"
+    },
+    {
+      "cipher_type": 2,
+      "fields": {
+        "notes": "line one\nline two"
+      },
+      "sealed_hex": "6c696e65206f6e650a6c696e652074776f"
+    },
+    {
+      "cipher_type": 1,
+      "fields": {
+        "notes": "recovery codes",
+        "password": "hunter2"
+      },
+      "sealed_hex": "007261676577617264656e3a6669656c64733a76320a7b2276223a322c226669656c6473223a7b226e6f746573223a227265636f7665727920636f646573222c2270617373776f7264223a2268756e74657232227d7d"
+    },
+    {
+      "cipher_type": 3,
+      "fields": {
+        "code": "123",
+        "number": "4111111111111111"
+      },
+      "sealed_hex": "007261676577617264656e3a6669656c64733a76320a7b2276223a322c226669656c6473223a7b22636f6465223a22313233222c226e756d626572223a2234313131313131313131313131313131227d7d"
+    },
+    {
+      "cipher_type": 5,
+      "fields": {
+        "passphrase": "pp",
+        "privateKey": "openssh-key-v1 test material\n"
+      },
+      "sealed_hex": "007261676577617264656e3a6669656c64733a76320a7b2276223a322c226669656c6473223a7b2270617373706872617365223a227070222c22707269766174654b6579223a226f70656e7373682d6b65792d76312074657374206d6174657269616c5c6e227d7d"
+    }
+  ]
+}

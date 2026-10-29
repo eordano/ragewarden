@@ -17,8 +17,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::registry::{kinds, WireEntry};
 use crate::Recipient;
+use crate::registry::{WireEntry, kinds};
 
 pub const POLICY_VERSION: u32 = 1;
 
@@ -136,7 +136,11 @@ pub fn merge_entries(registry: &[WireEntry], local: &[WireEntry]) -> Vec<WireEnt
             None => out.push(e.clone()),
         }
     }
-    out.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+    out.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
     out
 }
 
@@ -145,15 +149,12 @@ pub fn merge_entries(registry: &[WireEntry], local: &[WireEntry]) -> Vec<WireEnt
 ///
 /// Deterministic: the same `entries` and the same `local` always give the same
 /// `Vec<Recipient>` in the same order, in every client.
-pub fn select_encrypt_recipients(
-    entries: &[WireEntry],
-    local: &LocalAuthenticators,
-) -> Selection {
+pub fn select_encrypt_recipients(entries: &[WireEntry], local: &LocalAuthenticators) -> Selection {
     let mut sel = Selection::default();
     let mut seen: Vec<&str> = Vec::with_capacity(entries.len());
 
     for entry in entries {
-        if seen.iter().any(|id| *id == entry.id.as_str()) {
+        if seen.contains(&entry.id.as_str()) {
             continue;
         }
         seen.push(entry.id.as_str());
@@ -182,10 +183,6 @@ pub fn select_encrypt_recipients(
             skip(&mut sel, SkipReason::NoLocalAuthenticator);
             continue;
         }
-        // The same public key can legitimately reach us under two ids (a local
-        // enrollment and its registry publication, or a Software and a Recovery
-        // entry sharing one age key). Wrapping it twice is pure waste, not a
-        // policy decision, so it is not reported as a skip.
         if sel.recipients.contains(&recipient) {
             continue;
         }
@@ -225,6 +222,8 @@ mod tests {
             fido2_rp_id: None,
             fido2_salt: None,
             recovery_armored_pubkey: None,
+            stanza_version: None,
+            attestation_public_key: None,
         }
     }
 
@@ -248,14 +247,11 @@ mod tests {
 
     #[test]
     fn software_and_recovery_are_both_selected() {
-        let entries = vec![
-            software("sw", 1, "age1sw"),
-            {
-                let mut e = entry("rec", kinds::RECOVERY, 2);
-                e.recovery_armored_pubkey = Some("age1rec".into());
-                e
-            },
-        ];
+        let entries = vec![software("sw", 1, "age1sw"), {
+            let mut e = entry("rec", kinds::RECOVERY, 2);
+            e.recovery_armored_pubkey = Some("age1rec".into());
+            e
+        }];
         let sel = select_encrypt_recipients(&entries, &LocalAuthenticators::none());
         assert_eq!(sel.recipients.len(), 2, "{sel:?}");
         assert!(sel.skipped.is_empty());
@@ -287,10 +283,7 @@ mod tests {
 
         let unknown = entry("weird", "SomethingElse", 3);
 
-        let sel = select_encrypt_recipients(
-            &[off, bad, unknown],
-            &LocalAuthenticators::none(),
-        );
+        let sel = select_encrypt_recipients(&[off, bad, unknown], &LocalAuthenticators::none());
         assert!(sel.recipients.is_empty());
         let reasons: Vec<SkipReason> = sel.skipped.iter().map(|s| s.reason).collect();
         assert_eq!(
@@ -310,7 +303,10 @@ mod tests {
         let merged = merge_entries(&reg, &local);
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].id, "b", "ordered by created_at");
-        assert_eq!(merged[1].recovery_armored_pubkey.as_deref(), Some("age1fresh"));
+        assert_eq!(
+            merged[1].recovery_armored_pubkey.as_deref(),
+            Some("age1fresh")
+        );
     }
 
     #[test]
@@ -321,10 +317,8 @@ mod tests {
             &merge_entries(&[a.clone(), b.clone()], &[]),
             &LocalAuthenticators::none(),
         );
-        let two = select_encrypt_recipients(
-            &merge_entries(&[b, a], &[]),
-            &LocalAuthenticators::none(),
-        );
+        let two =
+            select_encrypt_recipients(&merge_entries(&[b, a], &[]), &LocalAuthenticators::none());
         assert_eq!(one, two);
     }
 

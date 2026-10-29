@@ -27,7 +27,7 @@ pub fn encode(hrp: &str, data: &[u8]) -> String {
     out.push_str(hrp);
     out.push('1');
     for &v in bits.iter().chain(cs.iter()) {
-        out.push(CHARSET[v as usize] as char);
+        out.push(charset_char(v) as char);
     }
     out
 }
@@ -42,9 +42,14 @@ pub fn decode(s: &str, expected_hrp: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut values = Vec::with_capacity(data.len());
+    let mut all_valid = 1u8;
     for c in data.bytes() {
-        let v = CHARSET.iter().position(|&x| x == c)?;
-        values.push(v as u8);
+        let (v, valid) = charset_value(c);
+        all_valid &= valid;
+        values.push(v);
+    }
+    if all_valid == 0 {
+        return None;
     }
     if !verify_checksum(hrp, &values) {
         return None;
@@ -63,6 +68,26 @@ pub fn decode(s: &str, expected_hrp: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// `CHARSET[v]` read by scanning all 32 entries, so the memory access does
+/// not depend on `v` (a 5-bit chunk of a secret key when encoding one).
+fn charset_char(v: u8) -> u8 {
+    CHARSET.iter().enumerate().fold(0u8, |acc, (i, &ch)| {
+        let hit = 0u8.wrapping_sub(((i as u8 ^ v) == 0) as u8);
+        acc | (ch & hit)
+    })
+}
+
+/// The inverse scan: the value of character `c` and whether it was one.
+fn charset_value(c: u8) -> (u8, u8) {
+    CHARSET
+        .iter()
+        .enumerate()
+        .fold((0u8, 0u8), |(acc, found), (i, &ch)| {
+            let hit = 0u8.wrapping_sub((ch ^ c == 0) as u8);
+            (acc | (i as u8 & hit), found | (hit & 1))
+        })
 }
 
 pub fn decode_age_x25519(s: &str) -> Option<[u8; 32]> {
@@ -88,8 +113,8 @@ fn polymod(values: &[u8]) -> u32 {
     for &v in values {
         let top = chk >> 25;
         chk = ((chk & 0x01ff_ffff) << 5) ^ v as u32;
-        for (i, gen) in GEN.iter().enumerate() {
-            chk ^= gen & 0u32.wrapping_sub((top >> i) & 1);
+        for (i, g) in GEN.iter().enumerate() {
+            chk ^= g & 0u32.wrapping_sub((top >> i) & 1);
         }
     }
     chk
@@ -130,6 +155,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_scanning_charset_lookups_match_the_table() {
+        for v in 0u8..32 {
+            assert_eq!(charset_char(v), CHARSET[v as usize]);
+            assert_eq!(charset_value(CHARSET[v as usize]), (v, 1));
+        }
+        for c in [b'1', b'b', b'i', b'o', b'B', 0u8, 0xff] {
+            assert_eq!(charset_value(c).1, 0, "{c} is not a bech32 character");
+        }
+    }
+
+    #[test]
     fn x25519_round_trip() {
         let pk = [0xab; 32];
         let s = encode_age_x25519(&pk);
@@ -150,9 +186,9 @@ mod tests {
             for &v in values {
                 let top = chk >> 25;
                 chk = ((chk & 0x01ff_ffff) << 5) ^ v as u32;
-                for (i, gen) in GEN.iter().enumerate() {
+                for (i, g) in GEN.iter().enumerate() {
                     if (top >> i) & 1 == 1 {
-                        chk ^= gen;
+                        chk ^= g;
                     }
                 }
             }

@@ -28,6 +28,7 @@ class BackfillViewModel @Inject constructor(
         val running: Boolean = false,
         val complete: Boolean = false,
         val staleRageItemCount: Int = 0,
+        val rewrapping: Boolean = false,
     )
 
     private val _state = MutableStateFlow(State())
@@ -36,11 +37,7 @@ class BackfillViewModel @Inject constructor(
     fun loadCandidates() {
         val all = repo.snapshot()
         val items = all.filter { !it.rage }
-        val staleRage = if (rotationTracker.isStale(repo.accountId)) {
-            all.count { it.rage }
-        } else {
-            0
-        }
+        val staleRage = repo.staleProtectedItems().size
         _state.update {
             it.copy(
                 candidates = items,
@@ -71,7 +68,7 @@ class BackfillViewModel @Inject constructor(
             for (item in items) {
                 _state.update { it.copy(currentName = item.name) }
                 val result = runCatching {
-                    val pt = repo.decrypt(item.id, emptyList()).getOrThrow()
+                    val pt = repo.decrypt(item.id, emptyList(), null).getOrThrow()
                     repo.update(item.copy(rage = true), pt).getOrThrow()
                 }
                 _state.update { current ->
@@ -90,8 +87,44 @@ class BackfillViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Re-encrypts every stale protected item to the current recipients, one
+     * hardware tap each: [open] runs the tap ceremony and hands the item's
+     * identities to [BitwardenVaultRepository.rewrap].
+     */
+    fun rewrapStale(open: suspend (VaultItem) -> Unit) {
+        if (_state.value.running) return
+        viewModelScope.launch {
+            val items = repo.staleProtectedItems()
+            _state.update {
+                it.copy(running = true, rewrapping = true, processed = 0, total = items.size, failed = emptyList(), complete = false)
+            }
+            rewrapAll(items, open) { name, processed, failed ->
+                _state.update { it.copy(currentName = name, processed = processed, failed = failed) }
+            }
+            _state.update { it.copy(running = false, complete = true, currentName = null, staleRageItemCount = repo.staleProtectedItems().size) }
+        }
+    }
+
     fun markRotationFresh() {
         rotationTracker.markFresh(repo.accountId)
         _state.update { it.copy(staleRageItemCount = 0) }
     }
+}
+
+/**
+ * Re-encrypts [items] one at a time through [open], carrying on past a
+ * failure (a declined tap, a missing key) so one item cannot strand the rest.
+ */
+internal suspend fun rewrapAll(
+    items: List<VaultItem>,
+    open: suspend (VaultItem) -> Unit,
+    progress: (current: String?, processed: Int, failed: List<Pair<String, String>>) -> Unit,
+) {
+    var failed = emptyList<Pair<String, String>>()
+    items.forEachIndexed { i, item ->
+        progress(item.name, i, failed)
+        runCatching { open(item) }.onFailure { e -> failed = failed + (item.id to (e.message ?: e::class.simpleName.orEmpty())) }
+    }
+    progress(null, items.size, failed)
 }

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use chrono::Utc;
-use ragewarden_core::{encrypt_with_prf, PrfEntry, Recipient};
+use ragewarden_core::{PrfEntry, Recipient, encrypt_with_prf};
 use thiserror::Error;
 use walkdir::WalkDir;
 use zeroize::Zeroizing;
@@ -343,12 +343,12 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os("PASSWORD_STORE_DIR");
-        std::env::set_var("PASSWORD_STORE_DIR", "/tmp/from-env-store");
+        crate::tests_lock::set_var("PASSWORD_STORE_DIR", "/tmp/from-env-store");
         let got = resolve_store_dir(None).unwrap();
         if let Some(p) = prev {
-            std::env::set_var("PASSWORD_STORE_DIR", p);
+            crate::tests_lock::set_var("PASSWORD_STORE_DIR", p);
         } else {
-            std::env::remove_var("PASSWORD_STORE_DIR");
+            crate::tests_lock::remove_var("PASSWORD_STORE_DIR");
         }
         assert_eq!(got, PathBuf::from("/tmp/from-env-store"));
     }

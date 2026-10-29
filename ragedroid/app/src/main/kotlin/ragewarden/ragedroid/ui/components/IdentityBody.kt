@@ -3,7 +3,6 @@ package ragewarden.ragedroid.ui.components
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -13,11 +12,13 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.collections.immutable.ImmutableList
 import kotlinx.collections.immutable.persistentListOf
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.data.Clipboard
 import ragewarden.ragedroid.model.VaultItem
 import ragewarden.ragedroid.ui.theme.RageType
@@ -36,13 +37,14 @@ fun IdentityBody(
     clipboard: Clipboard,
     showToast: (String) -> Unit,
 ) {
+    val strings = androidx.compose.ui.platform.LocalContext.current
     val rows: ImmutableList<IdentityField> = persistentListOf(
-        IdentityField("Full name", item.fullName, multiline = false, sensitive = false),
-        IdentityField("Date of birth", item.dob, multiline = false, sensitive = false),
-        IdentityField("Address", item.address, multiline = true, sensitive = false),
-        IdentityField("Phone", item.phone, multiline = false, sensitive = false),
-        IdentityField("Email", item.email, multiline = false, sensitive = false),
-        IdentityField("National ID", item.nationalId, multiline = false, sensitive = true),
+        IdentityField(stringResource(R.string.full_name), item.fullName, multiline = false, sensitive = false),
+        IdentityField(stringResource(R.string.date_of_birth), item.dob, multiline = false, sensitive = false),
+        IdentityField(stringResource(R.string.address), item.address, multiline = true, sensitive = false),
+        IdentityField(stringResource(R.string.phone), item.phone, multiline = false, sensitive = false),
+        IdentityField(stringResource(R.string.email), item.email, multiline = false, sensitive = false),
+        IdentityField(stringResource(R.string.national_id), item.nationalId, multiline = false, sensitive = true),
     )
 
     Column(modifier = Modifier.fillMaxWidth()) {
@@ -53,12 +55,12 @@ fun IdentityBody(
                     val value = row.value ?: return@IdentityRow
                     val bytes = value.toByteArray(Charsets.UTF_8)
                     if (row.sensitive) {
-                        clipboard.copySensitive(bytes, row.label.lowercase())
+                        clipboard.copySensitive(bytes, row.label.lowercase(), item = item.name)
                     } else {
                         clipboard.copyVisible(value, row.label.lowercase())
                     }
                     bytes.fill(0)
-                    showToast("${row.label} copied")
+                    showToast(strings.getString(R.string.copied, row.label))
                 },
             )
         }
@@ -86,7 +88,7 @@ private fun IdentityRow(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Text(
-                text = row.value ?: "Not set",
+                text = row.value ?: stringResource(R.string.not_set),
                 style = RageType.body.copy(
                     fontSize = 14.sp,
                     fontStyle = if (isEmpty) FontStyle.Italic else FontStyle.Normal,
@@ -101,22 +103,3 @@ private fun IdentityRow(
     }
 }
 
-@Composable
-private fun NotesField(text: String) {
-    val c = rageColors
-    Field(label = "Notes") {
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(c.surfaceSunken, RoundedCornerShape(8.dp))
-                .border(1.dp, c.border, RoundedCornerShape(8.dp))
-                .padding(horizontal = 12.dp, vertical = 10.dp),
-        ) {
-            Text(
-                text = text,
-                style = RageType.body.copy(fontSize = 13.5.sp),
-                color = c.fgPrimary,
-            )
-        }
-    }
-}

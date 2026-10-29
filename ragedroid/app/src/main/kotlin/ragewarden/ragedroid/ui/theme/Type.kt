@@ -157,12 +157,6 @@ object RageType {
         lineHeight = 18.sp,
         letterSpacing = (-0.01).em,
     )
-    val monoLarge = TextStyle(
-        fontFamily = Mono,
-        fontWeight = FontWeight.Medium,
-        fontSize = 18.sp,
-        lineHeight = 22.sp,
-    )
     val button = TextStyle(
         fontFamily = Sans,
         fontWeight = FontWeight.SemiBold,

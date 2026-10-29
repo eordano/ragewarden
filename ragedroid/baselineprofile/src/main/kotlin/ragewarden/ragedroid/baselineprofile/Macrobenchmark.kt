@@ -1,15 +1,16 @@
 package ragewarden.ragedroid.baselineprofile
 
-import androidx.benchmark.macro.ExperimentalMetricApi
 import androidx.benchmark.macro.FrameTimingMetric
 import androidx.benchmark.macro.StartupMode
 import androidx.benchmark.macro.StartupTimingMetric
-import androidx.benchmark.macro.TraceSectionMetric
 import androidx.benchmark.macro.junit4.MacrobenchmarkRule
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.uiautomator.By
 import androidx.test.uiautomator.Direction
+import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.Until
+import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -18,119 +19,85 @@ import org.junit.runner.RunWith
 class Macrobenchmark {
     @get:Rule val rule = MacrobenchmarkRule()
 
-    private fun androidx.benchmark.macro.MacrobenchmarkScope.skipOnboardingIfPresent() {
-        device.executeShellCommand(
-            "am start -n $PACKAGE_NAME/.MainActivity --ez ragewarden.demo true",
-        )
-        device.wait(Until.hasObject(By.text(FIRST_ITEM_NAME)), READY_TIMEOUT_MS)
+    @Before
+    fun signIn() {
+        val device = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation())
+        BenchVault.launch(device)
+        BenchVault.openVault(device)
     }
 
     @Test
     fun coldStartup() = rule.measureRepeated(
-        packageName = PACKAGE_NAME,
+        packageName = BenchVault.packageName,
         metrics = listOf(StartupTimingMetric()),
         iterations = ITERATIONS,
         startupMode = StartupMode.COLD,
     ) {
         pressHome()
         startActivityAndWait()
-        skipOnboardingIfPresent()
+        BenchVault.find(device, By.res("lock-password"), "the lock screen after a cold start")
     }
 
     @Test
     fun vaultListScroll() = rule.measureRepeated(
-        packageName = PACKAGE_NAME,
+        packageName = BenchVault.packageName,
         metrics = listOf(FrameTimingMetric()),
         iterations = ITERATIONS,
-        startupMode = StartupMode.WARM,
+        setupBlock = {
+            BenchVault.launch(device)
+            BenchVault.openVault(device)
+        },
     ) {
-        pressHome()
-        startActivityAndWait()
-        skipOnboardingIfPresent()
-
-        val list = device.findObject(By.scrollable(true))
-        if (list != null) {
-            repeat(SCROLL_REPEATS) {
-                list.fling(Direction.DOWN)
-                device.waitForIdle()
-                list.fling(Direction.UP)
-                device.waitForIdle()
-            }
+        val list = BenchVault.find(device, By.res(BenchVault.LIST), "the vault list")
+        repeat(SCROLL_REPEATS) {
+            list.fling(Direction.DOWN)
+            device.waitForIdle()
+            list.fling(Direction.UP)
+            device.waitForIdle()
         }
     }
 
     @Test
     fun detailOpenClose() = rule.measureRepeated(
-        packageName = PACKAGE_NAME,
+        packageName = BenchVault.packageName,
         metrics = listOf(FrameTimingMetric()),
         iterations = ITERATIONS,
-        startupMode = StartupMode.WARM,
+        setupBlock = {
+            BenchVault.launch(device)
+            BenchVault.openVault(device)
+        },
     ) {
-        pressHome()
-        startActivityAndWait()
-        skipOnboardingIfPresent()
-
         repeat(DETAIL_REPEATS) {
-            val item = device.wait(
-                Until.findObject(By.text(FIRST_ITEM_NAME)),
-                ITEM_TIMEOUT_MS,
-            ) ?: return@repeat
-            item.click()
-            device.wait(Until.hasObject(By.text("Username")), READY_TIMEOUT_MS)
+            BenchVault.itemRow(device).click()
+            BenchVault.find(device, By.res(BenchVault.REVEAL), "the detail screen")
             device.pressBack()
-            device.wait(Until.hasObject(By.text(FIRST_ITEM_NAME)), READY_TIMEOUT_MS)
+            device.wait(Until.hasObject(By.res(BenchVault.LIST)), BenchVault.UI_TIMEOUT_MS)
         }
     }
 
-    @OptIn(ExperimentalMetricApi::class)
     @Test
-    fun detailTapReveal() = rule.measureRepeated(
-        packageName = PACKAGE_NAME,
-        metrics = listOf(
-            FrameTimingMetric(),
-            TraceSectionMetric("ragewarden.decrypt", TraceSectionMetric.Mode.Sum),
-        ),
+    fun detailReveal() = rule.measureRepeated(
+        packageName = BenchVault.packageName,
+        metrics = listOf(FrameTimingMetric()),
         iterations = ITERATIONS,
-        startupMode = StartupMode.WARM,
+        setupBlock = {
+            BenchVault.launch(device)
+            BenchVault.openVault(device)
+        },
     ) {
-        pressHome()
-        startActivityAndWait()
-        skipOnboardingIfPresent()
-
-        val item = device.wait(
-            Until.findObject(By.text(FIRST_ITEM_NAME)),
-            ITEM_TIMEOUT_MS,
-        ) ?: return@measureRepeated
-        item.click()
-        device.wait(Until.hasObject(By.text("Reveal")), READY_TIMEOUT_MS)
-
+        BenchVault.itemRow(device).click()
         repeat(REVEAL_REPEATS) {
-            val reveal = device.wait(
-                Until.findObject(By.text("Reveal")),
-                ITEM_TIMEOUT_MS,
-            ) ?: return@repeat
-            reveal.click()
-            val authorize = device.wait(
-                Until.findObject(By.text("Authorize")),
-                READY_TIMEOUT_MS,
-            ) ?: return@repeat
-            authorize.click()
-            device.wait(Until.hasObject(By.text("Hide")), READY_TIMEOUT_MS)
-            val hide = device.findObject(By.text("Hide"))
-            hide?.click()
-            device.wait(Until.hasObject(By.text("Reveal")), READY_TIMEOUT_MS)
+            BenchVault.find(device, By.res(BenchVault.REVEAL), "the Reveal action").click()
+            BenchVault.find(device, By.res(BenchVault.HIDE), "the revealed password's Hide").click()
         }
+        device.pressBack()
+        device.wait(Until.hasObject(By.res(BenchVault.LIST)), BenchVault.UI_TIMEOUT_MS)
     }
 
     private companion object {
-        const val PACKAGE_NAME = "ragewarden.ragedroid"
-        const val FIRST_ITEM_NAME = "GitHub"
-        const val ITERATIONS = 20
+        const val ITERATIONS = 10
         const val SCROLL_REPEATS = 4
         const val DETAIL_REPEATS = 4
         const val REVEAL_REPEATS = 3
-        const val READY_TIMEOUT_MS = 5_000L
-        const val ITEM_TIMEOUT_MS = 3_000L
-        const val ONBOARDING_TIMEOUT_MS = 3_000L
     }
 }

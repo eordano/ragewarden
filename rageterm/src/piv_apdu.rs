@@ -58,6 +58,9 @@ pub const SW_REFERENCE_NOT_FOUND: u16 = 0x6A88;
 pub const SW_FILE_NOT_FOUND: u16 = 0x6A82;
 pub const SW_INS_NOT_SUPPORTED: u16 = 0x6D00;
 pub const SW_CONDITIONS_NOT_SATISFIED: u16 = 0x6985;
+/// "Security-related issue": what CanoKey answers when the presence wait for a
+/// touch-policy slot times out.
+pub const SW_SECURITY_ISSUE: u16 = 0x6600;
 /// Both are "this card has never heard of that command". Seen instead of
 /// `6D00` on some readers/applets for the Yubico extensions.
 pub const SW_FUNCTION_NOT_SUPPORTED: u16 = 0x6A81;
@@ -115,9 +118,7 @@ pub fn pin_retries_from_sw(sw: u16) -> Option<u8> {
 
 pub fn peer_key_len(algorithm: u8) -> usize {
     match algorithm {
-        // SEC1 uncompressed point 04 || X || Y.
         ALG_ECC_P256 => 65,
-        // Raw little-endian u-coordinate.
         ALG_X25519 => 32,
         _ => 0,
     }
@@ -155,10 +156,8 @@ pub fn general_authenticate_ecdh(
     if data.len() < 256 {
         apdu.push(data.len() as u8);
         apdu.extend_from_slice(&data);
-        // Le=0: accept up to 256 response bytes.
         apdu.push(0x00);
     } else {
-        // Extended-length APDU.
         apdu.push(0x00);
         apdu.push((data.len() >> 8) as u8);
         apdu.push((data.len() & 0xFF) as u8);
@@ -229,10 +228,10 @@ impl TouchPolicy {
         }
     }
 
-    /// True only when a touch is genuinely part of the operation. `Cached`
-    /// counts: the first use inside the window really does wait for a finger.
-    pub fn requires_touch(self) -> bool {
-        matches!(self, TouchPolicy::Always | TouchPolicy::Cached)
+    /// True only when every operation waits for a finger. `Cached` does not:
+    /// a touch in the last ~15 seconds covers the next use.
+    pub fn touch_every_use(self) -> bool {
+        matches!(self, TouchPolicy::Always)
     }
 
     /// True when the card told us, in a byte we understand, what it will do.
@@ -309,6 +308,37 @@ pub fn more_data_available(sw: u16) -> Option<u8> {
 }
 
 /// Pull the shared secret out of `7C L 82 L <secret>`.
+const TAG_CHALLENGE: u8 = 0x81;
+
+/// GENERAL AUTHENTICATE with a challenge (0x81) template -- ECDSA signing. For
+/// P-256 the challenge is the 32-byte SHA-256 digest; the card answers with a
+/// DER signature in an 0x82 response template.
+pub fn general_authenticate_sign(slot: u8, digest: &[u8; 32]) -> Vec<u8> {
+    let mut inner = vec![TAG_RESPONSE, 0x00, TAG_CHALLENGE, digest.len() as u8];
+    inner.extend_from_slice(digest);
+    let mut data = vec![TAG_DYNAMIC_AUTH];
+    data.extend_from_slice(&encode_len(inner.len()));
+    data.extend_from_slice(&inner);
+    let mut apdu = vec![
+        0x00,
+        INS_GENERAL_AUTHENTICATE,
+        ALG_ECC_P256,
+        slot,
+        data.len() as u8,
+    ];
+    apdu.extend_from_slice(&data);
+    apdu.push(0x00);
+    apdu
+}
+
+pub fn parse_sign_response(body: &[u8]) -> Result<Vec<u8>, ApduError> {
+    let template = tlv_find(body, TAG_DYNAMIC_AUTH)
+        .ok_or_else(|| ApduError::Tlv("no 0x7C dynamic authentication template".into()))?;
+    Ok(tlv_find(template, TAG_RESPONSE)
+        .ok_or_else(|| ApduError::Tlv("no 0x82 signature inside 0x7C".into()))?
+        .to_vec())
+}
+
 pub fn parse_ecdh_response(body: &[u8], expected_len: usize) -> Result<Vec<u8>, ApduError> {
     let template = tlv_find(body, TAG_DYNAMIC_AUTH)
         .ok_or_else(|| ApduError::Tlv("no 0x7C dynamic authentication template".into()))?;
@@ -342,7 +372,6 @@ pub fn tlv_find(data: &[u8], tag: u8) -> Option<&[u8]> {
         let t = data[i];
         i += 1;
         if t & 0x1F == 0x1F {
-            // Multi-byte tag: not used by PIV auth templates.
             return None;
         }
         if i >= data.len() {
@@ -410,7 +439,6 @@ mod tests {
     fn x25519_general_authenticate_matches_hand_encoding() {
         let peer = [0xAAu8; 32];
         let apdu = general_authenticate_ecdh(ALG_X25519, 0x9D, &peer).unwrap();
-        // 00 87 E1 9D Lc 7C 24 82 00 85 20 <32> 00
         assert_eq!(&apdu[..4], &[0x00, 0x87, 0xE1, 0x9D]);
         assert_eq!(apdu[4], 38);
         assert_eq!(&apdu[5..11], &[0x7C, 0x24, 0x82, 0x00, 0x85, 0x20]);
@@ -504,12 +532,11 @@ mod tests {
 
     #[test]
     fn metadata_policy_is_pin_then_touch() {
-        // 0x02 = PIN policy "once", 0x02 = touch policy "always".
         let meta = parse_slot_metadata(&metadata_body(0x02, 0x02)).unwrap();
         assert_eq!(meta.algorithm, Some(ALG_X25519));
         assert_eq!(meta.pin_policy, 0x02);
         assert_eq!(meta.touch_policy, TouchPolicy::Always);
-        assert!(meta.touch_policy.requires_touch());
+        assert!(meta.touch_policy.touch_every_use());
     }
 
     #[test]
@@ -522,35 +549,30 @@ mod tests {
 
     #[test]
     fn only_always_and_cached_count_as_a_touch() {
-        // The bug this guards: `ykman piv keys generate` leaves a slot at
-        // "never", the ECDH returns instantly, and the UI claims a tap.
-        assert!(!TouchPolicy::Never.requires_touch());
-        assert!(!TouchPolicy::Default.requires_touch());
-        assert!(TouchPolicy::Always.requires_touch());
-        assert!(TouchPolicy::Cached.requires_touch());
+        assert!(!TouchPolicy::Never.touch_every_use());
+        assert!(!TouchPolicy::Default.touch_every_use());
+        assert!(TouchPolicy::Always.touch_every_use());
+        assert!(!TouchPolicy::Cached.touch_every_use());
     }
 
     #[test]
     fn an_unrecognised_policy_byte_fails_closed() {
         let meta = parse_slot_metadata(&metadata_body(0x02, 0x7F)).unwrap();
         assert_eq!(meta.touch_policy, TouchPolicy::Unknown(0x7F));
-        assert!(!meta.touch_policy.requires_touch());
+        assert!(!meta.touch_policy.touch_every_use());
         assert!(!meta.touch_policy.is_known());
-        assert!(!TouchPolicy::Unavailable.requires_touch());
+        assert!(!TouchPolicy::Unavailable.touch_every_use());
         assert!(!TouchPolicy::Unavailable.is_known());
     }
 
     #[test]
     fn metadata_without_a_policy_element_is_rejected() {
-        // Algorithm and origin only: nothing here says anything about a touch.
         let body = vec![0x01, 0x01, ALG_X25519, 0x03, 0x01, 0x01];
         assert!(matches!(parse_slot_metadata(&body), Err(ApduError::Tlv(_))));
     }
 
     #[test]
     fn a_one_byte_policy_element_is_rejected_rather_than_read_as_touch() {
-        // If this were read positionally, the PIN policy byte 0x02 ("once")
-        // would be mistaken for touch policy 0x02 ("always").
         let body = vec![0x02, 0x01, 0x02];
         assert!(matches!(parse_slot_metadata(&body), Err(ApduError::Tlv(_))));
     }

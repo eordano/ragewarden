@@ -39,18 +39,21 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.data.VaultBridge
 import ragewarden.ragedroid.data.toUiRecipient
 import ragewarden.ragedroid.di.appEntryPoint
 import ragewarden.ragedroid.model.Recipient
 import ragewarden.ragedroid.model.VaultItem
 import ragewarden.ragedroid.model.VaultItemKind
+import ragewarden.ragedroid.ui.components.SelectionBox
 import ragewarden.ragedroid.ui.components.AppBar
 import ragewarden.ragedroid.ui.components.IconBtn
 import ragewarden.ragedroid.ui.components.Mono
@@ -58,6 +61,8 @@ import ragewarden.ragedroid.ui.components.RageButton
 import ragewarden.ragedroid.ui.components.RecipientPip
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
+import ragewarden.ragedroid.ui.uiQuantity
+import ragewarden.ragedroid.ui.uiString
 
 private enum class BulkStep { SelectItems, PickRecipients, Progress }
 
@@ -113,14 +118,14 @@ fun BulkProtectScreen(
     Column(modifier = Modifier.fillMaxSize().background(c.background)) {
         AppBar(
             title = when (step) {
-                BulkStep.SelectItems -> "Protect unprotected items"
-                BulkStep.PickRecipients -> "Pick recipients"
-                BulkStep.Progress -> if (complete) "Done" else "Protecting..."
+                BulkStep.SelectItems -> stringResource(R.string.protect_unprotected_items)
+                BulkStep.PickRecipients -> stringResource(R.string.pick_recipients)
+                BulkStep.Progress -> if (complete) stringResource(R.string.done) else stringResource(R.string.protecting)
             },
             leading = {
                 IconBtn(
                     icon = Icons.AutoMirrored.Outlined.ArrowBack,
-                    contentDescription = "Back",
+                    contentDescription = stringResource(R.string.back),
                     onClick = {
                         when {
                             running -> Unit
@@ -178,7 +183,7 @@ fun BulkProtectScreen(
                             val result = withContext(Dispatchers.IO) {
                                 runCatching {
                                     val item = progressRows[i].item
-                                    val pt = backend.decrypt(item.id, emptyList())
+                                    val pt = backend.decrypt(item.id, emptyList(), null)
                                     backend.update(item.copy(rage = true), pt)
                                 }
                             }
@@ -187,7 +192,7 @@ fun BulkProtectScreen(
                             } else {
                                 progressRows[i].copy(
                                     status = ItemProtectStatus.Failed,
-                                    error = result.exceptionOrNull()?.message ?: "Unknown error",
+                                    error = result.exceptionOrNull()?.message ?: uiString(R.string.unknown_error),
                                 )
                             }
                             processed = i + 1
@@ -207,9 +212,9 @@ fun BulkProtectScreen(
                     val failed = progressRows.count { it.status == ItemProtectStatus.Failed }
                     val succeeded = progressRows.size - failed
                     if (failed == 0) {
-                        onToast("Protected $succeeded item${if (succeeded == 1) "" else "s"}")
+                        onToast(uiQuantity(R.plurals.protected_items, succeeded, succeeded))
                     } else {
-                        onToast("Protected $succeeded, $failed failed")
+                        onToast(uiString(R.string.protected_failed, succeeded, failed))
                     }
                     onComplete()
                 },
@@ -255,7 +260,7 @@ private fun SelectItemsStep(
                     modifier = Modifier.size(18.dp),
                 )
                 Text(
-                    text = if (allSelected) "Deselect all" else "Select all",
+                    text = if (allSelected) stringResource(R.string.deselect_all) else stringResource(R.string.select_all),
                     style = RageType.button,
                     color = c.accent,
                 )
@@ -266,7 +271,7 @@ private fun SelectItemsStep(
                     .padding(horizontal = 10.dp, vertical = 4.dp),
             ) {
                 Text(
-                    text = "${selectedIds.size} of ${items.size} selected",
+                    text = stringResource(R.string.of_selected, selectedIds.size, items.size),
                     style = RageType.caption.copy(fontSize = 12.sp),
                     color = c.fgEmphasis,
                 )
@@ -276,7 +281,7 @@ private fun SelectItemsStep(
         if (items.isEmpty()) {
             Spacer(modifier = Modifier.weight(1f))
             Text(
-                text = "All items are already rage-protected.",
+                text = stringResource(R.string.all_items_are_already_rage_protected),
                 style = RageType.body.copy(fontSize = 15.sp),
                 color = c.fgSecondary,
                 modifier = Modifier.fillMaxWidth(),
@@ -300,7 +305,7 @@ private fun SelectItemsStep(
 
         Spacer(modifier = Modifier.height(12.dp))
         RageButton(
-            label = "Next",
+            label = stringResource(R.string.next),
             onClick = onNext,
             icon = Icons.Outlined.Shield,
             fullWidth = true,
@@ -328,7 +333,7 @@ private fun ItemSelectRow(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        Checkbox(on = selected)
+        SelectionBox(on = selected)
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = item.name,
@@ -338,44 +343,16 @@ private fun ItemSelectRow(
                 overflow = TextOverflow.Ellipsis,
             )
             val subtitle = when (item.kind) {
-                VaultItemKind.Login -> item.username.ifBlank { "Login" }
-                VaultItemKind.Card -> "Card"
-                VaultItemKind.Note -> "Secure note"
-                VaultItemKind.Identity -> "Identity"
-                VaultItemKind.SshKey -> "SSH key"
+                VaultItemKind.Login -> item.username.ifBlank { stringResource(R.string.login) }
+                VaultItemKind.Card -> stringResource(R.string.card)
+                VaultItemKind.Note -> stringResource(R.string.secure_note)
+                VaultItemKind.Identity -> stringResource(R.string.identity)
+                VaultItemKind.SshKey -> stringResource(R.string.ssh_key)
             }
             Text(
                 text = subtitle,
                 style = RageType.caption.copy(fontSize = 11.5.sp),
                 color = c.fgSecondary,
-            )
-        }
-    }
-}
-
-@Composable
-private fun Checkbox(on: Boolean) {
-    val c = rageColors
-    Box(
-        modifier = Modifier
-            .size(22.dp)
-            .background(
-                if (on) c.accent else androidx.compose.ui.graphics.Color.Transparent,
-                RoundedCornerShape(4.dp),
-            )
-            .border(
-                1.5.dp,
-                if (on) c.accent else c.border,
-                RoundedCornerShape(4.dp),
-            ),
-        contentAlignment = Alignment.Center,
-    ) {
-        if (on) {
-            Icon(
-                imageVector = Icons.Outlined.Check,
-                contentDescription = null,
-                tint = c.background,
-                modifier = Modifier.size(14.dp),
             )
         }
     }
@@ -397,7 +374,7 @@ private fun PickRecipientsStep(
             .padding(start = 16.dp, end = 16.dp, top = 6.dp, bottom = 16.dp),
     ) {
         Text(
-            text = "Encrypt $selectedItemCount item${if (selectedItemCount == 1) "" else "s"} to the selected recipients.",
+            text = androidx.compose.ui.res.pluralStringResource(R.plurals.encrypt_items_to_selected_recipients, selectedItemCount, selectedItemCount),
             style = RageType.body.copy(fontSize = 15.sp, lineHeight = 22.sp),
             color = c.fgPrimary,
             modifier = Modifier.padding(bottom = 12.dp),
@@ -422,7 +399,7 @@ private fun PickRecipientsStep(
                         .padding(top = 2.dp),
                 )
                 Text(
-                    text = "At least two recipients recommended. With only one, losing that key means losing access.",
+                    text = stringResource(R.string.at_least_two_recipients_recommended_with),
                     style = RageType.body.copy(fontSize = 13.sp, lineHeight = 18.sp),
                     color = c.fgPrimary,
                 )
@@ -446,7 +423,7 @@ private fun PickRecipientsStep(
 
         Spacer(modifier = Modifier.height(12.dp))
         RageButton(
-            label = "Begin · ${selectedIds.size} recipient${if (selectedIds.size == 1) "" else "s"}",
+            label = androidx.compose.ui.res.pluralStringResource(R.plurals.begin_with_recipients, selectedIds.size, selectedIds.size),
             onClick = onBegin,
             icon = Icons.Outlined.Lock,
             fullWidth = true,
@@ -474,7 +451,7 @@ private fun RecipientSelectRow(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        Checkbox(on = selected)
+        SelectionBox(on = selected)
         RecipientPip(kind = recipient.kind)
         Column(modifier = Modifier.weight(1f)) {
             Text(
@@ -521,12 +498,12 @@ private fun ProgressStep(
         Text(
             text = if (complete) {
                 if (failedCount == 0) {
-                    "$succeededCount of $total protected"
+                    stringResource(R.string.of_protected, succeededCount, total)
                 } else {
-                    "$succeededCount protected, $failedCount failed"
+                    stringResource(R.string.protected_failed_2, succeededCount, failedCount)
                 }
             } else {
-                "$processed of $total protected"
+                stringResource(R.string.of_protected, processed, total)
             },
             style = RageType.caption.copy(fontSize = 13.sp),
             color = c.fgSecondary,
@@ -562,7 +539,7 @@ private fun ProgressStep(
                         modifier = Modifier.size(20.dp),
                     )
                     Text(
-                        text = "All items are now rage-protected.",
+                        text = stringResource(R.string.all_items_are_now_rage_protected),
                         style = RageType.body.copy(fontSize = 14.sp),
                         color = c.fgEmphasis,
                     )
@@ -571,7 +548,7 @@ private fun ProgressStep(
 
             Spacer(modifier = Modifier.height(12.dp))
             RageButton(
-                label = "Done",
+                label = stringResource(R.string.done),
                 onClick = onDone,
                 icon = Icons.Outlined.Check,
                 fullWidth = true,

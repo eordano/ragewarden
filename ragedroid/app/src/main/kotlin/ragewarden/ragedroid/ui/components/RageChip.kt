@@ -1,5 +1,7 @@
 package ragewarden.ragedroid.ui.components
 
+import ragewarden.ragedroid.R
+import androidx.compose.ui.res.stringResource
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
@@ -42,7 +44,7 @@ fun RageChip(
             modifier = Modifier.size(11.dp),
         )
         Text(
-            text = "RAGE",
+            text = stringResource(R.string.rage),
             style = RageType.eyebrow.copy(
                 fontSize = 10.5.sp,
                 letterSpacing = 0.04.em,
@@ -51,7 +53,7 @@ fun RageChip(
         )
         if (recipientCount != null) {
             Text(
-                text = "· $recipientCount",
+                text = stringResource(R.string.dot_count, recipientCount),
                 style = RageType.eyebrow.copy(
                     fontSize = 10.5.sp,
                     letterSpacing = 0.04.em,

@@ -3,70 +3,56 @@ const BUILD_FLAGS = Object.freeze(Object.assign(
     (typeof globalThis !== 'undefined' && globalThis.__RAGEWARDEN_BUILD_FLAGS) || {},
 ));
 
-const STORAGE_LOCAL_KEY = 'ragewarden:sessionEnvelope';
-const STORAGE_SESSION_KEY = 'ragewarden:envelopeKey';
 const NATIVE_HOST_NAME = 'com.ragewarden.host';
+const AUTOLOCK_ALARM = 'ragewarden-autolock';
+const CLIPBOARD_ALARM = 'ragewarden-clipboard-clear';
+const OFFSCREEN_DOC = 'glue/offscreen-clipboard.html';
 
-let wasmModulePromise = null;
+/*
+ * Glue modules are shared with the extension pages. A Chromium service worker
+ * cannot call import(), so build.mjs prepends static imports and parks them on
+ * globalThis.__ragewardenBgModules; Firefox's event page loads them on demand.
+ */
+const MODULE_PATHS = Object.freeze({
+    wasm: 'wasm/ragemanifest.js',
+    storage: 'glue/storage.js',
+    match: 'glue/origin-match.js',
+    receipts: 'glue/receipt-check.js',
+    inventory: 'glue/inventory.js',
+    passkeys: 'glue/passkey-store.js',
+    relay: 'glue/prf-relay.js',
+});
+const modulePromises = {};
+
+function getModule(name) {
+    const pre = globalThis.__ragewardenBgModules;
+    if (pre && pre[name]) return Promise.resolve(pre[name]);
+    if (!modulePromises[name]) {
+        modulePromises[name] = import(chrome.runtime.getURL(MODULE_PATHS[name]));
+    }
+    return modulePromises[name];
+}
+
+let wasmReady = null;
+async function getWasm() {
+    const mod = await getModule('wasm');
+    if (!wasmReady) {
+        wasmReady = typeof mod.default === 'function'
+            ? mod.default({ module_or_path: chrome.runtime.getURL('wasm/ragemanifest_bg.wasm') })
+            : Promise.resolve();
+    }
+    await wasmReady;
+    return mod;
+}
+
 let cachedSessionPromise = null;
 let cachedSnapshot = null;
+let inFlightSnapshot = null;
 
-async function getWasm() {
-    if (!wasmModulePromise) {
-        const url = chrome.runtime.getURL('wasm/ragemanifest.js');
-        wasmModulePromise = (async () => {
-            const mod = await import(url);
-            if (typeof mod.default === 'function') {
-                await mod.default(chrome.runtime.getURL('wasm/ragemanifest_bg.wasm'));
-            }
-            return mod;
-        })();
+async function getSession() {
+    if (!cachedSessionPromise) {
+        cachedSessionPromise = getModule('storage').then(s => s.loadSession()).catch(() => null);
     }
-    return wasmModulePromise;
-}
-
-function bytesToB64(bytes) {
-    let s = '';
-    for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-    return btoa(s);
-}
-function b64ToBytes(b64) {
-    const s = atob(b64);
-    const out = new Uint8Array(s.length);
-    for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
-    return out;
-}
-
-async function chromeStorageGet(area, key) {
-    return new Promise((resolve, reject) => {
-        try {
-            area.get([key], items => {
-                const err = chrome.runtime.lastError;
-                if (err) reject(new Error(err.message)); else resolve(items?.[key] ?? null);
-            });
-        } catch (e) { reject(e); }
-    });
-}
-
-async function loadSessionFromDisk() {
-    const env = await chromeStorageGet(chrome.storage.local, STORAGE_LOCAL_KEY);
-    if (!env || env.v !== 1) return null;
-    const rawKeyB64 = await chromeStorageGet(chrome.storage.session, STORAGE_SESSION_KEY);
-    if (!rawKeyB64) return null;
-    try {
-        const keyBytes = b64ToBytes(rawKeyB64);
-        const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, false, ['decrypt']);
-        const pt = new Uint8Array(await crypto.subtle.decrypt(
-            { name: 'AES-GCM', iv: b64ToBytes(env.iv) }, key, b64ToBytes(env.ct),
-        ));
-        return JSON.parse(new TextDecoder().decode(pt));
-    } catch {
-        return null;
-    }
-}
-
-function getSession() {
-    if (!cachedSessionPromise) cachedSessionPromise = loadSessionFromDisk();
     return cachedSessionPromise;
 }
 
@@ -75,20 +61,39 @@ function invalidateSession() {
     cachedSnapshot = null;
     inFlightSnapshot = null;
     for (const id of Array.from(pendingTaps.keys())) {
-        settleTap(id, { ok: false, error: 'session invalidated while awaiting a hardware tap' });
+        settleTap(id, { ok: false, error: 'session changed while awaiting a hardware tap' });
     }
 }
 
-let inFlightSnapshot = null;
+if (chrome.storage && chrome.storage.onChanged) {
+    chrome.storage.onChanged.addListener((changes, area) => {
+        if ((area === 'local' && changes['ragewarden:sessionEnvelope'])
+            || (area === 'session' && changes['ragewarden:envelopeKey'])
+            || (area === 'local' && changes['ragewarden:passkey-recipient'])
+            || (area === 'local' && changes['ragewarden:software-identity'])) {
+            invalidateSession();
+        }
+    });
+}
 
 async function fetchSnapshot(force = false) {
     if (cachedSnapshot && !force) return cachedSnapshot;
     if (inFlightSnapshot && !force) return inFlightSnapshot;
     inFlightSnapshot = (async () => {
         const session = await getSession();
-        if (!session) throw new Error('not signed in');
+        if (!session) throw new Error('Ragewarden is locked');
         const wasm = await getWasm();
-        const snap = await wasm.wasm_fetch_vault(session);
+        const { localIdentityInventory } = await getModule('inventory');
+        const inventory = await localIdentityInventory(wasm, session, {
+            nativeCapable: typeof chrome.runtime.connectNative === 'function',
+        });
+        const snap = await wasm.wasm_fetch_vault_with_identities(session, inventory);
+        if (snap && snap.refreshed_session) {
+            try {
+                await (await getModule('storage')).saveSession(snap.refreshed_session);
+            } catch {}
+            cachedSessionPromise = Promise.resolve(snap.refreshed_session);
+        }
         cachedSnapshot = snap;
         return snap;
     })();
@@ -99,42 +104,17 @@ async function fetchSnapshot(force = false) {
     }
 }
 
+async function ciphersForOrigin(snapshot, origin) {
+    const { ciphersForOrigin: match } = await getModule('match');
+    return match((snapshot && snapshot.ciphers) || [], origin);
+}
+
 function originHost(originOrUrl) {
     try {
         return new URL(originOrUrl).hostname.toLowerCase();
     } catch {
         return String(originOrUrl || '').toLowerCase();
     }
-}
-
-function eTld1Hint(host) {
-    if (!host) return '';
-    const parts = host.split('.');
-    if (parts.length <= 2) return host;
-    return parts.slice(-2).join('.');
-}
-
-function ciphersForOrigin(snapshot, origin) {
-    const host = originHost(origin);
-    const baseDomain = eTld1Hint(host);
-    const out = [];
-    for (const c of snapshot.ciphers || []) {
-        if (c.kind && c.kind !== 'login') continue;
-        const candidate = (c.site || '').toLowerCase();
-        if (!candidate) continue;
-        const candHost = originHost(candidate.startsWith('http') ? candidate : `https://${candidate}`);
-        if (!candHost) continue;
-        if (candHost === host || candHost === baseDomain || host.endsWith(`.${candHost}`)) {
-            out.push({
-                id: c.id,
-                name: c.name,
-                username: c.username || null,
-                site: c.site || null,
-                rage: !!c.rage,
-            });
-        }
-    }
-    return out;
 }
 
 const TAP_PAGE = 'tap.html';
@@ -161,9 +141,6 @@ function settleTap(requestId, result) {
 
 function brokerHardwareTap(request) {
     if (!chrome.windows || typeof chrome.windows.create !== 'function') {
-        // content.js prints this string verbatim into the page, so it carries the
-        // one thing the reader can act on. Why the worker cannot raise the window
-        // itself is a fact about service workers, not about their login.
         return Promise.resolve({
             ok: false,
             error: 'Use the Ragewarden extension popup to authorize this.',
@@ -229,6 +206,19 @@ function isTapPageSender(sender) {
         && (sender.url || '').startsWith(chrome.runtime.getURL(TAP_PAGE));
 }
 
+/**
+ * Where a fill lands, as the tap window names it. A login form inside a frame is
+ * named by the frame's own origin -- the one its ciphers were matched against --
+ * and by the page that embeds it.
+ */
+function frameDestination(sender, origin) {
+    const host = originHost(origin);
+    if (!sender.frameId) return host;
+    let top = '';
+    try { top = new URL(sender.tab && sender.tab.url ? sender.tab.url : '').hostname.toLowerCase(); } catch {}
+    return top && top !== host ? `${host} (in a frame on ${top})` : host;
+}
+
 function senderOrigin(sender) {
     if (!sender) return '';
     if (sender.origin) return sender.origin;
@@ -239,7 +229,63 @@ function senderOrigin(sender) {
     }
 }
 
-async function maybeNativeHostUnwrap(stanza, context) {
+/*
+ * The last reader of a receipt decides. The tap page checked these receipts,
+ * but they crossed a message port to get here, so every one is re-validated
+ * against the request this window was opened for: real backend (or an allowed
+ * mock), user presence and verification read back out of authenticatorData, a
+ * challenge bound to this action/item/destination, and -- when this profile
+ * stored the credential's public key at enrolment -- the signature itself.
+ */
+async function validateReceipts(receipts, request) {
+    const { verifyReceipt, publicKeysFromRecords } = await getModule('receipts');
+    const { loadAllPasskeyRecipients } = await getModule('passkeys');
+    const publicKeys = publicKeysFromRecords(await loadAllPasskeyRecipients());
+    const purpose = {
+        action: request.action, destination: request.destination,
+        cipherId: request.cipherId, origin: request.origin,
+    };
+    for (const r of receipts) {
+        await verifyReceipt(r, {
+            allowMock: BUILD_FLAGS.allowMockTap === true, request: purpose, publicKeys,
+        });
+    }
+}
+
+/*
+ * Safari has no native-messaging host manifests: runtime.sendNativeMessage
+ * reaches the extension's own app (safari-host-app), whose handler relays the
+ * same framed request to the rageterm it bundles and returns its reply.
+ */
+function safariRelay() {
+    return typeof chrome.runtime.connectNative !== 'function'
+        && typeof chrome.runtime.sendNativeMessage === 'function';
+}
+
+function relayToApp(message) {
+    return new Promise((resolve) => {
+        let done = false;
+        const timer = setTimeout(() => { if (!done) { done = true; resolve(null); } }, TAP_TIMEOUT_MS);
+        try {
+            chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, message, (reply) => {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                resolve(reply || null);
+            });
+        } catch {
+            done = true;
+            clearTimeout(timer);
+            resolve(null);
+        }
+    });
+}
+
+async function maybeNativeHostUnwrap(stanza, context, challenge = '') {
+    if (safariRelay()) {
+        const msg = await relayToApp({ method: 'unwrap_stanza', stanza, context, challenge });
+        return msg && msg.ok && msg.file_key ? { fileKeyB64: msg.file_key, tap: msg.tap } : null;
+    }
     if (!chrome.runtime.connectNative) return null;
     return new Promise((resolve) => {
         let port;
@@ -250,16 +296,17 @@ async function maybeNativeHostUnwrap(stanza, context) {
             return;
         }
         let settled = false;
-        const finish = (value) => { if (!settled) { settled = true; try { port.disconnect(); } catch {} resolve(value); } };
+        let timer = null;
+        const finish = (value) => {
+            if (settled) return;
+            settled = true;
+            if (timer) clearTimeout(timer);
+            try { port.disconnect(); } catch {}
+            resolve(value);
+        };
         port.onMessage.addListener(msg => {
-            // Forward `tap` as well as the key. The host's attestation block
-            // (rageterm TapAttestation: backend/touched/verified/device/slot/at)
-            // is what glue/hardware-tap.js turns into a receipt, and
-            // assertReceiptIsRealTap refuses a native unwrap that arrives
-            // without one. Dropping it here -- as this line did -- makes every
-            // hardware unlock fail closed with "the native host replied without
-            // a `tap` block", which is safe but indistinguishable from having
-            // no key at all.
+            // The host's `tap` attestation is what glue/hardware-tap.js turns
+            // into a receipt; without it every native unlock fails closed.
             if (msg && msg.ok && msg.file_key) {
                 finish({ fileKeyB64: msg.file_key, tap: msg.tap });
             }
@@ -273,11 +320,100 @@ async function maybeNativeHostUnwrap(stanza, context) {
                 method: 'unwrap_stanza',
                 stanza,
                 context,
+                challenge,
             });
         } catch {
             finish(null);
         }
-        setTimeout(() => finish(null), 30_000);
+        timer = setTimeout(() => finish(null), TAP_TIMEOUT_MS);
+    });
+}
+
+async function lockNow() {
+    try { await (await getModule('storage')).lockSession(); } catch {}
+    invalidateSession();
+}
+
+if (chrome.alarms) {
+    chrome.alarms.create(AUTOLOCK_ALARM, { periodInMinutes: 1 });
+    chrome.alarms.onAlarm.addListener(async (alarm) => {
+        if (alarm.name === AUTOLOCK_ALARM) {
+            try {
+                if (await (await getModule('storage')).lockIfIdle()) invalidateSession();
+            } catch {}
+        } else if (alarm.name === CLIPBOARD_ALARM) {
+            await clearClipboardFromWorker();
+        }
+    });
+}
+
+if (chrome.idle && chrome.idle.onStateChanged) {
+    chrome.idle.onStateChanged.addListener((state) => {
+        if (state === 'locked') lockNow();
+    });
+}
+
+async function ensureOffscreenClipboard() {
+    if (!chrome.offscreen) return false;
+    const url = chrome.runtime.getURL(OFFSCREEN_DOC);
+    if (chrome.runtime.getContexts) {
+        const existing = await chrome.runtime.getContexts({
+            contextTypes: ['OFFSCREEN_DOCUMENT'], documentUrls: [url],
+        });
+        if (existing && existing.length > 0) return true;
+    }
+    try {
+        await chrome.offscreen.createDocument({
+            url: OFFSCREEN_DOC,
+            reasons: ['CLIPBOARD'],
+            justification: 'Overwrite a copied secret after the clipboard timeout.',
+        });
+    } catch (e) {
+        if (!/single offscreen/i.test(String(e && e.message))) throw e;
+    }
+    return true;
+}
+
+/*
+ * Runs in the worker, so the wipe happens even after the popup that copied
+ * the secret has closed. Chromium writes from an offscreen document; Firefox's
+ * event page has a DOM of its own.
+ */
+async function clearClipboardFromWorker() {
+    try {
+        if (await ensureOffscreenClipboard()) {
+            await chrome.runtime.sendMessage({ target: 'offscreen-clipboard', kind: 'clear' });
+            try { await chrome.offscreen.closeDocument(); } catch {}
+            return true;
+        }
+        if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(' ');
+            return true;
+        }
+        if (typeof document !== 'undefined' && document.body) {
+            const ta = document.createElement('textarea');
+            ta.value = ' ';
+            document.body.appendChild(ta);
+            ta.select();
+            const ok = document.execCommand('copy');
+            ta.remove();
+            return ok;
+        }
+    } catch (e) {
+        console.warn('[ragewarden] clipboard clear failed:', e);
+    }
+    return false;
+}
+
+let relayBroker = null;
+async function relay() {
+    if (!relayBroker) relayBroker = (await getModule('relay')).createRelayBroker({ tabs: chrome.tabs });
+    return relayBroker;
+}
+
+if (chrome.tabs && chrome.tabs.onRemoved) {
+    chrome.tabs.onRemoved.addListener((tabId) => {
+        if (relayBroker) relayBroker.tabClosed(tabId);
     });
 }
 
@@ -287,12 +423,10 @@ async function handleMessage(msg, sender) {
         return { ok: false, error: 'rejected: message did not originate from this extension' };
     }
     const fromTab = !!(sender && sender.tab) && !isExtensionPageSender(sender);
-    if (fromTab && sender.frameId !== undefined && sender.frameId !== 0) {
-        return { ok: false, error: 'rejected: subframe senders may not drive the vault' };
-    }
     const EXTENSION_PAGE_ONLY = new Set([
-        'vault.status', 'vault.fetch', 'vault.invalidate', 'vault.enroll', 'native.probe',
+        'vault.status', 'vault.fetch', 'vault.invalidate', 'vault.lock', 'native.probe',
         'native.unwrap', 'tap.claim', 'tap.complete', 'tap.fail',
+        'clipboard.scheduleClear', 'clipboard.cancelClear', 'relay.prf',
     ]);
     if (EXTENSION_PAGE_ONLY.has(msg.kind) && !isExtensionPageSender(sender)) {
         return { ok: false, error: `rejected: ${msg.kind} is not available to content scripts` };
@@ -308,7 +442,7 @@ async function handleMessage(msg, sender) {
         }
         case 'vault.fetch': {
             const session = await getSession();
-            if (!session) return { ok: false, error: 'not signed in' };
+            if (!session) return { ok: false, error: 'Ragewarden is locked' };
             const snap = await fetchSnapshot(!!msg.force);
             return {
                 ok: true,
@@ -325,14 +459,16 @@ async function handleMessage(msg, sender) {
             }
             try {
                 const snap = await fetchSnapshot();
-                return { ok: true, matches: ciphersForOrigin(snap, origin) };
+                return { ok: true, matches: await ciphersForOrigin(snap, origin) };
             } catch (err) {
                 return { ok: false, error: (err && err.message) || String(err) };
             }
         }
         case 'vault.unlock': {
             const session = await getSession();
-            if (!session) return { ok: false, error: 'not signed in' };
+            if (!session) {
+                return { ok: false, error: 'Ragewarden is locked -- unlock it from the toolbar' };
+            }
             const action = msg.action || 'autofill';
             const cipherId = msg.cipherId;
             if (!cipherId) return { ok: false, error: 'cipherId required' };
@@ -352,7 +488,7 @@ async function handleMessage(msg, sender) {
             if (!cipher) return { ok: false, error: `unknown cipher ${cipherId}` };
 
             if (fromTab) {
-                const allowed = ciphersForOrigin(snap, origin).some(c => c.id === cipherId);
+                const allowed = (await ciphersForOrigin(snap, origin)).some(c => c.id === cipherId);
                 if (!allowed) {
                     return {
                         ok: false,
@@ -360,8 +496,9 @@ async function handleMessage(msg, sender) {
                     };
                 }
             }
+            try { await (await getModule('storage')).touchSession(); } catch {}
 
-            const destination = fromTab ? originHost(origin) : (msg.destination || '');
+            const destination = fromTab ? frameDestination(sender, origin) : (msg.destination || '');
             const result = await brokerHardwareTap({
                 action,
                 cipherId,
@@ -385,23 +522,6 @@ async function handleMessage(msg, sender) {
                 ceremony: result.ceremony,
             };
         }
-        case 'vault.enroll': {
-            // Enrolment runs its WebAuthn ceremonies in the focused tap window
-            // (the side panel is not a reliable WebAuthn context). No cipher and
-            // no plaintext are involved -- the window returns an enrollment
-            // record which the caller publishes to the registry.
-            const result = await brokerHardwareTap({
-                action: 'enroll',
-                destination: 'this browser',
-                cipherName: msg.label || 'Primary passkey',
-                rpId: msg.rpId || null,
-                label: msg.label || 'Primary passkey',
-            });
-            if (!result.ok) {
-                return { ok: false, error: result.error || 'enrolment did not complete' };
-            }
-            return { ok: true, enrollment: result.enrollment };
-        }
         case 'tap.claim': {
             if (!isTapPageSender(sender)) {
                 return { ok: false, error: 'rejected: tap.claim is only for the tap page' };
@@ -418,19 +538,6 @@ async function handleMessage(msg, sender) {
             }
             const entry = pendingTaps.get(msg.requestId);
             if (!entry) return { ok: false, error: 'no such authorization request' };
-            // Enrolment returns a record, not plaintext, so it does not go through
-            // the receipt/plaintext gate below (there is no secret to release).
-            if (entry.request && entry.request.action === 'enroll') {
-                if (!msg.enrollment) {
-                    settleTap(msg.requestId, {
-                        ok: false,
-                        error: 'enrolment produced no record',
-                    });
-                    return { ok: false, error: 'no enrollment payload' };
-                }
-                settleTap(msg.requestId, { ok: true, enrollment: msg.enrollment });
-                return { ok: true };
-            }
             const receipts = Array.isArray(msg.receipts) ? msg.receipts : [];
             if (receipts.length === 0) {
                 settleTap(msg.requestId, {
@@ -439,14 +546,20 @@ async function handleMessage(msg, sender) {
                 });
                 return { ok: false, error: 'no tap receipt' };
             }
-            const mock = receipts.some(r => r && r.mock === true);
+            try {
+                await validateReceipts(receipts, entry.request);
+            } catch (err) {
+                const error = `refusing to release plaintext: ${(err && err.message) || err}`;
+                settleTap(msg.requestId, { ok: false, error });
+                return { ok: false, error };
+            }
             settleTap(msg.requestId, {
                 ok: true,
                 plaintext: msg.plaintext,
                 ceremony: {
                     taps: receipts.length,
-                    mock,
-                    backends: receipts.map(r => (r && r.backend) || 'unknown'),
+                    mock: receipts.some(r => r && r.mock === true),
+                    backends: receipts.map(r => (r && (r.tapBackend || r.backend)) || 'unknown'),
                 },
             });
             return { ok: true };
@@ -465,12 +578,46 @@ async function handleMessage(msg, sender) {
             invalidateSession();
             return { ok: true };
         }
+        case 'vault.lock': {
+            await lockNow();
+            return { ok: true };
+        }
+        case 'clipboard.scheduleClear': {
+            const seconds = Math.min(Math.max(Number(msg.seconds) || 30, 5), 600);
+            const when = Date.now() + seconds * 1000;
+            if (chrome.alarms) chrome.alarms.create(CLIPBOARD_ALARM, { when });
+            else setTimeout(clearClipboardFromWorker, seconds * 1000);
+            return { ok: true, clearAt: when };
+        }
+        case 'clipboard.cancelClear': {
+            if (chrome.alarms) chrome.alarms.clear(CLIPBOARD_ALARM);
+            return { ok: true };
+        }
         case 'native.probe': {
+            if (safariRelay()) {
+                const reply = await relayToApp({ method: 'probe' });
+                return { ok: true, available: !!reply, host: NATIVE_HOST_NAME, ...(reply || {}) };
+            }
             const ok = typeof chrome.runtime.connectNative === 'function';
             return { ok: true, available: ok, host: NATIVE_HOST_NAME };
         }
+        case 'relay.prf': {
+            const value = await (await relay()).request({
+                purpose: msg.purpose || {},
+                credentials: Array.isArray(msg.credentials) ? msg.credentials : [],
+                action: String(msg.action || ''),
+                destination: String(msg.destination || ''),
+            });
+            return { ok: true, ...value };
+        }
+        // From relay-content.js; the broker checks the tab, its URL and the nonce.
+        case 'relay.hello':
+            return { ok: true, request: await (await relay()).hello(msg, sender) };
+        case 'relay.result':
+            await (await relay()).result(msg, sender);
+            return { ok: true };
         case 'native.unwrap': {
-            const fk = await maybeNativeHostUnwrap(msg.stanza || {}, msg.context || {});
+            const fk = await maybeNativeHostUnwrap(msg.stanza || {}, msg.context || {}, msg.challenge || '');
             return { ok: !!fk, ...(fk || {}) };
         }
         default:
@@ -479,6 +626,7 @@ async function handleMessage(msg, sender) {
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg && msg.target === 'offscreen-clipboard') return false;
     handleMessage(msg, sender).then(r => sendResponse(r)).catch(err => {
         sendResponse({ ok: false, error: (err && err.message) || String(err) });
     });
@@ -495,11 +643,22 @@ if (chrome.runtime.onStartup) {
     });
 }
 
-
+// test-hooks:begin
 if (BUILD_FLAGS.testHooks === true) {
     self.__ragewardenBackground = {
         handleMessage,
         ciphersForOrigin,
         invalidateSession,
+        validateReceipts,
+        clearClipboardFromWorker,
+        relay,
     };
+    // WebDriver BiDi may not navigate a tab to moz-extension://, so a test
+    // build opens its own popup in a tab for tests/firefox-bidi.mjs to drive.
+    if (typeof browser !== 'undefined' && typeof browser.runtime.getBrowserInfo === 'function') {
+        browser.runtime.onInstalled.addListener(() => {
+            browser.tabs.create({ url: browser.runtime.getURL('popup/index.html') });
+        });
+    }
 }
+// test-hooks:end

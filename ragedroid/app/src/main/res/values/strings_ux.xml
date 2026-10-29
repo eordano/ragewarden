@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="write_down_a_recovery_phrase">Write down a recovery phrase</string>
+    <string name="setup_complete">Setup complete.</string>
+    <string name="vault_not_protected_yet">Your vault is not protected yet.</string>
+    <string name="done_sync_protected">Your vault is syncing. New items are protected by the keys you enrolled. Existing items stay as they are until you protect them from Settings.</string>
+    <string name="done_sync_unprotected">No key is enrolled yet, so nothing new can be protected.</string>
+    <string name="done_each_secret_needs_key">Each protected secret needs your key to open.</string>
+    <string name="still_to_do">Still to do</string>
+    <string name="todo_add_a_key">Add a key: Settings, then Keys</string>
+    <string name="todo_add_paper_backup">Write down a paper backup: Settings, then Create a new recovery phrase</string>
+    <string name="test_it_now">Test it now</string>
+    <string name="tap_prompt_copy_for_autofill">Copy the password to paste into %1$s?</string>
+    <string name="kdf_argon2id">Argon2id, %1$d MiB, %2$d passes, %3$d lanes</string>
+    <string name="kdf_pbkdf2">PBKDF2-SHA256, %1$s rounds</string>
+    <string name="password_stretching">Password stretching</string>
+    <string name="master_password_stretched_here">Checked on this device (%1$s).</string>
+    <string name="re_encrypt_items">Re-encrypt items</string>
+    <string name="key_list_unreadable_title">This phone\'s key list can\'t be read</string>
+    <string name="key_list_unreadable_body">The list that names this phone\'s keys is encrypted with a hardware key this phone no longer has, for example after a restore or a security reset. Protected items stay safe and your other devices are unaffected. Reset the list, then enrol this phone\'s keys again under Settings, then Keys.</string>
+    <string name="reset_key_list">Reset key list</string>
+    <string name="key_list_reset_done">Key list reset. Enrol this phone\'s keys again.</string>
+    <string name="key_list_unreadable_enrol">This phone\'s key list can\'t be read. Reset it from the warning on the vault screen, then enrol again.</string>
+    <string name="scan_totp_qr_code">Scan TOTP QR code</string>
+    <string name="autofill_unlock_to_fill">Unlock Ragewarden to fill</string>
+</resources>

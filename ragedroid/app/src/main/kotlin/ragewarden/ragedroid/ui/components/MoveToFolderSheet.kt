@@ -1,5 +1,7 @@
 package ragewarden.ragedroid.ui.components
 
+import ragewarden.ragedroid.R
+import androidx.compose.ui.res.stringResource
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -47,15 +49,16 @@ fun MoveToFolderSheet(
     onPick: (FolderOption) -> Unit,
 ) {
     val c = rageColors
-    val resolvedFolders: ImmutableList<FolderOption> = remember(folders) {
+    val unfiled = stringResource(R.string.unfiled)
+    val resolvedFolders: ImmutableList<FolderOption> = remember(folders, unfiled) {
         if (folders.any { it.id == null }) {
             folders
         } else {
-            (listOf(FolderOption(id = null, name = "Unfiled", color = null)) + folders)
+            (listOf(FolderOption(id = null, name = unfiled, color = null)) + folders)
                 .toImmutableList()
         }
     }
-    Sheet(open = open, onDismiss = onClose, title = "Move to folder") {
+    Sheet(open = open, onDismiss = onClose, title = stringResource(R.string.move_to_folder)) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()

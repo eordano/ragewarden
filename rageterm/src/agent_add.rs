@@ -1,5 +1,4 @@
 use std::io::{self, Read, Write};
-use std::time::Duration;
 
 use ssh_key::{Algorithm, EcdsaCurve, PrivateKey};
 use thiserror::Error;
@@ -17,6 +16,7 @@ const MAX_AGENT_REPLY: usize = 256 * 1024;
 pub enum AgentAddError {
     #[error("io: {0}")]
     Io(#[from] io::Error),
+    #[cfg_attr(windows, allow(dead_code))]
     #[error("$SSH_AUTH_SOCK is not set; start a real ssh-agent first")]
     NoAuthSock,
     #[error("not an OpenSSH private key: {0}")]
@@ -94,10 +94,6 @@ fn encode_add_identity(
     comment: &str,
     lifetime_secs: Option<u32>,
 ) -> Result<Zeroizing<Vec<u8>>, AgentAddError> {
-    // Reserved up front rather than grown: a `Vec` that reallocates copies the
-    // key material it already holds into the new block and frees the old one
-    // without wiping it, which `Zeroizing` on the final buffer cannot undo.
-    // 8 KiB clears an RSA-8192 payload, the largest ssh-key will hand us.
     let mut payload: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(8192));
     payload.push(if lifetime_secs.is_some() {
         SSH_AGENTC_ADD_ID_CONSTRAINED
@@ -197,17 +193,12 @@ fn interpret_reply(reply: &[u8]) -> Result<(), AgentAddError> {
 }
 
 fn send_to_agent(payload: &[u8]) -> Result<Vec<u8>, AgentAddError> {
-    let path = std::env::var("SSH_AUTH_SOCK").map_err(|_| AgentAddError::NoAuthSock)?;
-    send_via_socket(&path, payload)
+    let path = std::env::var("SSH_AUTH_SOCK").ok();
+    send_via_socket(path.as_deref(), payload)
 }
 
-#[cfg(unix)]
-fn send_via_socket(path: &str, payload: &[u8]) -> Result<Vec<u8>, AgentAddError> {
-    use std::os::unix::net::UnixStream;
-    let mut sock = UnixStream::connect(path)?;
-    sock.set_read_timeout(Some(Duration::from_secs(10)))?;
-    sock.set_write_timeout(Some(Duration::from_secs(10)))?;
-
+/// One request/reply in the ssh-agent framing (u32 big-endian length + body).
+fn exchange<S: Read + Write>(sock: &mut S, payload: &[u8]) -> Result<Vec<u8>, AgentAddError> {
     let len = (payload.len() as u32).to_be_bytes();
     sock.write_all(&len)?;
     sock.write_all(payload)?;
@@ -226,14 +217,66 @@ fn send_via_socket(path: &str, payload: &[u8]) -> Result<Vec<u8>, AgentAddError>
     Ok(body)
 }
 
-#[cfg(not(unix))]
-fn send_via_socket(_path: &str, _payload: &[u8]) -> Result<Vec<u8>, AgentAddError> {
+#[cfg(unix)]
+fn send_via_socket(path: Option<&str>, payload: &[u8]) -> Result<Vec<u8>, AgentAddError> {
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+    let path = path.ok_or(AgentAddError::NoAuthSock)?;
+    let mut sock = UnixStream::connect(path)?;
+    sock.set_read_timeout(Some(Duration::from_secs(10)))?;
+    sock.set_write_timeout(Some(Duration::from_secs(10)))?;
+    exchange(&mut sock, payload)
+}
+
+/// Windows OpenSSH's agent listens on a named pipe, which opens as a file.
+#[cfg(windows)]
+fn send_via_socket(path: Option<&str>, payload: &[u8]) -> Result<Vec<u8>, AgentAddError> {
+    let path = path.unwrap_or(r"\\.\pipe\openssh-ssh-agent");
+    let mut pipe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    exchange(&mut pipe, payload)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn send_via_socket(_path: Option<&str>, _payload: &[u8]) -> Result<Vec<u8>, AgentAddError> {
     Err(AgentAddError::UnsupportedPlatform)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_agent_exchange_frames_the_request_and_reads_one_reply() {
+        let mut io = std::io::Cursor::new(Vec::new());
+        io.get_mut().extend_from_slice(&[0, 0, 0, 1, 6]);
+        struct Duplex {
+            reply: std::io::Cursor<Vec<u8>>,
+            sent: Vec<u8>,
+        }
+        impl Read for Duplex {
+            fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+                self.reply.read(b)
+            }
+        }
+        impl Write for Duplex {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.sent.extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut d = Duplex {
+            reply: io,
+            sent: Vec::new(),
+        };
+        assert_eq!(exchange(&mut d, &[17, 1]).unwrap(), vec![6]);
+        assert_eq!(d.sent, vec![0, 0, 0, 2, 17, 1]);
+    }
 
     #[test]
     fn write_string_prefixes_length() {

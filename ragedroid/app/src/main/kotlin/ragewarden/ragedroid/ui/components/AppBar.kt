@@ -1,5 +1,7 @@
 package ragewarden.ragedroid.ui.components
 
+import ragewarden.ragedroid.R
+import androidx.compose.ui.res.stringResource
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -23,6 +25,11 @@ import androidx.compose.ui.unit.dp
 import ragewarden.ragedroid.ui.theme.RageTheme
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
+
+@Composable
+fun BackButton(onBack: () -> Unit) {
+    IconBtn(icon = Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = stringResource(R.string.back), onClick = onBack)
+}
 
 @Composable
 fun AppBar(

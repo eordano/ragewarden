@@ -121,9 +121,8 @@ class EditItemRecipientsTest {
         composeRule.onNodeWithText(box.name).assertDoesNotExist()
         // ...and it says so, rather than implying the item has no recipients.
         composeRule.onNodeWithText(
-            "Any one of these can decrypt. 2 software or paper recipient(s) are also " +
-                "wrapped in -- age headers do not name those, so they cannot be listed. " +
-                "Editing the recipient set lands with multi-recipient encrypt.",
+            "Any one of these can open it. 2 software or paper key(s) can open it too, " +
+                "but an item does not record which, so they cannot be listed here.",
         ).assertIsDisplayed()
     }
 

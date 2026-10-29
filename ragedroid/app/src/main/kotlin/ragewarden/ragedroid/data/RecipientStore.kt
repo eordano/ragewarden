@@ -1,5 +1,6 @@
 package ragewarden.ragedroid.data
 
+import ragewarden.ragedroid.identities.PasskeyRp
 import android.content.Context
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -34,6 +35,8 @@ data class StoredRecipient(
     val passkeyCredentialId: ByteArray? = null,
     val passkeyRpId: String? = null,
     val passkeySalt: ByteArray? = null,
+    /** The passkey's own P-256 public key, SPKI DER, published so a browser can verify its assertions. */
+    val passkeyPublicKeySpki: ByteArray? = null,
     val recoveryArmoredPubkey: String? = null,
     /**
      * True when the Keystore key was generated with
@@ -42,6 +45,8 @@ data class StoredRecipient(
      * that cannot enforce a physical action.
      */
     val keystoreAuthBound: Boolean? = null,
+    /** The auth-bound key asks for authentication on every use (API 35+), not once per 30 seconds. */
+    val keystorePerUse: Boolean = false,
     /**
      * True when this recipient's "hardware" is simulated. Mock recipients are
      * never published to the cross-device registry
@@ -53,6 +58,29 @@ data class StoredRecipient(
 ) {
     override fun equals(other: Any?): Boolean = other is StoredRecipient && other.id == id
     override fun hashCode(): Int = id.hashCode()
+
+    /**
+     * A passkey this app enrolled as [RecipientKind.Fido2] -- every one before
+     * the PasskeyPrf kind was used -- as a [RecipientKind.PasskeyPrf]: new
+     * wraps use `webauthn-prf-v1`. The `fido2*` fields stay, so the
+     * `fido2-hmac` stanzas already written to it keep opening until the items
+     * are re-encrypted.
+     */
+    fun migratedToPasskeyPrf(): StoredRecipient {
+        check(kind == RecipientKind.Fido2) { "only a Fido2-kind passkey moves to PasskeyPrf" }
+        return copy(
+            kind = RecipientKind.PasskeyPrf,
+            passkeyCredentialId = passkeyCredentialId ?: fido2CredentialId,
+            passkeyRpId = passkeyRpId ?: fido2RpId,
+            passkeySalt = passkeySalt ?: fido2Salt,
+        )
+    }
+
+    /** A credential stored without its RP id was made for [PasskeyRp.LEGACY_ID]. */
+    fun withRpDefaults(): StoredRecipient = copy(
+        fido2RpId = fido2RpId ?: PasskeyRp.LEGACY_ID.takeIf { fido2CredentialId?.isNotEmpty() == true },
+        passkeyRpId = passkeyRpId ?: PasskeyRp.LEGACY_ID.takeIf { passkeyCredentialId?.isNotEmpty() == true },
+    )
 }
 
 class RecipientStore(context: Context) {
@@ -161,20 +189,46 @@ class RecipientStore(context: Context) {
         }
     }
 
+    private val unreadableAccounts = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    fun isUnreadable(accountId: String): Boolean = accountId in unreadableAccounts
+
     private fun loadAll(accountId: String?): List<StoredRecipient> {
         if (accountId.isNullOrBlank()) return emptyList()
-        val raw = prefs.getString(prefKey(accountId), null) ?: return emptyList()
-        return runCatching { JSON.decodeFromString<List<StoredRecipient>>(raw) }.getOrDefault(emptyList())
+        val raw = try {
+            prefs.getString(prefKey(accountId), null)
+        } catch (e: StoreUnreadableException) {
+            unreadableAccounts += accountId
+            return emptyList()
+        } ?: return emptyList()
+        return try {
+            decodeStored(raw).also { unreadableAccounts -= accountId }
+        } catch (e: Exception) {
+            unreadableAccounts += accountId
+            emptyList()
+        }
     }
 
     private fun save(accountId: String, list: List<StoredRecipient>) {
+        if (accountId in unreadableAccounts) {
+            throw StoreUnreadableException("recipients", IllegalStateException("refusing to overwrite an unreadable recipient list"))
+        }
         prefs.putString(prefKey(accountId), JSON.encodeToString(list))
+    }
+
+    fun resetUnreadable(accountId: String) {
+        prefs.remove(prefKey(accountId))
+        unreadableAccounts -= accountId
+        if (accountId == activeAccountId) _flow.value = emptyList()
     }
 
     private fun prefKey(accountId: String): String = "recipients:$accountId"
 
     companion object {
         private val JSON = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+
+        internal fun decodeStored(raw: String): List<StoredRecipient> =
+            JSON.decodeFromString<List<StoredRecipient>>(raw).map(StoredRecipient::withRpDefaults)
         private const val EXPECTED_KEYSTORE_PUBKEY_LEN = 33
     }
 }

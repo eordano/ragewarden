@@ -1,7 +1,7 @@
 use std::io::{self, Read, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use ragewarden_core::Stanza;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -36,6 +36,10 @@ pub enum Request {
         stanza: WireStanza,
         #[serde(default)]
         context: RequestContext,
+        /// native-unwrap-proof-v1: base64 of 32 fresh bytes the device signs
+        /// together with the stanza (see `native_proof`).
+        #[serde(default)]
+        challenge: Option<String>,
     },
     /// "What can you serve, and can any of it prove a touch?" -- answered
     /// without opening a credential, without a notification and without asking
@@ -52,6 +56,8 @@ pub struct RequestContext {
     pub action: String,
     #[serde(default)]
     pub domain: String,
+    #[serde(default)]
+    pub destination: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,8 +92,8 @@ impl TapBackend {
     /// `webauthn-prf-v1` reply from this host could only ever have come from
     /// somewhere other than a FIDO2 device.
     pub fn for_tag(tag: &str) -> Self {
-        use ragewarden_core::stanza_format::{TAG_FIDO2_HMAC, TAG_PIV_P256};
-        if tag == TAG_PIV_P256 {
+        use ragewarden_core::stanza_format::{TAG_FIDO2_HMAC, TAG_PIV_P256, TAG_PIV_X25519_V2};
+        if tag == TAG_PIV_P256 || tag == TAG_PIV_X25519_V2 {
             TapBackend::PivP256
         } else if tag == TAG_FIDO2_HMAC {
             TapBackend::Fido2Hmac
@@ -119,6 +125,10 @@ pub struct TapAttestation {
     pub device: String,
     pub slot: String,
     pub at: u64,
+    /// The device's signature over the request's challenge, when it holds a
+    /// P-256 key to sign with (a P-256 PIV slot).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof: Option<crate::native_proof::UnwrapProof>,
 }
 
 fn unix_millis() -> u64 {
@@ -213,7 +223,11 @@ fn handle_payload(payload: &[u8]) -> String {
 
 fn dispatch(req: Request) -> Response {
     match req {
-        Request::UnwrapStanza { stanza, context } => match unwrap_stanza(stanza, &context) {
+        Request::UnwrapStanza {
+            stanza,
+            context,
+            challenge,
+        } => match unwrap_stanza(stanza, &context, challenge.as_deref()) {
             Ok((file_key_b64, tap)) => Response::ok(file_key_b64, tap),
             Err(e) => Response::err(e.to_string()),
         },
@@ -229,8 +243,16 @@ fn dispatch(req: Request) -> Response {
 /// the whole vault in a loop, unattended (`DESIGN.md` §6 assumed a tap that did
 /// not exist). The host now refuses those tags.
 fn tag_is_hardware_gated(tag: &str) -> bool {
-    use ragewarden_core::stanza_format::{TAG_FIDO2_HMAC, TAG_PIV_P256, TAG_WEBAUTHN_PRF_V1};
-    matches!(tag, t if t == TAG_PIV_P256 || t == TAG_FIDO2_HMAC || t == TAG_WEBAUTHN_PRF_V1)
+    use ragewarden_core::stanza_format::{
+        TAG_FIDO2_HMAC, TAG_PIV_P256, TAG_PIV_X25519_V2, TAG_WEBAUTHN_PRF_V1,
+    };
+    [
+        TAG_PIV_P256,
+        TAG_PIV_X25519_V2,
+        TAG_FIDO2_HMAC,
+        TAG_WEBAUTHN_PRF_V1,
+    ]
+    .contains(&tag)
 }
 
 /// Escape hatch for a deliberately software-only installation. Off by default;
@@ -245,7 +267,18 @@ fn software_unwrap_allowed() -> bool {
 fn unwrap_stanza(
     wire: WireStanza,
     context: &RequestContext,
+    challenge: Option<&str>,
 ) -> Result<(String, TapAttestation), NativeHostError> {
+    let proof_message = challenge.map(|c| {
+        crate::native_proof::message(
+            c,
+            &wire.tag,
+            &wire.args,
+            &wire.body,
+            &context.action,
+            &context.destination,
+        )
+    });
     let body = B64.decode(wire.body.as_bytes())?;
     let stanza = Stanza {
         tag: wire.tag,
@@ -253,10 +286,6 @@ fn unwrap_stanza(
         body,
     };
 
-    // `mock_enabled()` turns every PIV / FIDO2 ceremony in this process into a
-    // file read, so the hardware allowance above would be handing out file keys
-    // with no touch after all. Same escape hatch, deliberately the same one: an
-    // operator who sets both env vars knows there is no device.
     if crate::hw::mock_enabled() && !software_unwrap_allowed() {
         return Err(NativeHostError::ConsentUnavailable(format!(
             "refusing to serve native-messaging unwraps while {}=1: the PIV / FIDO2 \
@@ -279,18 +308,18 @@ fn unwrap_stanza(
         )));
     }
 
-    // Read the device's own account of what it is about to do, *before* the
-    // ceremony text and before the unwrap. GET METADATA needs neither PIN nor
-    // touch, so this cannot itself be mistaken for the gate; it is the only
-    // honest source for "is a finger genuinely part of this?", and reading it
-    // afterwards would let a card swapped mid-operation write its own receipt.
     let evidence = DeviceEvidence::gather(&stanza);
+    if !software_unwrap_allowed() {
+        if let Some(why) = evidence.why_no_touch_can_be_attested() {
+            return Err(NativeHostError::ConsentUnavailable(format!(
+                "refusing to unwrap: {why}. Nothing physical would confirm this request, so \
+                 it is not served. Use a slot with touch policy `always` or a FIDO2 key, or \
+                 set {ALLOW_SOFTWARE_ENV}=1 in the browser's environment to accept \
+                 unconfirmed unwraps deliberately."
+            )));
+        }
+    }
 
-    // Advisory only, and only for the hardware path: the consent is the touch
-    // that `PivIdentity` / `FidoIdentity` block on next. A failed notification
-    // used to be discarded silently while the unwrap proceeded regardless; now
-    // the failure is reported on stderr (which the browser captures) and the
-    // gate that matters is unaffected because it is on the device.
     let _ceremony = crate::ceremony::set(crate::ceremony::Ceremony::new(
         pretty_action(if context.action.is_empty() {
             "use"
@@ -304,11 +333,8 @@ fn unwrap_stanza(
             &context.domain
         },
     ));
-    notify_action(context);
+    notify_action(context, &evidence);
 
-    // Belt and braces with the tag check above: even for a hardware-gated tag,
-    // only device-backed identities are offered, so a software or stand-in key
-    // cannot answer a native-messaging request unless the operator opted in.
     let policy = if software_unwrap_allowed() {
         crate::consent::IdentityPolicy::SoftwareAllowed
     } else {
@@ -319,20 +345,27 @@ fn unwrap_stanza(
 
     for id in &identities {
         let started = Instant::now();
-        match id.try_unwrap_stanza(&stanza) {
+        crate::fido::reset_observed_flags();
+        let (unwrapped, signed) = match &proof_message {
+            Some(m) => {
+                crate::native_proof::unwrap_with_proof(m.clone(), || id.try_unwrap_stanza(&stanza))
+            }
+            None => (id.try_unwrap_stanza(&stanza), None),
+        };
+        match unwrapped {
             Ok(Some(file_key)) => {
-                let tap = evidence.seal(started.elapsed(), id.display());
-                if !tap.touched {
-                    // Visible in the browser's native-host stderr capture. A
-                    // file key leaving here with no proof of a touch is not an
-                    // error -- the operator may have asked for exactly that --
-                    // but it should never be silent.
-                    eprintln!(
-                        "rageterm native-host: served a `{}` file key with `touched: false`. \
-                         Nothing in this reply evidences a physical touch; a caller that \
-                         requires one must refuse it.",
+                let mut evidence = evidence.clone();
+                evidence.fido_flags = crate::fido::take_observed_flags();
+                let mut tap = evidence.seal(started.elapsed(), id.display());
+                if !tap.touched && !software_unwrap_allowed() {
+                    return Err(NativeHostError::ConsentUnavailable(format!(
+                        "the `{}` unwrap completed without evidence of a touch, so the key \
+                         is not served",
                         tap.backend.as_str()
-                    );
+                    )));
+                }
+                if let Some(signed) = signed {
+                    tap.proof = Some(signed.into_proof().map_err(NativeHostError::Identities)?);
                 }
                 return Ok((B64.encode(&file_key[..]), tap));
             }
@@ -351,15 +384,9 @@ fn unwrap_stanza(
     ))
 }
 
-// ---------------------------------------------------------------------------
-// Tap attestation
-// ---------------------------------------------------------------------------
-
 /// YubiKey PIV PIN-policy bytes. `piv_apdu` keeps `SlotMetadata::pin_policy`
 /// raw because nothing there needed to interpret it; the meanings are Yubico's
 /// and match the touch-policy encoding one for one.
-const PIN_POLICY_DEFAULT: u8 = 0x00;
-const PIN_POLICY_NEVER: u8 = 0x01;
 const PIN_POLICY_ONCE: u8 = 0x02;
 const PIN_POLICY_ALWAYS: u8 = 0x03;
 
@@ -382,6 +409,9 @@ struct DeviceEvidence {
     /// was never consulted because the path is a software one.
     touch_policy: Option<TouchPolicy>,
     pin_policy: Option<u8>,
+    /// `(user_present, user_verified)` from the FIDO2 assertion that produced
+    /// the key, filled in after the unwrap.
+    fido_flags: Option<(bool, bool)>,
     /// The key material can come from a file: the `mock` stand-in, the software
     /// escape hatch, or an identity that is not device-backed at all. Nails
     /// `touched` and `verified` to false regardless of anything else here.
@@ -396,17 +426,13 @@ impl DeviceEvidence {
             slot: String::new(),
             touch_policy: None,
             pin_policy: None,
+            fido_flags: None,
             software: true,
         }
     }
 
     fn gather(stanza: &Stanza) -> Self {
         let backend = TapBackend::for_tag(&stanza.tag);
-        // The operator opted into unattended unwraps. Whatever answers, this
-        // host cannot vouch for a touch, so the card is not even consulted --
-        // but the identity is still named, because a caller comparing this
-        // reply with a hardware one should see the same fields and differ only
-        // where it matters.
         let forced_software = software_unwrap_allowed();
 
         match backend {
@@ -423,8 +449,6 @@ impl DeviceEvidence {
 
         let mut ev = Self {
             backend: TapBackend::PivP256,
-            // A stand-in has no serial worth printing; its label is the thing
-            // that says NOT REAL HARDWARE, so that is what goes on the wire.
             device: if entry.mock || entry.serial == 0 {
                 entry.label.clone()
             } else {
@@ -433,18 +457,14 @@ impl DeviceEvidence {
             slot: format_slot(entry.slot),
             touch_policy: None,
             pin_policy: None,
-            // A mock identity reads a file in the config directory: a
-            // `piv-p256` stanza opened by no card at all.
+            fido_flags: None,
             software: forced_software || entry.mock,
         };
         if ev.software {
             return ev;
         }
 
-        // Failure here is not fatal: the unwrap can still succeed on a card
-        // that will not describe its own slot. It just cannot be attested, and
-        // `touch_policy: None` says exactly that.
-        match read_piv_slot_facts(entry.slot) {
+        match read_piv_slot_facts(entry.serial, entry.slot) {
             Ok(facts) => {
                 if facts.serial != 0 {
                     ev.device = facts.serial.to_string();
@@ -465,66 +485,54 @@ impl DeviceEvidence {
     }
 
     /// FIDO2 carries its proof in the assertion's authenticatorData UP flag,
-    /// and `fido_ctap::hmac_secret` never looks at it -- `Fido2Device` hands back
-    /// only the 32-byte hmac-secret output, so by the time the key reaches this
-    /// file the flag has been dropped on the floor. Rather than infer a touch
-    /// from "the authenticator answered", this reports what it can prove, which
-    /// is nothing -- so every `fido2-hmac` reply carries `touched: false` and a
-    /// caller that requires a tap will refuse it.
-    ///
-    /// Making FIDO2 attestable is a change one layer down, not here:
-    /// `Fido2Device::hmac_secret` has to return the assertion's UP/UV flags
-    /// alongside the PRF (`ctap_hid_fido2`'s `Assertion` carries them), and
-    /// `FidoIdentity::try_unwrap_stanza` has to carry them back out. Until then
-    /// this stays honest by staying negative.
+    /// which `fido::observe` records; `seal` reads it after the unwrap.
     fn gather_fido(stanza: &Stanza) -> Self {
         let mut ev = Self::software_only(TapBackend::Fido2Hmac);
         if let Some(entry) = find_fido_entry(stanza) {
             ev.device = entry.label;
             ev.slot = entry.credential_id_b64;
+            ev.software = entry.mock || software_unwrap_allowed();
         }
         ev
     }
 
-    // `_blocked_for` is received and deliberately ignored. It stays in the
-    // signature so every caller keeps handing the elapsed time over -- the
-    // comment on the Cached arm below is the reason it must never be read.
+    /// `Some(reason)` when this request cannot end in `touched: true` whatever
+    /// happens next, so the host should not even ask the device.
+    fn why_no_touch_can_be_attested(&self) -> Option<String> {
+        if self.software {
+            return Some("the identity is a software stand-in".into());
+        }
+        match self.backend {
+            TapBackend::Fido2Hmac => None,
+            TapBackend::PivP256 => match self.touch_policy {
+                Some(TouchPolicy::Always) => None,
+                Some(p) => Some(format!(
+                    "PIV slot {} has touch policy `{p}`, which does not wait for a touch on \
+                     every use",
+                    self.slot
+                )),
+                None => Some(format!(
+                    "the touch policy of PIV slot {} could not be read",
+                    self.slot
+                )),
+            },
+            TapBackend::Software => Some("the stanza is not hardware-gated".into()),
+        }
+    }
+
     fn seal(&self, _blocked_for: Duration, answered_by: &str) -> TapAttestation {
         let touched = !self.software
-            && match self.touch_policy {
-                // The card will not do a private-key operation on this slot
-                // without a finger, and it just did one.
-                Some(TouchPolicy::Always) => true,
-                // One touch covers ~15s, so success alone proves nothing -- and
-                // neither does elapsed time. A duration threshold was tried here
-                // (`blocked_for >= CACHED_TOUCH_MIN_BLOCK`) and removed: it can
-                // only ever be wrong in the UNSAFE direction. A card that is
-                // slow for any other reason -- a busy reader, a contended PC/SC
-                // stack, a laptop resuming -- answers late with no finger
-                // involved and would be attested as touched. Every other arm of
-                // this match errs toward refusing an unlock; this one errs
-                // toward releasing a secret, which is not a trade this file gets
-                // to make.
-                //
-                // So `cached` is not attestable, and only `always` is. A user
-                // who wants browser unlocks from a PIV slot should generate it
-                // with `--touch-policy always`; the refusal names that.
-                Some(TouchPolicy::Cached) => false,
-                Some(TouchPolicy::Never)
-                | Some(TouchPolicy::Default)
-                | Some(TouchPolicy::Unknown(_))
-                | Some(TouchPolicy::Unavailable)
-                | None => false,
+            && match self.backend {
+                TapBackend::Fido2Hmac => matches!(self.fido_flags, Some((true, _))),
+                _ => matches!(self.touch_policy, Some(TouchPolicy::Always)),
             };
-        // The card will not do a private-key operation on a PIN-gated slot
-        // until a VERIFY has succeeded, so an unwrap that completed under
-        // `once` or `always` is proof the PIN was entered. `default` and
-        // `never` prove the opposite; an unrecognised byte proves nothing.
         let verified = !self.software
-            && match self.pin_policy {
-                Some(PIN_POLICY_ONCE) | Some(PIN_POLICY_ALWAYS) => true,
-                Some(PIN_POLICY_DEFAULT) | Some(PIN_POLICY_NEVER) => false,
-                Some(_) | None => false,
+            && match self.backend {
+                TapBackend::Fido2Hmac => matches!(self.fido_flags, Some((_, true))),
+                _ => matches!(
+                    self.pin_policy,
+                    Some(PIN_POLICY_ONCE) | Some(PIN_POLICY_ALWAYS)
+                ),
             };
         TapAttestation {
             backend: self.backend,
@@ -537,6 +545,7 @@ impl DeviceEvidence {
             },
             slot: self.slot.clone(),
             at: unix_millis(),
+            proof: None,
         }
     }
 }
@@ -558,10 +567,8 @@ struct PivRegistryEntry {
 /// label, "the first PIV entry" -- would let the attestation describe a
 /// different slot from the one that answered.
 fn find_piv_entry(stanza: &Stanza) -> Option<PivRegistryEntry> {
-    use ragewarden_core::stanza_format::{piv_p256_recipient_tag, piv_recipient_tag};
-    let want = piv_p256_recipient_tag(stanza).ok()?;
     let registry = Identities::load().ok()?;
-    let found = registry.iter_chronological().find_map(|entry| {
+    registry.iter_chronological().find_map(|entry| {
         let IdentityKind::YubiKeyPiv {
             public_key_hex,
             serial,
@@ -571,21 +578,26 @@ fn find_piv_entry(stanza: &Stanza) -> Option<PivRegistryEntry> {
         else {
             return None;
         };
-        let mut pubkey = [0u8; 32];
-        hex::decode_to_slice(public_key_hex, &mut pubkey).ok()?;
-        (piv_recipient_tag(&pubkey) == want).then(|| PivRegistryEntry {
+        let id = crate::piv::PivIdentity {
+            public_key: crate::piv::PivPublicKey::from_hex(public_key_hex).ok()?,
+            serial: *serial,
+            slot: *slot,
+            label: entry.label.clone(),
+            mock: *mock,
+        };
+        id.names(stanza).unwrap_or(false).then(|| PivRegistryEntry {
             serial: *serial,
             slot: *slot,
             mock: *mock,
             label: entry.label.clone(),
         })
-    });
-    found
+    })
 }
 
 struct FidoRegistryEntry {
     label: String,
     credential_id_b64: String,
+    mock: bool,
 }
 
 fn find_fido_entry(stanza: &Stanza) -> Option<FidoRegistryEntry> {
@@ -593,9 +605,11 @@ fn find_fido_entry(stanza: &Stanza) -> Option<FidoRegistryEntry> {
     use ragewarden_core::stanza_format::fido2_hmac_credential_id;
     let want = fido2_hmac_credential_id(stanza).ok()?;
     let registry = Identities::load().ok()?;
-    let found = registry.iter_chronological().find_map(|entry| {
+    registry.iter_chronological().find_map(|entry| {
         let IdentityKind::Fido2HmacSecret {
-            credential_id_b64, ..
+            credential_id_b64,
+            mock,
+            ..
         } = &entry.kind
         else {
             return None;
@@ -604,9 +618,9 @@ fn find_fido_entry(stanza: &Stanza) -> Option<FidoRegistryEntry> {
         (id == want).then(|| FidoRegistryEntry {
             label: entry.label.clone(),
             credential_id_b64: credential_id_b64.clone(),
+            mock: *mock,
         })
-    });
-    found
+    })
 }
 
 struct PivSlotFacts {
@@ -622,8 +636,9 @@ struct PivSlotFacts {
 /// policy shares the same two-byte element and `PivSession` exposes no way to
 /// read it, so the three exchanges are issued here against the transport
 /// directly.
-fn read_piv_slot_facts(slot: u8) -> Result<PivSlotFacts, String> {
-    let mut transport = crate::piv_pcsc::open_first_piv_card().map_err(|e| e.to_string())?;
+fn read_piv_slot_facts(serial: u32, slot: u8) -> Result<PivSlotFacts, String> {
+    let _device = crate::lock::device_session().map_err(|e| e.to_string())?;
+    let mut transport = crate::piv_pcsc::open_piv_card(serial).map_err(|e| e.to_string())?;
 
     let (_, sw) = card_exchange(&mut transport, &apdu::select_piv())?;
     if sw != apdu::SW_OK {
@@ -671,10 +686,6 @@ fn card_exchange(
     }
     Ok((acc, sw))
 }
-
-// ---------------------------------------------------------------------------
-// Probe
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize)]
 pub struct BackendReport {
@@ -789,14 +800,27 @@ fn probe_piv(registry: &Identities, software_fallback: bool, mock_hardware: bool
         return report;
     }
 
-    match read_piv_slot_facts(slot) {
+    match read_piv_slot_facts(serial, slot) {
         Ok(facts) => {
             if facts.serial != 0 {
                 report.device = facts.serial.to_string();
             }
-            report.available = true;
-            report.can_attest_touch = facts.touch_policy.requires_touch();
-            report.detail = format!("slot touch policy is `{}`", facts.touch_policy);
+            let pin_gated = matches!(
+                facts.pin_policy,
+                Some(PIN_POLICY_ONCE) | Some(PIN_POLICY_ALWAYS)
+            );
+            report.can_attest_touch = facts.touch_policy.touch_every_use();
+            if pin_gated && !crate::pin::available() {
+                report.available = false;
+                report.detail = format!(
+                    "slot touch policy is `{}`, and its PIN policy needs a PIN that this host \
+                     cannot ask for: no terminal and no `pinentry` on PATH",
+                    facts.touch_policy
+                );
+            } else {
+                report.available = true;
+                report.detail = format!("slot touch policy is `{}`", facts.touch_policy);
+            }
         }
         Err(e) => {
             report.detail = format!("the card could not be read: {e}");
@@ -814,8 +838,6 @@ fn probe_fido(
         backend: TapBackend::Fido2Hmac,
         enrolled: false,
         available: false,
-        // Never true, and not because no key is plugged in. See
-        // `DeviceEvidence::gather_fido`.
         can_attest_touch: false,
         device: String::new(),
         slot: String::new(),
@@ -852,25 +874,49 @@ fn probe_fido(
         )
     } else if software_fallback {
         format!(
-            "{ALLOW_SOFTWARE_ENV}=1 is set, and separately this host does not read the \
-             assertion's user-presence flag, so no FIDO2 unwrap can be attested"
+            "{ALLOW_SOFTWARE_ENV}=1 is set: replies carry the assertion's user-presence \
+             flag, but this host also serves unconfirmed unwraps"
         )
-    } else {
-        "this host does not read the assertion's authenticatorData user-presence flag \
-         (fido_ctap::hmac_secret returns only the hmac-secret output), so a FIDO2 unwrap \
-         cannot be distinguished from one that skipped the touch. Every FIDO2 reply \
-         reports `touched: false`."
+    } else if !crate::pin::available() {
+        "each unwrap reports the assertion's user-presence flag; an authenticator with a \
+         PIN cannot be used here because there is no terminal and no `pinentry` on PATH"
             .into()
+    } else {
+        "each unwrap reports the assertion's user-presence flag".into()
     };
+    report.can_attest_touch = report.available;
     report
 }
 
-fn notify_action(context: &RequestContext) {
+/// What the notification tells the user to do, which must match what the
+/// device will actually wait for.
+fn notification_body(evidence: &DeviceEvidence) -> String {
+    match (evidence.backend, evidence.why_no_touch_can_be_attested()) {
+        (TapBackend::PivP256, None) => format!(
+            "Touch YubiKey {} (PIV slot {}) now to authorize.",
+            evidence.device, evidence.slot
+        ),
+        (TapBackend::Fido2Hmac, None) => {
+            format!(
+                "Touch your FIDO2 key ({}) now to authorize.",
+                evidence.device
+            )
+        }
+        (_, Some(why)) => {
+            format!("No touch is required ({why}) -- this request is not physically confirmed.")
+        }
+        (TapBackend::Software, None) => {
+            "No touch is required -- this request is not physically confirmed.".into()
+        }
+    }
+}
+
+fn notify_action(context: &RequestContext, evidence: &DeviceEvidence) {
     let summary = action_prompt(context);
-    let body = "Touch your security key to authorize.";
+    let body = notification_body(evidence);
     if let Err(e) = notify_rust::Notification::new()
         .summary(&summary)
-        .body(body)
+        .body(&body)
         .appname("rageterm")
         .show()
     {
@@ -910,6 +956,217 @@ fn pretty_action(action: &str) -> &str {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    fn piv_evidence(policy: Option<TouchPolicy>) -> DeviceEvidence {
+        DeviceEvidence {
+            backend: TapBackend::PivP256,
+            device: "12345".into(),
+            slot: "9d".into(),
+            touch_policy: policy,
+            pin_policy: None,
+            fido_flags: None,
+            software: false,
+        }
+    }
+
+    #[test]
+    fn a_slot_that_does_not_touch_every_use_is_refused_before_the_card_is_asked() {
+        assert!(
+            piv_evidence(Some(TouchPolicy::Always))
+                .why_no_touch_can_be_attested()
+                .is_none()
+        );
+        for p in [
+            Some(TouchPolicy::Cached),
+            Some(TouchPolicy::Never),
+            Some(TouchPolicy::Default),
+            None,
+        ] {
+            assert!(piv_evidence(p).why_no_touch_can_be_attested().is_some());
+        }
+        let mut sw = piv_evidence(Some(TouchPolicy::Always));
+        sw.software = true;
+        assert!(sw.why_no_touch_can_be_attested().is_some());
+    }
+
+    #[test]
+    fn the_notification_names_a_touch_only_when_one_is_coming() {
+        assert!(
+            notification_body(&piv_evidence(Some(TouchPolicy::Always)))
+                .starts_with("Touch YubiKey 12345")
+        );
+        assert!(
+            notification_body(&piv_evidence(Some(TouchPolicy::Never)))
+                .starts_with("No touch is required")
+        );
+        let mut fido = piv_evidence(None);
+        fido.backend = TapBackend::Fido2Hmac;
+        fido.device = "Solo".into();
+        assert!(notification_body(&fido).contains("FIDO2 key (Solo)"));
+    }
+
+    #[test]
+    fn a_fido2_reply_is_touched_only_when_the_assertion_had_up_set() {
+        let mut fido = piv_evidence(None);
+        fido.backend = TapBackend::Fido2Hmac;
+        assert!(!fido.seal(Duration::ZERO, "k").touched);
+        fido.fido_flags = Some((true, false));
+        let tap = fido.seal(Duration::ZERO, "k");
+        assert!(tap.touched && !tap.verified);
+        fido.fido_flags = Some((false, false));
+        assert!(!fido.seal(Duration::ZERO, "k").touched);
+    }
+
+    #[test]
+    fn a_challenged_p256_unwrap_carries_a_proof_the_browser_verifier_accepts() {
+        use crate::identities::{EnrolledIdentity, Identities};
+        use crate::tests_lock::ENV_LOCK;
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        crate::tests_lock::set_var("RAGEWARDEN_CONFIG_DIR", dir.path());
+        crate::tests_lock::set_var(crate::hw::MOCK_ENV, "1");
+        crate::tests_lock::set_var(ALLOW_SOFTWARE_ENV, "1");
+
+        let enrolled = crate::piv::mock_enroll_p256(0x9a).unwrap();
+        let mut ids = Identities::default();
+        ids.insert(EnrolledIdentity {
+            id: "p256".into(),
+            kind: IdentityKind::YubiKeyPiv {
+                public_key_hex: enrolled.public_key.to_hex(),
+                serial: enrolled.serial,
+                slot: enrolled.slot,
+                mock: true,
+            },
+            label: "p256 slot".into(),
+            created: chrono::Utc::now(),
+            last_used: None,
+        });
+        ids.save().unwrap();
+
+        let blob = ragewarden_core::encrypt(
+            b"x",
+            &[ragewarden_core::Recipient::YubiKeyPivP256 {
+                public_key: enrolled.public_key.bytes().to_vec(),
+                serial: enrolled.serial,
+                slot: enrolled.slot,
+            }],
+        )
+        .unwrap();
+        let stanza = ragewarden_core::parse_header_stanzas(&blob)
+            .unwrap()
+            .remove(0);
+        let body_b64 = B64.encode(&stanza.body);
+        let challenge = "c2l4dGVlbi1ieXRlLWNoYWxsZW5nZS4uLi4uLi4uLi4=";
+        let req = serde_json::json!({
+            "method": "unwrap_stanza",
+            "stanza": { "tag": stanza.tag, "args": stanza.args, "body": body_b64 },
+            "context": { "action": "autofill", "destination": "github.com" },
+            "challenge": challenge,
+        });
+        let resp: serde_json::Value =
+            serde_json::from_str(&handle_payload(req.to_string().as_bytes())).unwrap();
+
+        crate::tests_lock::remove_var(ALLOW_SOFTWARE_ENV);
+        crate::tests_lock::remove_var(crate::hw::MOCK_ENV);
+        crate::tests_lock::remove_var("RAGEWARDEN_CONFIG_DIR");
+
+        assert_eq!(resp["ok"], true, "{resp}");
+        let proof: crate::native_proof::UnwrapProof =
+            serde_json::from_value(resp["tap"]["proof"].clone()).unwrap();
+        let spki = crate::native_proof::attestation_key(enrolled.public_key.bytes()).unwrap();
+        let verify = |destination: &str| {
+            let m = crate::native_proof::message(
+                challenge,
+                &stanza.tag,
+                &stanza.args,
+                &body_b64,
+                "autofill",
+                destination,
+            );
+            crate::native_proof::verify(Some(&proof), &m, std::slice::from_ref(&spki))
+        };
+        assert_eq!(verify("github.com"), Ok(true));
+        assert!(
+            verify("evil.example").is_err(),
+            "a proof must not verify for another destination"
+        );
+    }
+
+    #[test]
+    fn a_challenged_fido2_unwrap_carries_an_assertion_proof_the_browser_verifier_accepts() {
+        use crate::identities::{EnrolledIdentity, Identities};
+        use crate::tests_lock::ENV_LOCK;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        crate::tests_lock::set_var("RAGEWARDEN_CONFIG_DIR", dir.path());
+        crate::tests_lock::set_var(crate::hw::MOCK_ENV, "1");
+        crate::tests_lock::set_var(ALLOW_SOFTWARE_ENV, "1");
+
+        let enrolled = crate::fido::mock_enroll("ragewarden").unwrap();
+        let public_key = enrolled.public_key.expect("a mock credential has a key");
+        let mut ids = Identities::default();
+        ids.insert(EnrolledIdentity {
+            id: "fido".into(),
+            kind: IdentityKind::Fido2HmacSecret {
+                credential_id_b64: B64URL.encode(&enrolled.credential_id),
+                salt_hex: hex::encode(enrolled.salt),
+                rp_id: enrolled.rp_id.clone(),
+                mock: true,
+                uv: enrolled.uv,
+                public_key_hex: Some(hex::encode(public_key)),
+            },
+            label: "fido key".into(),
+            created: chrono::Utc::now(),
+            last_used: None,
+        });
+        ids.save().unwrap();
+
+        let recipients = [ragewarden_core::Recipient::Fido2HmacSecret {
+            credential_id: enrolled.credential_id.clone(),
+            salt: enrolled.salt,
+            rp_id: enrolled.rp_id.clone(),
+        }];
+        let outputs = crate::commands::build_prf_outputs_for(&recipients).unwrap();
+        let table = crate::commands::prf_table_from(&outputs);
+        let blob = ragewarden_core::encrypt_with_prf(b"x", &recipients, &table).unwrap();
+        let stanza = ragewarden_core::parse_header_stanzas(&blob)
+            .unwrap()
+            .remove(0);
+        let body_b64 = B64.encode(&stanza.body);
+        let challenge = "ZmlkbzItY2hhbGxlbmdlLWZvci10aGUtdGVzdA==";
+        let req = serde_json::json!({
+            "method": "unwrap_stanza",
+            "stanza": { "tag": stanza.tag, "args": stanza.args, "body": body_b64 },
+            "context": { "action": "autofill", "destination": "github.com" },
+            "challenge": challenge,
+        });
+        let resp: serde_json::Value =
+            serde_json::from_str(&handle_payload(req.to_string().as_bytes())).unwrap();
+
+        crate::tests_lock::remove_var(ALLOW_SOFTWARE_ENV);
+        crate::tests_lock::remove_var(crate::hw::MOCK_ENV);
+        crate::tests_lock::remove_var("RAGEWARDEN_CONFIG_DIR");
+
+        assert_eq!(resp["ok"], true, "{resp}");
+        assert_eq!(resp["tap"]["proof"]["kind"], "fido2-assertion", "{resp}");
+        let proof: crate::native_proof::UnwrapProof =
+            serde_json::from_value(resp["tap"]["proof"].clone()).unwrap();
+        let trusted = [crate::native_proof::attestation_key(&public_key).unwrap()];
+        let verify = |destination: &str| {
+            let m = crate::native_proof::message(
+                challenge,
+                &stanza.tag,
+                &stanza.args,
+                &body_b64,
+                "autofill",
+                destination,
+            );
+            crate::native_proof::verify(Some(&proof), &m, &trusted)
+        };
+        assert_eq!(verify("github.com"), Ok(true));
+        assert!(verify("evil.example").is_err());
+    }
 
     #[test]
     fn frame_roundtrip_little_endian() {
@@ -971,6 +1228,7 @@ mod tests {
         let ctx = RequestContext {
             action: "autofill".into(),
             domain: "github.com".into(),
+            destination: String::new(),
         };
         let s = action_prompt(&ctx);
         assert!(s.contains("Autofill"));
@@ -993,7 +1251,9 @@ mod tests {
         }"#;
         let req: Request = serde_json::from_slice(payload).unwrap();
         match req {
-            Request::UnwrapStanza { stanza, context } => {
+            Request::UnwrapStanza {
+                stanza, context, ..
+            } => {
                 assert_eq!(stanza.tag, "piv-p256");
                 assert_eq!(stanza.args, vec!["a", "b"]);
                 assert_eq!(stanza.body, "AAAA");
@@ -1007,6 +1267,7 @@ mod tests {
     #[test]
     fn hardware_gated_tags_are_exactly_the_device_backed_ones() {
         assert!(tag_is_hardware_gated("piv-p256"));
+        assert!(tag_is_hardware_gated("piv-x25519-v2"));
         assert!(tag_is_hardware_gated("fido2-hmac"));
         assert!(tag_is_hardware_gated("webauthn-prf-v1"));
         assert!(!tag_is_hardware_gated("X25519"));
@@ -1028,19 +1289,19 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let prev_allow = std::env::var_os(ALLOW_SOFTWARE_ENV);
         let prev_mock = std::env::var_os(crate::hw::MOCK_ENV);
-        std::env::remove_var(ALLOW_SOFTWARE_ENV);
-        std::env::remove_var(crate::hw::MOCK_ENV);
+        crate::tests_lock::remove_var(ALLOW_SOFTWARE_ENV);
+        crate::tests_lock::remove_var(crate::hw::MOCK_ENV);
 
         struct Restore(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
         impl Drop for Restore {
             fn drop(&mut self) {
                 match self.0.take() {
-                    Some(v) => std::env::set_var(ALLOW_SOFTWARE_ENV, v),
-                    None => std::env::remove_var(ALLOW_SOFTWARE_ENV),
+                    Some(v) => crate::tests_lock::set_var(ALLOW_SOFTWARE_ENV, v),
+                    None => crate::tests_lock::remove_var(ALLOW_SOFTWARE_ENV),
                 }
                 match self.1.take() {
-                    Some(v) => std::env::set_var(crate::hw::MOCK_ENV, v),
-                    None => std::env::remove_var(crate::hw::MOCK_ENV),
+                    Some(v) => crate::tests_lock::set_var(crate::hw::MOCK_ENV, v),
+                    None => crate::tests_lock::remove_var(crate::hw::MOCK_ENV),
                 }
             }
         }
@@ -1063,6 +1324,7 @@ mod tests {
             slot: "0x9d".into(),
             touch_policy: Some(touch),
             pin_policy: pin,
+            fido_flags: None,
             software: false,
         }
     }
@@ -1074,18 +1336,21 @@ mod tests {
         let long = Duration::from_secs(3);
         let instant = Duration::from_millis(5);
 
-        assert!(hardware_evidence(TouchPolicy::Always, None)
-            .seal(instant, "x")
-            .touched);
-        // `cached` is NOT attestable at any duration. A slow answer proves a
-        // slow reader, not a finger, and guessing from elapsed time is the one
-        // rule here that could be wrong in the direction of releasing a secret.
-        assert!(!hardware_evidence(TouchPolicy::Cached, None)
-            .seal(long, "x")
-            .touched);
-        assert!(!hardware_evidence(TouchPolicy::Cached, None)
-            .seal(instant, "x")
-            .touched);
+        assert!(
+            hardware_evidence(TouchPolicy::Always, None)
+                .seal(instant, "x")
+                .touched
+        );
+        assert!(
+            !hardware_evidence(TouchPolicy::Cached, None)
+                .seal(long, "x")
+                .touched
+        );
+        assert!(
+            !hardware_evidence(TouchPolicy::Cached, None)
+                .seal(instant, "x")
+                .touched
+        );
 
         for policy in [
             TouchPolicy::Cached,
@@ -1100,7 +1365,6 @@ mod tests {
             );
         }
 
-        // The card was never reached at all.
         let mut unread = hardware_evidence(TouchPolicy::Always, None);
         unread.touch_policy = None;
         assert!(!unread.seal(long, "x").touched);
@@ -1128,12 +1392,7 @@ mod tests {
                 .seal(long, "x")
                 .verified
         );
-        for pin in [
-            Some(PIN_POLICY_DEFAULT),
-            Some(PIN_POLICY_NEVER),
-            Some(0x7Fu8),
-            None,
-        ] {
+        for pin in [Some(0x00), Some(0x01), Some(0x7Fu8), None] {
             assert!(
                 !hardware_evidence(TouchPolicy::Always, pin)
                     .seal(long, "x")
@@ -1145,9 +1404,8 @@ mod tests {
     #[test]
     fn the_backend_comes_from_the_stanza_tag_and_never_flatters_a_software_read() {
         assert_eq!(TapBackend::for_tag("piv-p256"), TapBackend::PivP256);
+        assert_eq!(TapBackend::for_tag("piv-x25519-v2"), TapBackend::PivP256);
         assert_eq!(TapBackend::for_tag("fido2-hmac"), TapBackend::Fido2Hmac);
-        // rageterm enrolls no webauthn-prf identity, so a reply for that tag
-        // cannot have come off a FIDO2 device.
         assert_eq!(TapBackend::for_tag("webauthn-prf-v1"), TapBackend::Software);
         assert_eq!(TapBackend::for_tag("X25519"), TapBackend::Software);
         assert_eq!(TapBackend::for_tag("scrypt"), TapBackend::Software);
@@ -1213,7 +1471,6 @@ mod tests {
         assert_eq!(backends.len(), 2);
         assert_eq!(backends[0]["backend"], serde_json::json!("piv-p256"));
         assert_eq!(backends[1]["backend"], serde_json::json!("fido2-hmac"));
-        // No authenticator UP flag is ever read, with or without a device.
         assert_eq!(backends[1]["can_attest_touch"], serde_json::json!(false));
         assert!(v["can_attest_touch"].is_boolean());
         assert!(v["software_fallback"].is_boolean());

@@ -63,6 +63,22 @@ pub enum IdentityKind {
 
         #[serde(default)]
         mock: bool,
+
+        /// Which of the credential's two hmac-secret seeds items are wrapped
+        /// to: `Some(true)` the UV seed (PIN or built-in UV at enrollment),
+        /// `Some(false)` the possession-only seed. Every later wrap and unwrap
+        /// requests the same seed, so setting a PIN afterwards does not lock
+        /// earlier items out. `None` (enrolled before this was recorded)
+        /// follows the authenticator's current configuration.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uv: Option<bool>,
+
+        /// The credential's ES256 public key (uncompressed SEC1, hex): what the
+        /// registry publishes as `attestationPublicKey` and what signs
+        /// native-host proofs. Absent for a credential enrolled before rageterm
+        /// kept it, until `rageterm attest-fido2` recovers it with one touch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        public_key_hex: Option<String>,
     },
 
     OsKeyring {
@@ -151,8 +167,27 @@ impl Identities {
     /// Encryption to a FIDO2 recipient needs the same PRF the decrypter will
     /// see, and the `Recipient` on the wire carries no mock flag, so the answer
     /// has to come from the local enrollment record.
+    /// The verification mode recorded for this credential at enrollment.
+    pub fn fido_uv_mode(&self, credential_id: &[u8]) -> Option<bool> {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
+        self.items.values().find_map(|e| match &e.kind {
+            IdentityKind::Fido2HmacSecret {
+                credential_id_b64,
+                uv,
+                ..
+            } if B64URL
+                .decode(credential_id_b64.as_bytes())
+                .map(|id| id == credential_id)
+                .unwrap_or(false) =>
+            {
+                *uv
+            }
+            _ => None,
+        })
+    }
+
     pub fn is_mock_fido_credential(&self, credential_id: &[u8]) -> bool {
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine};
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
         self.items.values().any(|e| match &e.kind {
             IdentityKind::Fido2HmacSecret {
                 credential_id_b64,
@@ -189,11 +224,31 @@ fn uuid_v4_string() -> String {
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5], bytes[6], bytes[7],
-        bytes[8], bytes[9],
-        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
     )
+}
+
+/// A FIDO2 credential's stored public key, if any.
+pub fn fido_public_key(public_key_hex: &Option<String>) -> Option<[u8; 65]> {
+    hex::decode(public_key_hex.as_deref()?)
+        .ok()?
+        .try_into()
+        .ok()
 }
 
 #[cfg(test)]

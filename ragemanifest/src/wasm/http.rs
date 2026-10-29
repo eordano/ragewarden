@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use ragewarden_core::sync::{HttpBody, HttpClient, HttpError, HttpResponse};
 use send_wrapper::SendWrapper;
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Request, RequestInit, Response};
 
@@ -80,7 +80,17 @@ async fn do_request(
             .set("content-type", ct)
             .map_err(|e| HttpError::Transport(format!("set content-type: {}", js_err_msg(&e))))?;
     }
-    for (k, v) in &headers {
+    // Vaultwarden and Bitwarden withhold SSH key items from a client that does not
+    // say it is new enough to read them; rageterm sends the same pair.
+    let client_headers = [
+        ("bitwarden-client-version", "2025.1.0"),
+        ("bitwarden-client-name", "ragemanifest"),
+    ];
+    let pairs = client_headers
+        .iter()
+        .map(|(k, v)| (*k, *v))
+        .chain(headers.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    for (k, v) in pairs {
         header_obj
             .set(k, v)
             .map_err(|e| HttpError::Transport(format!("set {k}: {}", js_err_msg(&e))))?;

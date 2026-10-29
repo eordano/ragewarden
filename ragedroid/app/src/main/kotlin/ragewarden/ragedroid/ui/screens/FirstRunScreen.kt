@@ -1,11 +1,16 @@
 package ragewarden.ragedroid.ui.screens
 
+import androidx.compose.ui.platform.testTag
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.defaultMinSize
+import androidx.compose.material.icons.outlined.PriorityHigh
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -33,10 +38,8 @@ import androidx.compose.material.icons.outlined.KeyboardArrowDown
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.Nfc
 import androidx.compose.material.icons.outlined.Usb
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -49,11 +52,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
@@ -62,24 +62,23 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import ragewarden.ragedroid.data.BitwardenVaultRepository
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.data.SessionStore
 import ragewarden.ragedroid.data.StoredRecipient
 import ragewarden.ragedroid.data.VaultBridge
 import ragewarden.ragedroid.di.appEntryPoint
 import ragewarden.ragedroid.identities.enrollKeystoreIdentity
 import ragewarden.ragedroid.identities.enrollPasskeyWithPrf
-import ragewarden.ragedroid.identities.enrollYubiKeyPivX25519
+import ragewarden.ragedroid.identities.enrollYubiKeyPiv
 import ragewarden.ragedroid.identities.isStrongBoxAvailable
 import ragewarden.ragedroid.identities.passkeyEnrollmentSupported
 import ragewarden.ragedroid.ui.components.ButtonVariant
 import ragewarden.ragedroid.ui.components.Mono
 import ragewarden.ragedroid.ui.components.RageButton
-import ragewarden.ragedroid.ui.components.SecurePinField
-import ragewarden.ragedroid.ui.components.rememberSecurePinFieldState
 import ragewarden.ragedroid.ui.findActivity
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
+import ragewarden.ragedroid.ui.uiString
 
 internal enum class FirstRunStep { Welcome, SignIn, Enroll, Backup, Done }
 
@@ -100,6 +99,7 @@ fun FirstRunScreen(
     onPickPaperRecoveryBackup: () -> Unit = {},
     showToast: (String) -> Unit = {},
 ) {
+    val strings = androidx.compose.ui.platform.LocalContext.current
     val c = rageColors
     val rawContext = LocalContext.current
     val context = rawContext.applicationContext
@@ -110,7 +110,16 @@ fun FirstRunScreen(
     val recipientStore = remember(context) { context.appEntryPoint().recipientStore() }
     fun currentAccountId(): String = VaultBridge.repository()?.accountId.orEmpty()
 
-    var step by remember { mutableStateOf(FirstRunStep.Welcome) }
+    var step by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(FirstRunStep.Welcome) }
+    androidx.activity.compose.BackHandler(
+        enabled = step == FirstRunStep.SignIn || step == FirstRunStep.Enroll || step == FirstRunStep.Backup,
+    ) {
+        step = when (step) {
+            FirstRunStep.Backup -> FirstRunStep.Enroll
+            FirstRunStep.Enroll -> FirstRunStep.SignIn
+            else -> FirstRunStep.Welcome
+        }
+    }
     // These three MUST stay empty. They once held a live test server, account and
     // master password; this file is in src/main with no build-type gate, so those
     // literals compiled straight into every release APK -- a shipped credential and
@@ -126,8 +135,19 @@ fun FirstRunScreen(
     var password by remember { mutableStateOf("") }
     var enrollKind by remember { mutableStateOf<FirstRunEnrollKind?>(null) }
     var enrollPhase by remember { mutableStateOf(FirstRunEnrollPhase.Idle) }
+    var unboundConsentOpen by remember { mutableStateOf(false) }
+    val enrollPlatform: suspend () -> ragewarden.ragedroid.data.StoredRecipient = {
+        val biometric = ragewarden.ragedroid.identities.isBiometricEnrollable(rawContext)
+        val (recipient, _) = enrollKeystoreIdentity(
+            displayName = if (biometric) uiString(R.string.this_phone) else uiString(R.string.this_phone_no_confirmation),
+            useStrongBox = isStrongBoxAvailable(rawContext),
+            requireBiometric = biometric,
+        )
+        recipient
+    }
     var showAdvanced by remember { mutableStateOf(false) }
     var signInBusy by remember { mutableStateOf(false) }
+    var legacyKdfIterations by remember { mutableStateOf<Int?>(null) }
     var signInError by remember { mutableStateOf<String?>(null) }
     var pinPromptOpen by remember { mutableStateOf(false) }
     var enrollError by remember { mutableStateOf<String?>(null) }
@@ -140,10 +160,10 @@ fun FirstRunScreen(
             require(id.isNotBlank()) { "no signed-in account; cannot persist recipient" }
             recipientStore.add(id, recipient)
             auditFeed.record(
-                action = ragewarden.ragedroid.data.audit.AuditAction.Enroll,
+                action = ragewarden.ragedroid.data.audit.AuditAction.EnrollIdentity,
                 item = recipient.displayName,
                 recipient = recipient.id,
-                reason = "${recipient.kind} recipient added",
+                reason = uiString(R.string.recipient_added_2, recipient.kind),
             )
             VaultBridge.repository()?.pushRecipientRegistry()
         }
@@ -165,14 +185,12 @@ fun FirstRunScreen(
             } catch (ce: CancellationException) {
                 enrollPhase = FirstRunEnrollPhase.Idle
                 throw ce
+            } catch (t: ragewarden.ragedroid.data.StoreUnreadableException) {
+                enrollPhase = FirstRunEnrollPhase.Idle
+                enrollError = context.getString(R.string.key_list_unreadable_enrol)
             } catch (t: Throwable) {
                 enrollPhase = FirstRunEnrollPhase.Idle
-                val parts = listOfNotNull(
-                    t.javaClass.simpleName,
-                    t.message,
-                    t.cause?.let { "cause: ${it.javaClass.simpleName}: ${it.message}" },
-                )
-                enrollError = parts.joinToString(" -- ")
+                enrollError = t.message?.takeIf { it.isNotBlank() } ?: context.getString(R.string.enrol_failed)
                 android.util.Log.w("FirstRunEnroll", "enrollment failed", t)
             }
         }
@@ -191,6 +209,57 @@ fun FirstRunScreen(
             .background(c.background)
             .imePadding(),
     ) {
+        if (unboundConsentOpen) {
+            UnboundKeyConsent(
+                onSetScreenLock = {
+                    unboundConsentOpen = false
+                    runCatching {
+                        rawContext.startActivity(
+                            android.content.Intent(android.app.admin.DevicePolicyManager.ACTION_SET_NEW_PASSWORD)
+                                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                        )
+                    }
+                },
+                onEnrolAnyway = {
+                    unboundConsentOpen = false
+                    runEnrollment { enrollPlatform() }
+                },
+                onCancel = { unboundConsentOpen = false },
+            )
+        }
+        legacyKdfIterations?.let { iterations ->
+            androidx.compose.material3.AlertDialog(
+                onDismissRequest = { legacyKdfIterations = null },
+                title = { androidx.compose.material3.Text(stringResource(R.string.strengthen_this_account)) },
+                text = {
+                    androidx.compose.material3.Text(
+                        stringResource(R.string.this_account_stretches_its_master_password, iterations),
+                    )
+                },
+                confirmButton = {
+                    androidx.compose.material3.TextButton(onClick = {
+                        legacyKdfIterations = null
+                        signInBusy = true
+                        scope.launch {
+                            val result = repo.login(serverUrl.trim(), email.trim(), password, allowLegacyKdf = true)
+                            signInBusy = false
+                            result.fold(
+                                onSuccess = {
+                                    VaultBridge.installRepository(repo)
+                                    step = FirstRunStep.Enroll
+                                },
+                                onFailure = { e -> signInError = e.message ?: uiString(R.string.sign_in_failed) },
+                            )
+                        }
+                    }) { androidx.compose.material3.Text(stringResource(R.string.sign_in_and_strengthen)) }
+                },
+                dismissButton = {
+                    androidx.compose.material3.TextButton(onClick = { legacyKdfIterations = null }) {
+                        androidx.compose.material3.Text(stringResource(R.string.cancel))
+                    }
+                },
+            )
+        }
         when (step) {
             FirstRunStep.Welcome -> WelcomeStep(onBegin = { step = FirstRunStep.SignIn })
             FirstRunStep.SignIn -> SignInStep(
@@ -223,7 +292,11 @@ fun FirstRunScreen(
                                     step = FirstRunStep.Enroll
                                 },
                                 onFailure = { e ->
-                                    signInError = e.message ?: "Sign-in failed"
+                                    if (e is ragewarden.ragedroid.data.BitwardenVaultRepository.LegacyKdfException) {
+                                        legacyKdfIterations = e.iterations
+                                    } else {
+                                        signInError = e.message ?: uiString(R.string.sign_in_failed)
+                                    }
                                 },
                             )
                         }
@@ -251,22 +324,18 @@ fun FirstRunScreen(
                 onTrigger = {
                     when (enrollKind) {
                         FirstRunEnrollKind.Platform -> {
-                            runEnrollment {
-                                val biometric = ragewarden.ragedroid.identities.isBiometricEnrollable(rawContext)
-                                val (recipient, _) = enrollKeystoreIdentity(
-                                    displayName = if (biometric) "This phone" else "This phone (no biometric)",
-                                    useStrongBox = isStrongBoxAvailable(rawContext),
-                                    requireBiometric = biometric,
-                                )
-                                recipient
+                            if (ragewarden.ragedroid.identities.isBiometricEnrollable(rawContext)) {
+                                runEnrollment { enrollPlatform() }
+                            } else {
+                                unboundConsentOpen = true
                             }
                         }
                         FirstRunEnrollKind.SecurityKey -> {
                             if (!passkeyEnrollmentSupported()) {
-                                showToast("Passkey enrollment not available on this build")
+                                showToast(strings.getString(R.string.passkey_enrollment_not_available_on_this))
                                 enrollPhase = FirstRunEnrollPhase.Idle
                             } else if (activity == null) {
-                                showToast("Need an Activity context")
+                                showToast(strings.getString(R.string.need_an_activity_context))
                                 enrollPhase = FirstRunEnrollPhase.Idle
                             } else {
                                 runEnrollment {
@@ -280,7 +349,7 @@ fun FirstRunScreen(
                         }
                         FirstRunEnrollKind.YubikeyPiv -> {
                             if (activity == null) {
-                                showToast("Need an Activity context")
+                                showToast(strings.getString(R.string.need_an_activity_context))
                                 enrollPhase = FirstRunEnrollPhase.Idle
                             } else {
                                 pinPromptOpen = true
@@ -291,7 +360,7 @@ fun FirstRunScreen(
                 },
                 onContinue = { step = FirstRunStep.Backup },
                 onSkip = {
-                    showToast("Hardware enrollment skipped -- you can add a recipient later in Settings")
+                    showToast(strings.getString(R.string.hardware_enrollment_skipped_you_can_add))
                     step = FirstRunStep.Backup
                 },
             )
@@ -300,17 +369,26 @@ fun FirstRunScreen(
                 onPickRecovery = onPickPaperRecoveryBackup,
                 onSkip = { step = FirstRunStep.Done },
             )
-            FirstRunStep.Done -> DoneStep(onOpenVault = onComplete)
+            FirstRunStep.Done -> {
+                val enrolled = currentAccountId().takeIf { it.isNotBlank() }
+                    ?.let { recipientStore.forAccount(it) }
+                    .orEmpty()
+                DoneStep(
+                    keyEnrolled = enrolled.any { it.defaultEncrypt && it.kind != ragewarden.ragedroid.model.RecipientKind.Recovery },
+                    backupEnrolled = enrolled.any { it.kind == ragewarden.ragedroid.model.RecipientKind.Recovery },
+                    onOpenVault = onComplete,
+                )
+            }
         }
 
         if (pinPromptOpen && activity != null) {
-            FirstRunYubiKeyPinPrompt(
+            YubiKeyPinPrompt(
                 onCancel = { pinPromptOpen = false },
                 onSubmit = { chars ->
                     pinPromptOpen = false
                     runEnrollment {
                         try {
-                            val (recipient, _) = enrollYubiKeyPivX25519(
+                            val (recipient, _) = enrollYubiKeyPiv(
                                 activity = activity,
                                 pin = chars,
                                 displayName = null,
@@ -324,44 +402,6 @@ fun FirstRunScreen(
             )
         }
     }
-}
-
-@Composable
-private fun FirstRunYubiKeyPinPrompt(
-    onCancel: () -> Unit,
-    onSubmit: (CharArray) -> Unit,
-) {
-    val pinState = rememberSecurePinFieldState()
-    AlertDialog(
-        onDismissRequest = {
-            pinState.zero()
-            onCancel()
-        },
-        title = { Text("YubiKey PIN") },
-        text = {
-            Column {
-                Text(
-                    text = "Enter your YubiKey PIV PIN. The default is 123456 if you haven't set one.",
-                    style = RageType.body.copy(fontSize = 13.sp, lineHeight = 18.sp),
-                )
-                Spacer(modifier = Modifier.height(12.dp))
-                SecurePinField(state = pinState)
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = {
-                val chars = pinState.submit()
-                pinState.zero()
-                onSubmit(chars)
-            }) { Text("Continue") }
-        },
-        dismissButton = {
-            TextButton(onClick = {
-                pinState.zero()
-                onCancel()
-            }) { Text("Cancel") }
-        },
-    )
 }
 
 @Composable
@@ -399,7 +439,7 @@ private fun Logo() {
         }
         Column {
             Text(
-                text = "RageDroid",
+                text = stringResource(R.string.ragedroid),
                 style = RageType.h2.copy(
                     fontSize = 18.sp,
                     lineHeight = 18.sp,
@@ -409,7 +449,7 @@ private fun Logo() {
             )
             Spacer(modifier = Modifier.height(2.dp))
             Text(
-                text = "A LocalForge product",
+                text = stringResource(R.string.a_localforge_product),
                 style = RageType.sansBody.copy(fontSize = 10.sp, lineHeight = 12.sp),
                 color = c.fgSecondary,
             )
@@ -455,13 +495,13 @@ internal fun WelcomeStep(onBegin: () -> Unit) {
         Spacer(modifier = Modifier.height(36.dp))
         Column(modifier = Modifier.fillMaxWidth()) {
             Text(
-                text = "A phishing-resistant Bitwarden client.",
+                text = stringResource(R.string.a_phishing_resistant_bitwarden_client),
                 style = RageType.body.copy(fontSize = 14.sp, fontStyle = FontStyle.Italic),
                 color = c.fgSecondary,
             )
             Spacer(modifier = Modifier.height(14.dp))
             Text(
-                text = "The master password leaking does not leak any of the actual secrets.",
+                text = stringResource(R.string.the_master_password_leaking_does_not),
                 style = RageType.h1.copy(
                     fontSize = 32.sp,
                     lineHeight = 35.sp,
@@ -471,27 +511,27 @@ internal fun WelcomeStep(onBegin: () -> Unit) {
             )
             Spacer(modifier = Modifier.height(20.dp))
             Text(
-                text = "RageDroid wraps every secret in an additional age envelope. Unlocking any individual credential requires a hardware tap -- your YubiKey, the FIDO2 authenticator in your laptop, or this phone's secure element.",
+                text = stringResource(R.string.ragedroid_wraps_every_secret_in_an),
                 style = RageType.body.copy(fontSize = 16.sp, lineHeight = 25.sp),
                 color = c.fgPrimary,
             )
             Spacer(modifier = Modifier.height(16.dp))
             Text(
-                text = "Both layers are needed to read a secret. Steal one, learn nothing.",
+                text = stringResource(R.string.both_layers_are_needed_to_read),
                 style = RageType.body.copy(fontSize = 16.sp, lineHeight = 25.sp),
                 color = c.fgPrimary,
             )
         }
         Spacer(modifier = Modifier.height(32.dp))
         RageButton(
-            label = "Begin setup",
+            label = stringResource(R.string.begin_setup),
             onClick = onBegin,
             icon = Icons.AutoMirrored.Outlined.ArrowForward,
             fullWidth = true,
         )
         Spacer(modifier = Modifier.height(14.dp))
         Text(
-            text = "Existing Bitwarden vault required · age/rage compatible · open source",
+            text = stringResource(R.string.existing_bitwarden_vault_required_age_rage),
             style = RageType.sansBody.copy(fontSize = 11.sp, textAlign = TextAlign.Center),
             color = c.fgSecondary,
             modifier = Modifier.fillMaxWidth(),
@@ -515,31 +555,33 @@ private fun SignInStep(
     val c = rageColors
     StepScaffold {
         StepTitle(
-            kicker = "Step 1 of 3",
-            title = "Sign in to your vault",
-            sub = "Connect your Bitwarden vault. Self-hosted Vaultwarden works too.",
+            kicker = stringResource(R.string.step_1_of_3),
+            title = stringResource(R.string.sign_in_to_your_vault),
+            sub = stringResource(R.string.connect_your_bitwarden_vault_self_hosted),
         )
         Column(modifier = Modifier.fillMaxWidth()) {
-            FirstRunFieldLabel("Server")
+            FirstRunFieldLabel(stringResource(R.string.server))
             FirstRunInput(
                 value = serverUrl,
                 onChange = onServerChange,
                 mono = true,
-                placeholder = "https://vault.bitwarden.com",
+                placeholder = stringResource(R.string.https_vault_bitwarden_com),
                 keyboardType = androidx.compose.ui.text.input.KeyboardType.Uri,
                 autoCorrect = false,
+                tag = "signin-server",
             )
             Spacer(modifier = Modifier.height(16.dp))
-            FirstRunFieldLabel("Email")
+            FirstRunFieldLabel(stringResource(R.string.email))
             FirstRunInput(
                 value = email,
                 onChange = onEmailChange,
                 keyboardType = androidx.compose.ui.text.input.KeyboardType.Email,
                 autoCorrect = false,
+                tag = "signin-email",
             )
             Spacer(modifier = Modifier.height(16.dp))
-            FirstRunFieldLabel("Master password")
-            FirstRunInput(value = password, onChange = onPasswordChange, password = true)
+            FirstRunFieldLabel(stringResource(R.string.master_password))
+            FirstRunInput(value = password, onChange = onPasswordChange, password = true, tag = "signin-password")
             if (error != null) {
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(text = error, style = RageType.body, color = c.fgEmphasis)
@@ -551,13 +593,13 @@ private fun SignInStep(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             RageButton(
-                label = "Back",
+                label = stringResource(R.string.back),
                 onClick = onBack,
                 variant = ButtonVariant.Ghost,
             )
             Box(modifier = Modifier.weight(1f)) {
                 RageButton(
-                    label = if (busy) "Working..." else "Sign in & continue",
+                    label = if (busy) stringResource(R.string.working) else stringResource(R.string.sign_in_continue),
                     onClick = onContinue,
                     icon = Icons.AutoMirrored.Outlined.ArrowForward,
                     fullWidth = true,
@@ -582,13 +624,13 @@ private fun signInFormProblem(serverUrl: String, email: String, password: String
     val server = serverUrl.trim()
     val account = email.trim()
     return when {
-        server.isEmpty() -> "Enter your vault server, e.g. https://vault.bitwarden.com"
+        server.isEmpty() -> uiString(R.string.enter_your_vault_server_e_g)
         !serverSchemeAccepted(server) ->
-            "Server must start with https:// -- plain http:// is only allowed for localhost."
-        account.isEmpty() -> "Enter the email address of your vault account."
+            uiString(R.string.server_must_start_with_https_plain)
+        account.isEmpty() -> uiString(R.string.enter_the_email_address_of_your)
         !account.contains('@') || account.any { it.isWhitespace() } ->
-            "That doesn't look like an email address."
-        password.isEmpty() -> "Enter your master password."
+            uiString(R.string.that_doesn_t_look_like_an)
+        password.isEmpty() -> uiString(R.string.enter_your_master_password)
         else -> null
     }
 }
@@ -626,6 +668,7 @@ private fun FirstRunInput(
     placeholder: String? = null,
     keyboardType: androidx.compose.ui.text.input.KeyboardType = androidx.compose.ui.text.input.KeyboardType.Text,
     autoCorrect: Boolean = true,
+    tag: String? = null,
 ) {
     val c = rageColors
     val style = if (mono) RageType.mono.copy(color = c.fgPrimary) else RageType.sansBody.copy(color = c.fgPrimary)
@@ -652,7 +695,7 @@ private fun FirstRunInput(
                 keyboardType = resolvedKeyboardType,
                 autoCorrect = autoCorrect,
             ),
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxWidth().let { m -> if (tag != null) m.testTag(tag) else m },
             decorationBox = { inner ->
                 Box {
                     // Never on a password field -- a hint under the dots would be
@@ -709,26 +752,26 @@ private fun EnrollStep(
 
 private data class EnrollOption(
     val kind: FirstRunEnrollKind,
-    val name: String,
-    val description: String,
+    @androidx.annotation.StringRes val name: Int,
+    @androidx.annotation.StringRes val description: Int,
     val icon: ImageVector,
-    val tag: String? = null,
+    @androidx.annotation.StringRes val tag: Int? = null,
     val recommended: Boolean = false,
 )
 
 private val PRIMARY_OPTIONS = listOf(
     EnrollOption(
         kind = FirstRunEnrollKind.Platform,
-        name = "This phone",
-        description = "Use the secure element + biometrics already on this device.",
+        name = R.string.this_phone,
+        description = R.string.use_the_secure_element_biometrics_already,
         icon = Icons.Outlined.Fingerprint,
-        tag = "Fastest",
+        tag = R.string.fastest,
         recommended = true,
     ),
     EnrollOption(
         kind = FirstRunEnrollKind.SecurityKey,
-        name = "A security key",
-        description = "YubiKey, Solo, Titan, or any FIDO2 authenticator. Tap to confirm each unlock.",
+        name = R.string.a_security_key,
+        description = R.string.yubikey_solo_titan_or_any_fido2,
         icon = Icons.Outlined.Nfc,
     ),
 )
@@ -736,8 +779,8 @@ private val PRIMARY_OPTIONS = listOf(
 private val ADVANCED_OPTIONS = listOf(
     EnrollOption(
         kind = FirstRunEnrollKind.YubikeyPiv,
-        name = "YubiKey (PIV mode)",
-        description = "Pin a key to PIV slot 95 with an X25519 keypair. Power-user path.",
+        name = R.string.yubikey_piv_mode,
+        description = R.string.pin_a_key_to_piv_slot_2,
         icon = Icons.Outlined.Usb,
     ),
 )
@@ -752,9 +795,9 @@ private fun EnrollPicker(
 ) {
     StepScaffold {
         StepTitle(
-            kicker = "Step 2 of 3",
-            title = "Enroll your first passkey",
-            sub = "Pick how you want to authorize unlocks. Each unlock takes a tap. The private key is generated on the device and never leaves it.",
+            kicker = stringResource(R.string.step_2_of_3),
+            title = stringResource(R.string.add_your_first_key),
+            sub = stringResource(R.string.pick_how_you_want_to_authorize),
         )
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             PRIMARY_OPTIONS.forEach { option ->
@@ -769,7 +812,7 @@ private fun EnrollPicker(
                 horizontalArrangement = Arrangement.spacedBy(4.dp),
             ) {
                 Text(
-                    text = "More options",
+                    text = stringResource(R.string.more_options),
                     style = RageType.button.copy(fontSize = 12.sp),
                     color = rageColors.fgSecondary,
                 )
@@ -790,7 +833,7 @@ private fun EnrollPicker(
         Spacer(modifier = Modifier.height(20.dp))
         Row(modifier = Modifier.fillMaxWidth()) {
             RageButton(
-                label = "Back",
+                label = stringResource(R.string.back),
                 onClick = onBack,
                 variant = ButtonVariant.Ghost,
             )
@@ -804,7 +847,7 @@ private fun EnrollPicker(
             contentAlignment = Alignment.Center,
         ) {
             Text(
-                text = "Skip -- set up later",
+                text = stringResource(R.string.skip_set_up_later),
                 style = RageType.caption,
                 color = rageColors.fgSecondary,
             )
@@ -813,7 +856,21 @@ private fun EnrollPicker(
 }
 
 @Composable
-private fun EnrollOptionRow(option: EnrollOption, onClick: () -> Unit) {
+private fun EnrollOptionRow(option: EnrollOption, onClick: () -> Unit) = OptionRow(
+    option.icon, stringResource(option.name), stringResource(option.description), option.recommended, option.tag?.let { stringResource(it) },
+    Modifier.padding(top = 8.dp).size(18.dp), onClick,
+)
+
+@Composable
+private fun OptionRow(
+    icon: ImageVector,
+    name: String,
+    description: String,
+    recommended: Boolean,
+    tag: String?,
+    arrowModifier: Modifier,
+    onClick: () -> Unit,
+) {
     val c = rageColors
     Row(
         modifier = Modifier
@@ -832,7 +889,7 @@ private fun EnrollOptionRow(option: EnrollOption, onClick: () -> Unit) {
             contentAlignment = Alignment.Center,
         ) {
             Icon(
-                imageVector = option.icon,
+                imageVector = icon,
                 contentDescription = null,
                 tint = c.accent,
                 modifier = Modifier.size(18.dp),
@@ -844,25 +901,25 @@ private fun EnrollOptionRow(option: EnrollOption, onClick: () -> Unit) {
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Text(
-                    text = option.name,
+                    text = name,
                     style = RageType.rowTitle.copy(fontSize = 15.sp, lineHeight = 19.sp),
                     color = c.fgEmphasis,
                 )
-                if (option.recommended) {
+                if (recommended) {
                     Box(
                         modifier = Modifier
                             .border(1.dp, c.success, RoundedCornerShape(4.dp))
                             .padding(horizontal = 6.dp, vertical = 2.dp),
                     ) {
                         Text(
-                            text = "Recommended".uppercase(),
+                            text = stringResource(R.string.recommended_2).uppercase(),
                             style = RageType.eyebrow.copy(fontSize = 10.sp, lineHeight = 12.sp),
                             color = c.success,
                         )
                     }
-                } else if (option.tag != null) {
+                } else if (tag != null) {
                     Text(
-                        text = option.tag.uppercase(),
+                        text = tag.uppercase(),
                         style = RageType.eyebrow.copy(fontSize = 10.sp, lineHeight = 12.sp),
                         color = c.fgSecondary,
                     )
@@ -870,7 +927,7 @@ private fun EnrollOptionRow(option: EnrollOption, onClick: () -> Unit) {
             }
             Spacer(modifier = Modifier.height(2.dp))
             Text(
-                text = option.description,
+                text = description,
                 style = RageType.body.copy(fontSize = 13.5.sp, lineHeight = 19.5.sp),
                 color = c.fgSecondary,
             )
@@ -879,9 +936,7 @@ private fun EnrollOptionRow(option: EnrollOption, onClick: () -> Unit) {
             imageVector = Icons.AutoMirrored.Outlined.KeyboardArrowRight,
             contentDescription = null,
             tint = c.fgSecondary,
-            modifier = Modifier
-                .padding(top = 8.dp)
-                .size(18.dp),
+            modifier = arrowModifier,
         )
     }
 }
@@ -900,9 +955,9 @@ private fun EnrollProgress(
     val copy = enrollCopy(enrollKind)
     StepScaffold {
         StepTitle(
-            kicker = "Step 2 of 3",
-            title = copy.title,
-            sub = copy.sub,
+            kicker = stringResource(R.string.step_2_of_3),
+            title = stringResource(copy.title),
+            sub = stringResource(copy.sub),
         )
         // The card itself is not clickable. It used to be the *only* way to
         // begin enrollment -- an invisible full-card hit target next to copy that
@@ -934,10 +989,10 @@ private fun EnrollProgress(
             Spacer(modifier = Modifier.height(6.dp))
             Text(
                 text = when (phase) {
-                    FirstRunEnrollPhase.Idle -> copy.idleHint
-                    FirstRunEnrollPhase.Listening -> copy.listeningHint
-                    FirstRunEnrollPhase.Found -> "Authenticator detected. Recording it as a recipient..."
-                    FirstRunEnrollPhase.DoneEnroll -> "Recorded as a recipient in your \"RageDroid Recipients\" secure note."
+                    FirstRunEnrollPhase.Idle -> stringResource(copy.idleHint)
+                    FirstRunEnrollPhase.Listening -> stringResource(copy.listeningHint)
+                    FirstRunEnrollPhase.Found -> stringResource(R.string.authenticator_detected_recording_it_as_a)
+                    FirstRunEnrollPhase.DoneEnroll -> stringResource(R.string.recorded_as_a_recipient_in_your)
                 },
                 style = RageType.sansBody.copy(textAlign = TextAlign.Center),
                 color = c.fgSecondary,
@@ -949,7 +1004,7 @@ private fun EnrollProgress(
             if (phase == FirstRunEnrollPhase.Idle && error == null) {
                 Spacer(modifier = Modifier.height(14.dp))
                 RageButton(
-                    label = copy.startLabel,
+                    label = stringResource(copy.startLabel),
                     onClick = onTrigger,
                     icon = if (enrollKind == FirstRunEnrollKind.Platform) {
                         Icons.Outlined.Fingerprint
@@ -976,7 +1031,7 @@ private fun EnrollProgress(
                     .background(c.info),
             )
             Text(
-                text = "If this device is lost and you've enrolled no backup recipients, your protected secrets become unrecoverable. Step 3 lets you pick a second way in.",
+                text = stringResource(R.string.if_this_device_is_lost_and),
                 style = RageType.sansBody.copy(fontSize = 11.5.sp, lineHeight = 17.sp),
                 color = c.fgSecondary,
                 modifier = Modifier
@@ -1005,7 +1060,7 @@ private fun EnrollProgress(
                         .padding(start = 10.dp, top = 10.dp, end = 12.dp, bottom = 10.dp),
                 ) {
                     Text(
-                        text = "Enrollment failed",
+                        text = stringResource(R.string.enrollment_failed),
                         style = RageType.sansBody.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold),
                         color = c.danger,
                     )
@@ -1017,8 +1072,8 @@ private fun EnrollProgress(
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        RageButton(label = "Try again", onClick = onTrigger, variant = ButtonVariant.Primary)
-                        RageButton(label = "Dismiss", onClick = onDismissError, variant = ButtonVariant.Ghost)
+                        RageButton(label = stringResource(R.string.try_again), onClick = onTrigger, variant = ButtonVariant.Primary)
+                        RageButton(label = stringResource(R.string.dismiss), onClick = onDismissError, variant = ButtonVariant.Ghost)
                     }
                 }
             }
@@ -1026,7 +1081,7 @@ private fun EnrollProgress(
         if (phase == FirstRunEnrollPhase.DoneEnroll) {
             Spacer(modifier = Modifier.height(14.dp))
             RageButton(
-                label = "Continue",
+                label = stringResource(R.string.continue_),
                 onClick = onContinue,
                 icon = Icons.AutoMirrored.Outlined.ArrowForward,
                 fullWidth = true,
@@ -1045,7 +1100,7 @@ private fun EnrollProgress(
             contentAlignment = Alignment.Center,
         ) {
             Text(
-                text = "Back -- choose a different method",
+                text = stringResource(R.string.back_choose_a_different_method),
                 style = RageType.caption,
                 color = c.fgSecondary,
             )
@@ -1054,14 +1109,14 @@ private fun EnrollProgress(
 }
 
 private data class EnrollCopy(
-    val title: String,
-    val sub: String,
+    @androidx.annotation.StringRes val title: Int,
+    @androidx.annotation.StringRes val sub: Int,
     /** Label of the Start button. Must name what pressing it actually does. */
-    val startLabel: String,
-    val idleHint: String,
-    val listeningHint: String,
-    val doneTitle: String,
-    val doneMeta: String,
+    @androidx.annotation.StringRes val startLabel: Int,
+    @androidx.annotation.StringRes val idleHint: Int,
+    @androidx.annotation.StringRes val listeningHint: Int,
+    @androidx.annotation.StringRes val doneTitle: Int,
+    @androidx.annotation.StringRes val doneMeta: Int,
 )
 
 // The idle hints all lead with Start. They used to open with "Insert via USB-C,
@@ -1070,33 +1125,33 @@ private data class EnrollCopy(
 // trigger fired.
 private fun enrollCopy(kind: FirstRunEnrollKind): EnrollCopy = when (kind) {
     FirstRunEnrollKind.Platform -> EnrollCopy(
-        title = "Enroll this phone",
-        sub = "Generates a passkey backed by the device secure element. Biometric to unlock.",
+        title = R.string.enroll_this_phone,
+        sub = R.string.generates_a_passkey_backed_by_the,
         // Not "confirm with biometrics": enrollKeystoreIdentity falls back to a
         // non-biometric key when the device has none enrolled.
-        startLabel = "Start -- enroll this phone",
-        idleHint = "Tap Start to generate the key in this phone's secure element. You'll confirm with biometrics if the device has them.",
-        listeningHint = "Confirm with your fingerprint to finish generating the key.",
-        doneTitle = "This phone enrolled",
-        doneMeta = "StrongBox · P-256",
+        startLabel = R.string.start_enroll_this_phone,
+        idleHint = R.string.tap_start_to_generate_the_key,
+        listeningHint = R.string.confirm_with_your_fingerprint_to_finish,
+        doneTitle = R.string.this_phone_enrolled,
+        doneMeta = R.string.strongbox_p_256,
     )
     FirstRunEnrollKind.SecurityKey -> EnrollCopy(
-        title = "Enroll a security key",
-        sub = "The key generates its own keypair. Nothing is listening for it until you press Start.",
-        startLabel = "Start -- listen for the key",
-        idleHint = "Tap Start, then present your key: insert via USB-C, or hold it to the back of the phone.",
-        listeningHint = "Listening for NFC and USB-C... touch the key when it lights up.",
-        doneTitle = "Security key enrolled",
-        doneMeta = "FIDO2 · X25519",
+        title = R.string.enroll_a_security_key,
+        sub = R.string.the_key_generates_its_own_keypair,
+        startLabel = R.string.start_listen_for_the_key,
+        idleHint = R.string.tap_start_then_present_your_key,
+        listeningHint = R.string.listening_for_nfc_and_usb_c,
+        doneTitle = R.string.security_key_enrolled,
+        doneMeta = R.string.fido2_x25519,
     )
     FirstRunEnrollKind.YubikeyPiv -> EnrollCopy(
-        title = "Enroll a YubiKey (PIV)",
-        sub = "RageDroid generates an X25519 keypair on the YubiKey itself. The private key never leaves the device.",
-        startLabel = "Start -- enter your PIN",
-        idleHint = "Tap Start and enter your PIV PIN, then present the YubiKey: USB-C, or held to the back of the phone.",
-        listeningHint = "Listening for NFC and USB-C... hold the key steady while it generates the keypair.",
-        doneTitle = "YubiKey enrolled",
-        doneMeta = "PIV slot 95 · X25519",
+        title = R.string.enroll_a_yubikey_piv,
+        sub = R.string.ragedroid_generates_an_x25519_keypair_on,
+        startLabel = R.string.start_enter_your_pin,
+        idleHint = R.string.tap_start_and_enter_your_piv,
+        listeningHint = R.string.listening_for_nfc_and_usb_c_2,
+        doneTitle = R.string.yubikey_enrolled,
+        doneMeta = R.string.piv_slot_95_x25519,
     )
 }
 
@@ -1106,7 +1161,7 @@ private fun EnrollIdleVisual(kind: FirstRunEnrollKind, listening: Boolean) {
     val pulseAlpha by animateFloatAsState(
         targetValue = if (listening) 0.35f else 0f,
         animationSpec = tween(durationMillis = 800, easing = LinearEasing),
-        label = "enroll-pulse",
+        label = stringResource(R.string.enroll_pulse),
     )
     Box(contentAlignment = Alignment.Center, modifier = Modifier.size(110.dp)) {
         if (listening) {
@@ -1169,18 +1224,18 @@ private fun EnrollDoneVisual(copy: EnrollCopy) {
         }
         Spacer(modifier = Modifier.height(12.dp))
         Text(
-            text = copy.doneTitle,
+            text = stringResource(copy.doneTitle),
             style = RageType.rowTitle.copy(fontSize = 16.sp, lineHeight = 20.sp),
             color = c.fgEmphasis,
         )
         Spacer(modifier = Modifier.height(4.dp))
-        Mono(text = copy.doneMeta, size = 11, color = c.fgSecondary)
+        Mono(text = stringResource(copy.doneMeta), size = 11, color = c.fgSecondary)
     }
 }
 
 private data class BackupOption(
-    val name: String,
-    val description: String,
+    @androidx.annotation.StringRes val name: Int,
+    @androidx.annotation.StringRes val description: Int,
     val icon: ImageVector,
     val recommended: Boolean = false,
 )
@@ -1194,23 +1249,23 @@ private data class BackupOption(
  * button an inch further down, dressed up as three choices.
  */
 private val RECOVERY_BACKUP_OPTION = BackupOption(
-    name = "Paper recovery phrase",
-    description = "24 BIP39 words. Write them down once, keep them safe -- they unlock your vault on any new device.",
+    name = R.string.paper_recovery_phrase,
+    description = R.string.s_24_bip39_words_write_them_down,
     icon = Icons.Outlined.Description,
     recommended = true,
 )
 
 @Composable
-private fun BackupStep(
+internal fun BackupStep(
     onBack: () -> Unit,
     onPickRecovery: () -> Unit,
     onSkip: () -> Unit,
 ) {
     StepScaffold {
         StepTitle(
-            kicker = "Step 3 of 3",
-            title = "Add a backup recipient",
-            sub = "A second way in, in case this device is lost. Recommended.",
+            kicker = stringResource(R.string.step_3_of_3),
+            title = stringResource(R.string.add_a_backup_recipient),
+            sub = stringResource(R.string.a_second_way_in_in_case),
         )
         BackupOptionRow(option = RECOVERY_BACKUP_OPTION, onClick = onPickRecovery)
         Spacer(modifier = Modifier.height(20.dp))
@@ -1218,97 +1273,42 @@ private fun BackupStep(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            RageButton(label = "Back", onClick = onBack, variant = ButtonVariant.Ghost)
+            RageButton(label = stringResource(R.string.back), onClick = onBack, variant = ButtonVariant.Ghost)
             Box(modifier = Modifier.weight(1f)) {
                 RageButton(
-                    label = "Skip -- I'll add later",
-                    onClick = onSkip,
-                    variant = ButtonVariant.Secondary,
+                    label = stringResource(R.string.write_down_a_recovery_phrase),
+                    onClick = onPickRecovery,
                     fullWidth = true,
                 )
             }
         }
-    }
-}
-
-@Composable
-private fun BackupOptionRow(option: BackupOption, onClick: () -> Unit) {
-    val c = rageColors
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(c.surfaceElevated, RoundedCornerShape(10.dp))
-            .border(1.dp, c.border, RoundedCornerShape(10.dp))
-            .clickable(onClick = onClick)
-            .padding(14.dp),
-        verticalAlignment = Alignment.Top,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
+        Spacer(modifier = Modifier.height(8.dp))
         Box(
             modifier = Modifier
-                .size(36.dp)
-                .background(c.tile, RoundedCornerShape(8.dp)),
+                .fillMaxWidth()
+                .clickable(role = Role.Button, onClick = onSkip)
+                .defaultMinSize(minHeight = 48.dp)
+                .padding(vertical = 10.dp),
             contentAlignment = Alignment.Center,
         ) {
-            Icon(
-                imageVector = option.icon,
-                contentDescription = null,
-                tint = c.accent,
-                modifier = Modifier.size(18.dp),
-            )
-        }
-        Column(modifier = Modifier.weight(1f)) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                Text(
-                    text = option.name,
-                    style = RageType.rowTitle.copy(fontSize = 15.sp, lineHeight = 19.sp),
-                    color = c.fgEmphasis,
-                )
-                if (option.recommended) {
-                    Box(
-                        modifier = Modifier
-                            .border(1.dp, c.success, RoundedCornerShape(4.dp))
-                            .padding(horizontal = 6.dp, vertical = 2.dp),
-                    ) {
-                        Text(
-                            text = "Recommended".uppercase(),
-                            style = RageType.eyebrow.copy(fontSize = 10.sp, lineHeight = 12.sp),
-                            color = c.success,
-                        )
-                    }
-                }
-            }
-            Spacer(modifier = Modifier.height(2.dp))
             Text(
-                text = option.description,
-                style = RageType.body.copy(fontSize = 13.5.sp, lineHeight = 19.5.sp),
-                color = c.fgSecondary,
+                text = stringResource(R.string.skip_i_ll_add_later),
+                style = RageType.caption,
+                color = rageColors.fgSecondary,
             )
         }
-        Icon(
-            imageVector = Icons.AutoMirrored.Outlined.KeyboardArrowRight,
-            contentDescription = null,
-            tint = c.fgSecondary,
-            modifier = Modifier
-                .size(18.dp)
-                .padding(top = 8.dp),
-        )
     }
 }
 
 @Composable
-private fun DoneStep(onOpenVault: () -> Unit) {
+private fun BackupOptionRow(option: BackupOption, onClick: () -> Unit) = OptionRow(
+    option.icon, stringResource(option.name), stringResource(option.description), option.recommended, null,
+    Modifier.size(18.dp).padding(top = 8.dp), onClick,
+)
+
+@Composable
+internal fun DoneStep(keyEnrolled: Boolean, backupEnrolled: Boolean, onOpenVault: () -> Unit) {
     val c = rageColors
-    val syncBody = buildAnnotatedString {
-        append("Your vault is now syncing. New items default to ")
-        withStyle(SpanStyle(fontStyle = FontStyle.Italic)) {
-            append("protected")
-        }
-        append(". Existing items are unchanged -- you can convert them in batches from Settings.")
-    }
     StepScaffold {
         Column(
             modifier = Modifier
@@ -1319,11 +1319,11 @@ private fun DoneStep(onOpenVault: () -> Unit) {
             Box(
                 modifier = Modifier
                     .size(64.dp)
-                    .background(c.success, RoundedCornerShape(32.dp)),
+                    .background(if (keyEnrolled) c.success else c.warning, RoundedCornerShape(32.dp)),
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(
-                    imageVector = Icons.Outlined.Check,
+                    imageVector = if (keyEnrolled) Icons.Outlined.Check else Icons.Outlined.PriorityHigh,
                     contentDescription = null,
                     tint = Color(0xFFFAF6EE),
                     modifier = Modifier.size(32.dp),
@@ -1331,7 +1331,7 @@ private fun DoneStep(onOpenVault: () -> Unit) {
             }
             Spacer(modifier = Modifier.height(24.dp))
             Text(
-                text = "Setup complete.",
+                text = stringResource(if (keyEnrolled) R.string.setup_complete else R.string.vault_not_protected_yet),
                 style = RageType.h1.copy(
                     fontSize = 30.sp,
                     lineHeight = 35.sp,
@@ -1341,19 +1341,41 @@ private fun DoneStep(onOpenVault: () -> Unit) {
             )
             Spacer(modifier = Modifier.height(16.dp))
             Text(
-                text = syncBody,
+                text = stringResource(if (keyEnrolled) R.string.done_sync_protected else R.string.done_sync_unprotected),
                 style = RageType.body.copy(fontSize = 16.sp, lineHeight = 25.sp),
                 color = c.fgPrimary,
             )
-            Spacer(modifier = Modifier.height(12.dp))
-            Text(
-                text = "One tap per reveal. No caching, no exceptions.",
-                style = RageType.body.copy(fontSize = 14.sp, lineHeight = 21.sp, fontStyle = FontStyle.Italic),
-                color = c.fgSecondary,
-            )
+            if (keyEnrolled) {
+                Spacer(modifier = Modifier.height(12.dp))
+                Text(
+                    text = stringResource(R.string.done_each_secret_needs_key),
+                    style = RageType.body.copy(fontSize = 14.sp, lineHeight = 21.sp, fontStyle = FontStyle.Italic),
+                    color = c.fgSecondary,
+                )
+            }
+            val todo = buildList {
+                if (!keyEnrolled) add(R.string.todo_add_a_key)
+                if (!backupEnrolled) add(R.string.todo_add_paper_backup)
+            }
+            if (todo.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(20.dp))
+                Text(
+                    text = stringResource(R.string.still_to_do).uppercase(),
+                    style = RageType.eyebrow,
+                    color = c.fgSecondary,
+                )
+                todo.forEach { res ->
+                    Text(
+                        text = stringResource(res),
+                        style = RageType.body.copy(fontSize = 14.sp, lineHeight = 21.sp),
+                        color = c.fgPrimary,
+                        modifier = Modifier.padding(top = 6.dp).testTag("done-todo"),
+                    )
+                }
+            }
         }
         RageButton(
-            label = "Open vault",
+            label = stringResource(R.string.open_vault),
             onClick = onOpenVault,
             icon = Icons.AutoMirrored.Outlined.ArrowForward,
             fullWidth = true,

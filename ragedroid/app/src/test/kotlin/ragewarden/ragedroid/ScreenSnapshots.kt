@@ -27,8 +27,6 @@ import androidx.test.core.app.ApplicationProvider
 import com.github.takahirom.roborazzi.RoborazziOptions
 import com.github.takahirom.roborazzi.captureRoboImage
 import kotlinx.collections.immutable.persistentListOf
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.SupervisorJob
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -162,7 +160,6 @@ class ScreenSnapshots {
 
     private fun stubClipboard(): Clipboard = Clipboard(
         context = ApplicationProvider.getApplicationContext(),
-        scope = CoroutineScope(SupervisorJob()),
     )
 
     private fun setRageContent(block: @Composable () -> Unit) {
@@ -242,7 +239,7 @@ class ScreenSnapshots {
         setRageContent {
             ItemDetailScreen(
                 item = detailItem,
-                decryptPassword = { _, _ -> ByteArray(0) },
+                decryptPassword = { _, _, _, _ -> ByteArray(0) },
                 clipboard = stubClipboard(),
                 showToast = {},
                 onBack = {},
@@ -335,7 +332,7 @@ class ScreenSnapshots {
         setRageContent {
             ItemDetailScreen(
                 item = detailItem,
-                decryptPassword = { _, _ -> ByteArray(0) },
+                decryptPassword = { _, _, _, _ -> ByteArray(0) },
                 clipboard = stubClipboard(),
                 showToast = {},
                 onBack = {},
@@ -378,7 +375,7 @@ class ScreenSnapshots {
         setRageContent {
             ItemDetailScreen(
                 item = detailItem,
-                decryptPassword = { _, _ -> ByteArray(0) },
+                decryptPassword = { _, _, _, _ -> ByteArray(0) },
                 clipboard = stubClipboard(),
                 showToast = {},
                 onBack = {},

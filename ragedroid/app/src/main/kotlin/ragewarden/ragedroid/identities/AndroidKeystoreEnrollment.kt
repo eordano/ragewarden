@@ -9,7 +9,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import ragewarden.ragedroid.data.StoredRecipient
 import ragewarden.ragedroid.model.RecipientKind
-import java.math.BigInteger
 import java.security.KeyPairGenerator
 import java.security.interfaces.ECPublicKey
 import java.security.spec.ECGenParameterSpec
@@ -65,13 +64,15 @@ suspend fun enrollKeystoreIdentity(
                     keystorePubkey = pub,
                     keystoreHandle = attemptHandle,
                     keystoreAuthBound = backing.biometric,
+                    keystorePerUse = backing.biometric && keystorePerUse(),
                 )
                 val identity = AndroidKeystoreIdentity(
-                    mockSecret = null,
+                    mockKey = null,
                     expectedPublicKey = pub,
                     keyHandle = attemptHandle,
                     label = effectiveDisplayName,
                     authBound = backing.biometric,
+                    perUse = backing.biometric && keystorePerUse(),
                 )
                 return@withContext recipient to identity
             }
@@ -91,6 +92,9 @@ suspend fun enrollKeystoreIdentity(
     )
 }
 
+/** Whether an auth-bound Keystore key enrolled now is per use (API 35+) rather than a 30-second window. */
+fun keystorePerUse(): Boolean = android.os.Build.VERSION.SDK_INT >= 35
+
 private fun generateKeyPairOnce(handle: String, backing: KeystoreBacking): ByteArray {
     val specBuilder = KeyGenParameterSpec.Builder(handle, KeyProperties.PURPOSE_AGREE_KEY)
         .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
@@ -100,8 +104,12 @@ private fun generateKeyPairOnce(handle: String, backing: KeystoreBacking): ByteA
     }
     if (backing.biometric) {
         specBuilder.setUserAuthenticationRequired(true)
+        // Validity 0 is per use: each ECDH needs its own prompt, run with the
+        // KeyAgreement as the CryptoObject (Android 15 added that). Below 35 a
+        // KeyAgreement cannot be a CryptoObject, so the key falls back to a
+        // 30-second window opened by a prompt just before the decrypt.
         specBuilder.setUserAuthenticationParameters(
-            KEY_VALIDITY_SECONDS,
+            if (keystorePerUse()) 0 else KEY_VALIDITY_SECONDS,
             KeyProperties.AUTH_BIOMETRIC_STRONG or KeyProperties.AUTH_DEVICE_CREDENTIAL,
         )
     }
@@ -147,14 +155,4 @@ fun isBiometricEnrollable(context: Context): Boolean {
     val allowed = androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG or
         androidx.biometric.BiometricManager.Authenticators.DEVICE_CREDENTIAL
     return mgr.canAuthenticate(allowed) == androidx.biometric.BiometricManager.BIOMETRIC_SUCCESS
-}
-
-internal fun littleEndian32ToBigInteger(le: ByteArray): BigInteger =
-    BigInteger(1, le.reversedArray())
-
-internal fun bigIntegerToLittleEndian32(bi: BigInteger): ByteArray {
-    val be = bi.toByteArray()
-    val unsigned = if (be.size == 33 && be[0] == 0.toByte()) be.copyOfRange(1, 33) else be
-    val padded = if (unsigned.size < 32) ByteArray(32 - unsigned.size) + unsigned else unsigned
-    return padded.reversedArray()
 }

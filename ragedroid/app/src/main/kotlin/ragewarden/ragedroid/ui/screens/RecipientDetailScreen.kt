@@ -17,7 +17,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Fingerprint
@@ -36,6 +35,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -44,13 +44,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.data.VaultBridge
 import ragewarden.ragedroid.di.appEntryPoint
 import ragewarden.ragedroid.model.Recipient
 import ragewarden.ragedroid.model.RecipientKind
 import ragewarden.ragedroid.ui.components.AppBar
+import ragewarden.ragedroid.ui.components.BackButton
 import ragewarden.ragedroid.ui.components.ButtonVariant
-import ragewarden.ragedroid.ui.components.IconBtn
 import ragewarden.ragedroid.ui.components.MasterPasswordConfirm
 import ragewarden.ragedroid.ui.components.Mono
 import ragewarden.ragedroid.ui.components.RageButton
@@ -58,6 +59,7 @@ import ragewarden.ragedroid.ui.components.RageChip
 import ragewarden.ragedroid.ui.components.Sheet
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
+import ragewarden.ragedroid.ui.uiString
 
 @Composable
 fun RecipientDetailScreen(
@@ -66,6 +68,7 @@ fun RecipientDetailScreen(
     onRename: (String) -> Unit = {},
     onRemove: () -> Unit = {},
     onToast: (String) -> Unit = {},
+    onRewrapStale: () -> Unit = {},
 ) {
     val c = rageColors
     var revokeOpen by remember { mutableStateOf(false) }
@@ -103,30 +106,24 @@ fun RecipientDetailScreen(
     val coverageKnowable = descriptors.isNotEmpty()
     /** Revoke copy must not quote a count we could not compute. */
     val wrappedItemsPhrase = if (coverageKnowable) {
-        "The $coverage item${if (coverage == 1) "" else "s"} already wrapped to it"
+        androidx.compose.ui.res.pluralStringResource(R.plurals.items_already_protected_with_it, coverage, coverage)
     } else {
-        "Items already wrapped to it"
+        stringResource(R.string.items_already_protected_with_it)
     }
 
     val subtitle = when (recipient.kind) {
-        RecipientKind.YubiKey -> "YubiKey · PIV X25519"
-        RecipientKind.Fido2 -> "FIDO2 hmac-secret"
-        RecipientKind.PasskeyPrf -> "Passkey · WebAuthn PRF"
-        RecipientKind.StrongBox -> "Android StrongBox"
-        RecipientKind.Recovery -> "Paper age identity"
-        RecipientKind.Software -> "Software identity"
+        RecipientKind.YubiKey -> stringResource(R.string.yubikey_piv_x25519)
+        RecipientKind.Fido2 -> stringResource(R.string.passkey_fido2_hmac_secret_older_format)
+        RecipientKind.PasskeyPrf -> stringResource(R.string.passkey_webauthn_prf)
+        RecipientKind.StrongBox -> stringResource(R.string.android_strongbox)
+        RecipientKind.Recovery -> stringResource(R.string.paper_recovery_phrase)
+        RecipientKind.Software -> stringResource(R.string.software_identity)
     }
 
     Column(modifier = Modifier.fillMaxSize().background(c.background)) {
         AppBar(
-            title = "Recipient",
-            leading = {
-                IconBtn(
-                    icon = Icons.AutoMirrored.Outlined.ArrowBack,
-                    contentDescription = "Back",
-                    onClick = onBack,
-                )
-            },
+            title = stringResource(R.string.recipient),
+            leading = { BackButton(onBack) },
         )
 
         Column(
@@ -189,7 +186,7 @@ fun RecipientDetailScreen(
                         verticalAlignment = Alignment.Bottom,
                     ) {
                         Text(
-                            text = "COVERAGE",
+                            text = stringResource(R.string.coverage),
                             style = RageType.eyebrow.copy(fontSize = 11.sp),
                             color = c.fgSecondary,
                         )
@@ -200,7 +197,7 @@ fun RecipientDetailScreen(
                                 color = c.fgEmphasis,
                             )
                             Text(
-                                text = " of $totalProtected protected items",
+                                text = stringResource(R.string.of_protected_items, totalProtected),
                                 style = RageType.body.copy(fontSize = 13.5.sp),
                                 color = c.fgSecondary,
                             )
@@ -236,7 +233,7 @@ fun RecipientDetailScreen(
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = "This recipient can decrypt every protected item.",
+                                text = stringResource(R.string.this_recipient_can_decrypt_every_protected),
                                 style = RageType.caption.copy(fontSize = 11.5.sp),
                                 color = c.success,
                             )
@@ -254,10 +251,9 @@ fun RecipientDetailScreen(
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
                                 text = if (coverageKnowable) {
-                                    "Enrolled but never written to a cipher. Re-encrypt to add."
+                                    stringResource(R.string.no_item_is_protected_for_this)
                                 } else {
-                                    "An age header cannot name this kind of key, so coverage " +
-                                        "can't be counted from here. It may well open every item."
+                                    stringResource(R.string.items_do_not_record_this_kind)
                                 },
                                 style = RageType.caption.copy(fontSize = 11.5.sp),
                                 color = c.warning,
@@ -267,7 +263,7 @@ fun RecipientDetailScreen(
                 }
             }
 
-            SectionLabel(label = "Identity")
+            SectionLabel(label = stringResource(R.string.identity))
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -280,10 +276,10 @@ fun RecipientDetailScreen(
                         .background(c.border),
                 )
                 val rows = buildList {
-                    add(IdentityRow("Serial", recipient.serial, mono = false))
-                    add(IdentityRow("Public key", recipient.fingerprint, mono = true))
-                    add(IdentityRow("Enrolled", recipient.enrolled, mono = false))
-                    add(IdentityRow("Last used", recipient.lastUsed, mono = false))
+                    add(IdentityRow(stringResource(R.string.serial), recipient.serial, mono = false))
+                    add(IdentityRow(stringResource(R.string.public_key), recipient.fingerprint, mono = true))
+                    add(IdentityRow(stringResource(R.string.enrolled), recipient.enrolled, mono = false))
+                    add(IdentityRow(stringResource(R.string.last_used_2), recipient.lastUsed, mono = false))
                 }
                 rows.forEachIndexed { idx, row ->
                     IdentityRowView(row = row, isLast = idx == rows.lastIndex)
@@ -305,13 +301,13 @@ fun RecipientDetailScreen(
                     verticalAlignment = Alignment.Bottom,
                 ) {
                     Text(
-                        text = "CAN UNLOCK",
+                        text = stringResource(R.string.can_unlock),
                         style = RageType.eyebrow.copy(fontSize = 11.sp, letterSpacing = 0.08.em),
                         color = c.fgSecondary,
                     )
                     if (items.size > 6) {
                         Text(
-                            text = "${items.size} items",
+                            text = stringResource(R.string.items, items.size),
                             style = RageType.caption.copy(fontSize = 11.5.sp),
                             color = c.fgSecondary,
                         )
@@ -333,10 +329,9 @@ fun RecipientDetailScreen(
                 if (items.isEmpty()) {
                     Text(
                         text = if (coverageKnowable) {
-                            "No ciphers list this recipient yet. Add it during the next re-encrypt."
+                            stringResource(R.string.no_items_use_this_key_yet)
                         } else {
-                            "Items wrapped to this recipient can't be listed: its stanza carries " +
-                                "no identifying argument, so no header names it."
+                            stringResource(R.string.items_protected_with_this_key_can)
                         },
                         style = RageType.body.copy(
                             fontSize = 13.5.sp,
@@ -365,7 +360,7 @@ fun RecipientDetailScreen(
                                     overflow = TextOverflow.Ellipsis,
                                 )
                                 Text(
-                                    text = "${item.folder} · ${item.recipients.size} recipients",
+                                    text = stringResource(R.string.recipients, item.folder, item.recipients.size),
                                     style = RageType.caption.copy(fontSize = 11.5.sp),
                                     color = c.fgSecondary,
                                 )
@@ -383,7 +378,7 @@ fun RecipientDetailScreen(
                                         .padding(horizontal = 5.dp, vertical = 1.dp),
                                 ) {
                                     Text(
-                                        text = "SOLE",
+                                        text = stringResource(R.string.sole),
                                         style = RageType.eyebrow.copy(
                                             fontSize = 9.5.sp,
                                             letterSpacing = 0.06.em,
@@ -404,7 +399,7 @@ fun RecipientDetailScreen(
                     }
                     if (items.size > 6) {
                         Text(
-                            text = "+ ${items.size - 6} more",
+                            text = stringResource(R.string.more, items.size - 6),
                             style = RageType.caption.copy(fontSize = 12.sp),
                             color = c.fgSecondary,
                             textAlign = TextAlign.Center,
@@ -425,26 +420,51 @@ fun RecipientDetailScreen(
             Column(
                 modifier = Modifier.padding(start = 18.dp, end = 18.dp, top = 24.dp, bottom = 32.dp),
             ) {
+                if (recipient.kind == ragewarden.ragedroid.model.RecipientKind.Fido2) {
+                    val stored = remember(recipient.id, accountId) {
+                        recipientStore.forAccount(accountId).firstOrNull { it.id == recipient.id }
+                    }
+                    if (stored != null) {
+                        Text(text = stringResource(R.string.passkey_move_title), style = RageType.eyebrow, color = c.fgSecondary)
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(text = stringResource(R.string.passkey_move_body), style = RageType.caption, color = c.fgSecondary)
+                        Spacer(modifier = Modifier.height(10.dp))
+                        val moved = stringResource(R.string.passkey_moved)
+                        val failed = stringResource(R.string.passkey_move_failed)
+                        RageButton(
+                            label = stringResource(R.string.passkey_move_button),
+                            onClick = {
+                                scope.launch {
+                                    runCatching {
+                                        recipientStore.add(accountId, stored.migratedToPasskeyPrf())
+                                        repo?.pushRecipientRegistry()?.getOrThrow()
+                                    }.onSuccess { onToast(moved); onBack() }
+                                        .onFailure { e -> onToast(failed.format(e.message ?: "")) }
+                                }
+                            },
+                            variant = ButtonVariant.Secondary,
+                            fullWidth = true,
+                        )
+                        Spacer(modifier = Modifier.height(24.dp))
+                    }
+                }
                 Text(
-                    text = "DANGER ZONE",
+                    text = stringResource(R.string.danger_zone),
                     style = RageType.eyebrow.copy(fontSize = 11.sp, letterSpacing = 0.08.em),
                     color = c.dangerStrong,
                 )
                 Spacer(modifier = Modifier.height(10.dp))
                 RageButton(
-                    label = "Revoke this recipient",
+                    label = stringResource(R.string.revoke_this_recipient),
                     onClick = { revokeOpen = true },
                     variant = ButtonVariant.Secondary,
                     fullWidth = true,
                 )
                 Spacer(modifier = Modifier.height(10.dp))
-                // Say what unpublishRecipient() actually does. It rewrites the
-                // recipient-registry marker cipher and syncs; it never touches
-                // an item cipher, and ragedroid has no bulk-rewrap path at all.
-                // The old copy promised a re-encrypt of every cipher, one tap
-                // each -- a security outcome nothing in the app produces.
+                // unpublishRecipient() rewrites the registry and syncs; the items
+                // themselves are re-encrypted afterwards by the backfill wizard.
                 Text(
-                    text = "Drops this recipient from the published set, so nothing new is encrypted to it. Ciphers already wrapped to it keep their stanza and stay readable by it until each item is rotated. Getting it back means re-enrolling.",
+                    text = stringResource(R.string.drops_this_recipient_from_the_published),
                     style = RageType.caption.copy(fontSize = 11.5.sp, lineHeight = 17.sp),
                     color = c.fgSecondary,
                 )
@@ -452,10 +472,10 @@ fun RecipientDetailScreen(
         }
     }
 
-    Sheet(open = revokeOpen, onDismiss = { revokeOpen = false }, title = "Revoke ${recipient.name}?") {
+    Sheet(open = revokeOpen, onDismiss = { revokeOpen = false }, title = stringResource(R.string.revoke, recipient.name)) {
         Column(modifier = Modifier.fillMaxWidth()) {
             Text(
-                text = "${recipient.name} stops being encrypted to from now on. $wrappedItemsPhrase keep their stanza and stay readable by it until each one is rotated, so the coverage count above will not drop.",
+                text = stringResource(R.string.stops_being_encrypted_to_from_now, recipient.name, wrappedItemsPhrase),
                 style = RageType.body.copy(fontSize = 14.5.sp, lineHeight = 22.sp),
                 color = c.fgPrimary,
                 modifier = Modifier.padding(bottom = 12.dp),
@@ -468,21 +488,21 @@ fun RecipientDetailScreen(
                 // The 48dp touch floor that keeps a thumb miss off it lives in
                 // RageButton itself, so neither call site restates it.
                 RageButton(
-                    label = "Keep",
+                    label = stringResource(R.string.keep),
                     onClick = { revokeOpen = false },
                     variant = ButtonVariant.Ghost,
                     fullWidth = true,
                     modifier = Modifier.weight(1f),
                 )
                 RageButton(
-                    label = "Revoke",
+                    label = stringResource(R.string.revoke_2),
                     onClick = {
                         revokeOpen = false
                         // No repository means no master-password gate exists to
                         // put in front of this, so refuse instead of revoking
                         // ungated.
                         if (repo == null || accountId.isBlank()) {
-                            onToast("No active account")
+                            onToast(uiString(R.string.no_active_account))
                         } else {
                             pwOpen = true
                         }
@@ -490,6 +510,7 @@ fun RecipientDetailScreen(
                     variant = ButtonVariant.Danger,
                     fullWidth = true,
                     modifier = Modifier.weight(1f),
+                    rejectObscured = true,
                 )
             }
         }
@@ -504,9 +525,9 @@ fun RecipientDetailScreen(
         MasterPasswordConfirm(
             open = pwOpen,
             onClose = { if (!revoking) pwOpen = false },
-            title = "Revoke ${recipient.name}?",
-            body = "${recipient.name} stops being encrypted to. $wrappedItemsPhrase stay readable by it until each is rotated. Confirm with your master password to continue.",
-            action = if (revoking) "Revoking..." else "Revoke recipient",
+            title = stringResource(R.string.revoke, recipient.name),
+            body = stringResource(R.string.stops_being_encrypted_to_stay_readable, recipient.name, wrappedItemsPhrase),
+            action = if (revoking) stringResource(R.string.revoking) else stringResource(R.string.revoke_recipient),
             repository = repo,
             onConfirm = {
                 if (revoking) return@MasterPasswordConfirm
@@ -517,12 +538,14 @@ fun RecipientDetailScreen(
                         runCatching { recipientStore.remove(accountId, recipient.id) }
                         pwOpen = false
                         revoking = false
-                        onToast("Recipient revoked")
+                        onToast(context.getString(R.string.recipient_revoked))
                         onRemove()
-                        onBack()
+                        // Items already wrapped to it stay readable by it until they
+                        // are re-encrypted; the wizard does that, one tap each.
+                        if (items.isNotEmpty()) onRewrapStale() else onBack()
                     }.onFailure { e ->
                         revoking = false
-                        onToast("Revoke failed: ${e.message ?: "unknown error"}")
+                        onToast(uiString(R.string.revoke_failed, e.message ?: uiString(R.string.unknown_error)))
                     }
                 }
             },

@@ -1,5 +1,3 @@
-/* Layout + components for the real popup. Design tokens come from tokens.css,
-   which the build copies from design/colors_and_type.css. */
 
 html, body {
   height: 100%;
@@ -75,8 +73,6 @@ body {
   color: var(--color-fg-emphasis);
 }
 
-/* app bar */
-
 .appbar {
   display: flex;
   align-items: center;
@@ -99,8 +95,6 @@ body {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .appbar-actions { display: flex; gap: 2px; flex-shrink: 0; }
-
-/* buttons */
 
 .btn {
   font-family: var(--font-sans);
@@ -141,8 +135,6 @@ body {
 .btn-icon:hover:not(:disabled) { background: var(--color-tile); }
 
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-
-/* inputs */
 
 .field { display: block; }
 .field > .eyebrow { display: block; margin-bottom: 5px; }
@@ -187,8 +179,6 @@ body {
   max-width: none;
 }
 
-/* lists */
-
 .list { display: flex; flex-direction: column; }
 .list-sub { display: flex; flex-direction: column; gap: 6px; }
 
@@ -232,9 +222,6 @@ body {
   color: var(--color-fg-secondary);
 }
 
-/* Only the exception is marked: a row with no tag is hardware-protected, which
-   is the rule. The list used to badge every row RAGE or plain and tint the
-   protected avatars as well, so the one row that needed to stand out did not. */
 .tag {
   font-size: 9.5px; font-weight: 700; letter-spacing: 0.07em;
   padding: 2px 6px; border-radius: 999px;
@@ -298,8 +285,6 @@ body {
   color: var(--color-fg-secondary);
 }
 
-/* banners */
-
 .banner {
   display: flex; align-items: flex-start; gap: 10px;
   border: 1px solid var(--color-border);
@@ -319,8 +304,6 @@ body {
 .banner-danger  { border-left-color: var(--color-danger-strong); }
 .banner-info    { border-left-color: var(--color-info); }
 
-/* secrets */
-
 .readout {
   display: flex; align-items: center; gap: 8px;
   background: var(--color-surface-sunken);
@@ -329,6 +312,7 @@ body {
   padding: 7px 8px 7px 11px;
 }
 .readout > .mono { flex: 1; min-width: 0; word-break: break-all; }
+.readout > .mono.wrap { white-space: pre-wrap; }
 
 .secret-host { margin-bottom: 8px; }
 .secret-idle {
@@ -370,8 +354,6 @@ body {
 }
 .phrase-word .mono { font-size: 12px; word-break: break-all; }
 
-/* sheet */
-
 .sheet {
   position: absolute; inset: 0; z-index: 60;
   display: flex; flex-direction: column; justify-content: flex-end;
@@ -398,20 +380,11 @@ body {
 .sheet-actions { display: flex; gap: 8px; }
 .sheet-actions .btn:first-child { flex-shrink: 0; }
 
-/* toasts */
-
-/* Toasts sit *in* the column, below the screen -- they never overlay it.
-   As `position: absolute; bottom: 8px; z-index: 80` this host floated over the
-   footer: an error toast covered most of the primary button it was telling the
-   user to press, and outranked .sheet (z-index 60) so it painted over
-   confirmation dialogs. In flow it can do neither, and the empty host is 0px
-   high, so nothing is displaced until something has to be said. */
 .toast-host {
   flex-shrink: 0;
   padding: 0 8px 8px;
   display: flex; flex-direction: column; gap: 5px;
 }
-/* The whole toast is the dismiss button. */
 .toast {
   display: flex; align-items: flex-start; gap: 8px;
   width: 100%; box-sizing: border-box;
@@ -439,3 +412,15 @@ body {
 
 *::-webkit-scrollbar { width: 6px; height: 6px; }
 *::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 3px; }
+
+.ceremony {
+    border: 1px solid var(--color-border, #2c2c2c);
+    border-left: 3px solid var(--color-info);
+    border-radius: 8px;
+    padding: 8px 10px;
+    display: grid;
+    gap: 2px;
+}
+.ceremony-action { font-weight: 600; }
+.ceremony-dest { font-size: 11.5px; }
+.totp-code { font-size: 20px; letter-spacing: 0.12em; }

@@ -21,14 +21,17 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.data.BitwardenVaultRepository
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
+import ragewarden.ragedroid.ui.uiString
 
 /**
  * Master-password gate in front of a destructive action.
@@ -47,9 +50,9 @@ fun MasterPasswordConfirm(
     onClose: () -> Unit,
     onConfirm: () -> Unit,
     repository: BitwardenVaultRepository,
-    title: String = "Confirm with master password",
+    title: String = uiString(R.string.confirm_with_master_password),
     body: String? = null,
-    action: String = "Confirm",
+    action: String = uiString(R.string.confirm),
     danger: Boolean = true,
 ) {
     val c = rageColors
@@ -69,7 +72,7 @@ fun MasterPasswordConfirm(
     val submit: () -> Unit = submit@{
         if (working) return@submit
         if (pw.isEmpty()) {
-            err = "Enter your master password."
+            err = uiString(R.string.enter_your_master_password)
             return@submit
         }
         working = true
@@ -83,14 +86,14 @@ fun MasterPasswordConfirm(
                         onConfirm()
                         onClose()
                     } else {
-                        err = "Wrong master password."
+                        err = uiString(R.string.wrong_master_password)
                     }
                 },
                 // Verification failing is not verification passing. Surface the
                 // error and keep the sheet open rather than letting the action
                 // through.
                 onFailure = { e ->
-                    err = e.message ?: "Could not verify password."
+                    err = e.message ?: uiString(R.string.could_not_verify_password)
                 },
             )
         }
@@ -106,7 +109,7 @@ fun MasterPasswordConfirm(
                     modifier = Modifier.padding(bottom = 14.dp),
                 )
             }
-            Field(label = "Master password") {
+            Field(label = stringResource(R.string.master_password)) {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -155,15 +158,16 @@ fun MasterPasswordConfirm(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 RageButton(
-                    label = "Cancel",
+                    label = stringResource(R.string.cancel),
                     onClick = onClose,
                     variant = ButtonVariant.Secondary,
                 )
                 RageButton(
-                    label = if (working) "Working..." else action,
+                    label = if (working) stringResource(R.string.working) else action,
                     onClick = submit,
                     variant = if (danger) ButtonVariant.Danger else ButtonVariant.Primary,
                     enabled = !working,
+                    rejectObscured = true,
                     modifier = Modifier.weight(1f),
                     fullWidth = true,
                 )

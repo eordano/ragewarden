@@ -1,85 +1,47 @@
-# RagewardenHost -- Safari host app
+# Ragewarden for Safari -- host app
 
-Minimal macOS host application that ships the Ragewarden Safari Web Extension. Apple's
-extension model requires every Safari Web Extension to be packaged inside a host app: this
-folder is that shell.
+Safari ships web extensions inside a macOS app. `build.sh` builds that app from the
+extension in `../dist/safari`:
 
-## Why this exists
-
-Safari Web Extensions cannot be sideloaded the way Chromium / Firefox extensions can. They
-are bundled into a `.app`, signed with an Apple Developer ID, optionally notarized, and
-distributed through the App Store (or, for development builds, sideloaded by enabling the
-"Allow Unsigned Extensions" toggle in Safari -> Develop). The host app's only job is to
-present a settings/about window and ensure the bundled extension shows up in
-Safari -> Settings -> Extensions.
-
-The actual extension logic -- popup, content script, background page, WASM -- lives in
-`../ext/` and is staged into the Xcode project at build time by `xcrun
-safari-web-extension-converter`.
-
-## Repository layout
-
-```
-safari-host-app/
-+-- README.md         # this file
-+-- Package.swift     # Swift Package -- minimal target so the Swift code stays compilable
-|                     # without an Xcode project; the real `.app` is produced by Xcode
-|                     # via the converter (below).
-+-- Sources/
-    +-- RagewardenHost/
-        +-- main.swift
+```sh
+wasm-pack build --target web ..        # or from ragewarden/: wasm-pack build --target web ragemanifest
+node ../build.mjs safari
+./build.sh                             # prints the path of Ragewarden.app
 ```
 
-The `Package.swift` produces a CLI binary; the actual macOS `.app` is produced by Xcode.
-We keep both because:
+It runs `xcrun safari-web-extension-converter` (macOS-only, Swift) into `build/`, gives the
+app the bundle id `com.ragewarden.safari` (override with `SAFARI_BUNDLE_ID`) so the
+extension `com.ragewarden.safari.Extension` embeds under it, builds Release with
+`xcodebuild`, and checks that the `.appex` carries the manifest and the very wasm in
+`dist/safari`. The build is unsigned; set `SAFARI_TEAM_ID` to sign with your team.
+`Package.swift` / `Sources/RagewardenHost/main.swift` are the host's own launcher (it opens
+Safari's extension settings when the extension is off) and build with `swift build`.
 
-- `swift build` runs in CI on Linux runners (the file compiles, the AppKit/SafariServices
-  blocks are gated behind `#if canImport(...)`), so a regression in the host-app source
-  blocks merge.
-- The Xcode project is intentionally not committed here -- Xcode project files are noisy
-  XML diffs that don't survive automated edits well. A human developer regenerates them
-  with `xcrun safari-web-extension-converter`.
+CI builds both on `macos-latest` (`.github/workflows/ci.yml`, job `safari`).
 
-## Generating the Xcode project
+## Running it
 
-From the repo root, after building the extension into `dist/safari/`:
+Open `Ragewarden.app`, then enable Ragewarden in Safari -> Settings -> Extensions. An
+unsigned build needs Safari -> Develop -> Allow Unsigned Extensions.
 
-```bash
-node ragemanifest/build.mjs safari --with-wasm
-xcrun safari-web-extension-converter \
-    ragemanifest/dist/safari \
-    --project-location ragemanifest/safari-host-app/build \
-    --bundle-identifier com.ragewarden.safari \
-    --app-name "Ragewarden" \
-    --no-prompt --no-open
-```
+## Distribution
 
-The converter writes `build/Ragewarden/Ragewarden.xcodeproj`. The host-app target it
-generates is conventional Swift + AppKit + SafariServices code. The `main.swift` here
-mirrors the pattern Apple's template uses, so when the converter overwrites the target
-sources at upgrade time the diff stays small.
-
-## Distribution channels
-
-| channel | requirements |
+| channel | what it takes |
 |---|---|
-| Local development | Xcode -> "Run" -- sideloads the extension into the running Safari. Toggle Safari -> Develop -> "Allow Unsigned Extensions" to enable. |
-| Direct download (`.dmg`) | Apple Developer Program membership ($99/year). Sign with `codesign`, notarize with `xcrun notarytool`. Stamp the ticket onto the `.dmg`. |
-| Mac App Store | Apple Developer Program membership ($99/year) + App Store Connect submission. Apple's reviewer runs the host app in their environment; expect feedback on the host-app UI specifically (Apple expects more than a stub window). |
+| Direct download | Developer ID signing (`SAFARI_TEAM_ID`), `xcrun notarytool`, a `.dmg` |
+| Mac App Store | Apple Developer Program and App Store Connect review |
 
-The Mac App Store is the canonical channel for end users; direct download is the escape
-hatch for users who don't want to use the App Store. Both share the same signed binary.
+## PIV and FIDO2 keys
 
-## Native messaging caveat
-
-Safari Web Extensions cannot use `chrome.runtime.connectNative`. The PIV-via-rageterm
-path that lights up in Chromium and Firefox is **post-MVP on Safari** and requires the
-host app to bridge via `NSExtensionContext` + a separate XPC service -- design work
-captured in `ragemanifest/DESIGN.md` §5 and §6.
-
-## Source of truth
-
-- Extension code: `ragemanifest/ext/`
-- Extension-to-Safari converter: `xcrun safari-web-extension-converter` (Apple)
-- Distribution checklists: `../../SECURITY.md` (release-gate ceremonies)
-- Apple Developer ID setup, App Store submission: external Apple developer docs
+Safari has no native-messaging host manifests. The extension's
+`runtime.sendNativeMessage` goes to this app's extension handler
+(`Extension/SafariWebExtensionHandler.swift`, copied over the converter's), which
+relays the same length-prefixed request to `rageterm native-host` and returns its reply.
+Set `RAGETERM_BIN` to a macOS rageterm and `build.sh` bundles it next to the handler,
+which prefers it; otherwise the handler runs an installed rageterm (Homebrew, Nix
+profile). For the sandboxed extension `build.sh` adds the smart-card and USB entitlements
+and read access to `~/.config/ragewarden` and those install locations; the handler runs
+rageterm with the user's real HOME. A signed build signs the bundled rageterm to inherit
+the extension's sandbox and re-seals the extension and app around it. `swift test` runs
+the handler against stand-in rageterms (framing, native-host mode, HOME, no reply, a
+rageterm that exits early, an oversized reply).

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub struct RegisterResultDto {
     pub email: String,
     pub kdf_iterations: u32,
+    pub kdf_type: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -15,16 +16,30 @@ pub struct SessionDto {
     pub user_id: String,
     pub email: String,
 
+    #[serde(default)]
     pub user_enc_key_b64: String,
 
+    #[serde(default)]
     pub user_mac_key_b64: String,
     pub kdf_iterations: u32,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kdf_type: Option<u32>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kdf_memory_mib: Option<u32>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kdf_parallelism: Option<u32>,
 
     #[serde(default)]
     pub device_id: String,
 
     pub api_url: String,
     pub identity_url: String,
+
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub protected_user_key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -134,4 +149,8 @@ pub struct VaultItemDto {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshDto>,
+
+    /// What the rage blob holds, by Bitwarden field name; those fields are
+    /// absent above and need a tap.
+    pub protected_fields: Vec<String>,
 }

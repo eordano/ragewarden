@@ -203,8 +203,12 @@ export class RagetermDriver {
         return this.run(['recipients', 'list']);
     }
 
-    /** Same consent gate as get(): rotate decrypts before it re-encrypts. */
+    /**
+     * Same consent gate as get(): reencrypt decrypts before it re-encrypts.
+     * --allow-revoke because a browser passkey stanza can only be written by the
+     * browser that holds the authenticator; the popup keeps its Software entry.
+     */
     async rotate(name: string): Promise<RunResult> {
-        return this.run(['rotate', name, '--yes']);
+        return this.run(['reencrypt', name, '--yes', '--allow-revoke']);
     }
 }

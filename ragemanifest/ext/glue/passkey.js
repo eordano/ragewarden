@@ -1,6 +1,14 @@
+import { b64ToBytes, bytesToB64, bytesToB64Url } from './b64.js';
+import { authenticatorFlags as flagsFromAuthData, checkClientData, purposeChallenge } from './assertion.js';
+
 const DEFAULT_RP_NAME = 'Ragewarden';
 
-function defaultRpId() {
+export const PRF_UNSUPPORTED = 'this browser or authenticator does not support the WebAuthn PRF '
+    + 'extension, which Ragewarden needs to derive keys from a passkey (Chrome/Edge 116+, Firefox '
+    + '132+, Safari 18+, with a passkey provider that implements it). Use another authenticator, '
+    + 'or protect items with a paper recovery phrase.';
+
+export function defaultRpId() {
     if (typeof location !== 'undefined' && location.hostname) return location.hostname;
     throw new Error(
         'rpId is required in this context: no location.hostname to derive it from. '
@@ -10,19 +18,11 @@ function defaultRpId() {
 }
 
 export function authenticatorFlags(assertion) {
-    const out = { userPresent: false, userVerified: false, known: false };
     try {
         const ad = assertion && assertion.response && assertion.response.authenticatorData;
-        if (!ad) return out;
-        const bytes = new Uint8Array(ad);
-        if (bytes.length < 33) return out;
-        const f = bytes[32];
-        out.userPresent = (f & 0x01) !== 0;
-        out.userVerified = (f & 0x04) !== 0;
-        out.known = true;
-        return out;
+        return flagsFromAuthData(ad ? new Uint8Array(ad) : null);
     } catch {
-        return out;
+        return { userPresent: false, userVerified: false, known: false };
     }
 }
 
@@ -56,24 +56,6 @@ function requireUserAction(assertion, what) {
         );
     }
     return flags;
-}
-
-function bytesToB64(bytes) {
-    const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-    let s = '';
-    for (let i = 0; i < arr.length; i++) s += String.fromCharCode(arr[i]);
-    return btoa(s);
-}
-
-function b64ToBytes(b64) {
-    const bin = atob(b64);
-    const out = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return out;
-}
-
-function bytesToB64Url(bytes) {
-    return bytesToB64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
 function ensureSalt(salt) {
@@ -125,7 +107,13 @@ export async function passkeyEnroll(opts = {}) {
     if (!cred) throw new Error('passkey create failed (no credential returned)');
 
     const extResults = (cred.getClientExtensionResults && cred.getClientExtensionResults()) || {};
+    if (!extResults.prf || extResults.prf.enabled === false) {
+        throw new Error(PRF_UNSUPPORTED);
+    }
     const prfFirst = extResults.prf && extResults.prf.results && extResults.prf.results.first;
+    const resp = cred.response || {};
+    const spki = typeof resp.getPublicKey === 'function' ? resp.getPublicKey() : null;
+    const alg = typeof resp.getPublicKeyAlgorithm === 'function' ? resp.getPublicKeyAlgorithm() : null;
 
     return {
         record: {
@@ -134,6 +122,7 @@ export async function passkeyEnroll(opts = {}) {
             salt_b64: bytesToB64(salt),
             rp_id: rpId,
             label,
+            ...(spki ? { public_key_spki_b64: bytesToB64(new Uint8Array(spki)), public_key_alg: alg } : {}),
         },
         // PRF output the authenticator returned from create() itself (CTAP2.1
         // hmac-secret at make-credential). PRF is deterministic in (credential,
@@ -146,35 +135,23 @@ export async function passkeyEnroll(opts = {}) {
     };
 }
 
-export async function passkeyUnlock(opts) {
-    const credentialId = opts.credentialId instanceof Uint8Array
-        ? opts.credentialId
-        : b64ToBytes(opts.credentialId);
-    const salt = ensureSalt(opts.salt);
-    const rpId = opts.rpId || defaultRpId();
-    const _action = String(opts.action || '');
-    const _destination = String(opts.destination || '');
-
-    const challenge = crypto.getRandomValues(new Uint8Array(32));
-    const assertion = await navigator.credentials.get({
-        publicKey: {
-            challenge,
-            rpId,
-            allowCredentials: [{ id: credentialId, type: 'public-key' }],
-            userVerification: 'required',
-            extensions: { prf: { eval: { first: salt } } },
-        },
-    });
-    if (!assertion) throw new Error('passkey assertion failed (no assertion returned)');
-    requireUserAction(assertion, 'passkeyUnlock');
-    const ext = assertion.getClientExtensionResults();
-    const prf = ext && ext.prf && ext.prf.results && ext.prf.results.first;
-    if (!prf) {
-        throw new Error('PRF extension produced no result; authenticator missing PRF capability');
+function requirePurpose(purpose, what) {
+    if (!purpose || typeof purpose !== 'object' || !purpose.nonce) {
+        throw new Error(`${what}: a purpose {action, destination, cipherId, origin, nonce} is required`);
     }
-    const out = new Uint8Array(prf);
-    if (out.length !== 32) throw new Error(`PRF output must be 32 bytes, got ${out.length}`);
-    return out;
+    return purpose;
+}
+
+async function assertionEvidence(assertion, purpose) {
+    const resp = assertion.response;
+    const clientDataJSON = new Uint8Array(resp.clientDataJSON);
+    await checkClientData(clientDataJSON, purpose);
+    return {
+        purpose,
+        clientDataJSON: bytesToB64(clientDataJSON),
+        authenticatorData: bytesToB64(new Uint8Array(resp.authenticatorData)),
+        signature: bytesToB64(new Uint8Array(resp.signature)),
+    };
 }
 
 export async function passkeyPresenceAssert(opts = {}) {
@@ -185,21 +162,22 @@ export async function passkeyPresenceAssert(opts = {}) {
         throw new Error('passkeyPresenceAssert: credentialIds must not be empty');
     }
     const rpId = opts.rpId || defaultRpId();
-    const challenge = crypto.getRandomValues(new Uint8Array(32));
+    const purpose = requirePurpose(opts.purpose, 'passkeyPresenceAssert');
     const assertion = await navigator.credentials.get({
         publicKey: {
-            challenge,
+            challenge: await purposeChallenge(purpose),
             rpId,
             allowCredentials: ids.map(id => ({ id, type: 'public-key' })),
             userVerification: 'required',
         },
     });
     if (!assertion) throw new Error('passkey assertion failed (no assertion returned)');
-    // UV is enforced inside requireUserAction() -- it used to be checked only
-    // here, which left the two PRF unlock paths (strictly stronger ceremonies)
-    // accepting an assertion this one rejected.
     const flags = requireUserAction(assertion, 'passkeyPresenceAssert');
-    return { credentialId: new Uint8Array(assertion.rawId), flags };
+    return {
+        credentialId: new Uint8Array(assertion.rawId),
+        flags,
+        evidence: await assertionEvidence(assertion, purpose),
+    };
 }
 
 export async function passkeyUnlockMulti(opts) {
@@ -213,8 +191,7 @@ export async function passkeyUnlockMulti(opts) {
         throw new Error('passkeyUnlockMulti: pairs must not be empty');
     }
     const rpId = opts.rpId || defaultRpId();
-    const _action = String(opts.action || '');
-    const _destination = String(opts.destination || '');
+    const purpose = requirePurpose(opts.purpose, 'passkeyUnlockMulti');
 
     const allowCredentials = pairs.map(p => ({
         id: p.credentialId,
@@ -225,10 +202,9 @@ export async function passkeyUnlockMulti(opts) {
         evalByCredential[bytesToB64Url(p.credentialId)] = { first: p.salt };
     }
 
-    const challenge = crypto.getRandomValues(new Uint8Array(32));
     const assertion = await navigator.credentials.get({
         publicKey: {
-            challenge,
+            challenge: await purposeChallenge(purpose),
             rpId,
             allowCredentials,
             userVerification: 'required',
@@ -239,15 +215,13 @@ export async function passkeyUnlockMulti(opts) {
     const flags = requireUserAction(assertion, 'passkeyUnlockMulti');
     const ext = assertion.getClientExtensionResults();
     const prf = ext && ext.prf && ext.prf.results && ext.prf.results.first;
-    if (!prf) {
-        throw new Error('PRF extension produced no result; authenticator missing PRF capability');
-    }
+    if (!prf) throw new Error(PRF_UNSUPPORTED);
     const prfOutput = new Uint8Array(prf);
     if (prfOutput.length !== 32) {
         throw new Error(`PRF output must be 32 bytes, got ${prfOutput.length}`);
     }
     const credentialId = new Uint8Array(assertion.rawId);
-    return { credentialId, prfOutput, flags };
+    return { credentialId, prfOutput, flags, evidence: await assertionEvidence(assertion, purpose) };
 }
 
 async function wrapWithPrf(prfOutput, armoredSecret) {
@@ -361,8 +335,3 @@ export async function passkeyEnrollWithSoftwareKey(opts, wasm, ceremony) {
     };
 }
 
-export const __testing = {
-    bytesToB64,
-    bytesToB64Url,
-    b64ToBytes,
-};

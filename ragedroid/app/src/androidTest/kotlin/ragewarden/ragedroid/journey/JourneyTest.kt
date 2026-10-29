@@ -1,7 +1,9 @@
 package ragewarden.ragedroid.journey
 
 import androidx.compose.ui.test.ComposeTimeoutException
+import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasSetTextAction
+import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isRoot
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -37,10 +39,10 @@ import ragewarden.ragedroid.MainActivity
  * honest cross-client path, and this test walks it end to end: it does not stop
  * at sign-in, and it asserts the recovered plaintext by value.
  *
- * The direction proven here is rageterm -> ragedroid. The reverse (a phrase
- * generated ON the phone and consumed by another client) is NOT covered; see
- * step 5 of `tests/journey/run.sh`, which says so plainly rather than invoking a
- * browser spec that does not exist.
+ * The direction proven here is rageterm -> ragedroid. The item this test writes
+ * at the end goes on to the browser: run.sh's browser half
+ * (`ragemanifest/tests/playwright/tests/android-recovery.spec.ts`) opens it with
+ * the same 24 words.
  *
  * THREE MORE THINGS ARE ASSERTED HERE, and each one is here rather than in a
  * cheaper test because a cheaper test could not fail:
@@ -124,7 +126,7 @@ class JourneyTest {
     private val server get() = requireArg("journeyServer")
     private val email get() = requireArg("journeyEmail")
     private val password get() = requireArg("journeyPassword")
-    private val phrase get() = requireArg("journeyPhrase")
+    private val phrase get() = requireArg("journeyPhrase").replace('_', ' ')
     private val item get() = requireArg("journeyItem")
     private val secret get() = requireArg("journeySecret")
 
@@ -134,7 +136,7 @@ class JourneyTest {
      * [item]. See the class header: this is the negative control, and it is the
      * only reason the positive assertion below means anything.
      */
-    private val decoyPhrase get() = requireArg("journeyDecoyPhrase")
+    private val decoyPhrase get() = requireArg("journeyDecoyPhrase").replace('_', ' ')
 
     /**
      * How many recipients rageterm actually wrapped [item] to. run.sh derives
@@ -163,19 +165,18 @@ class JourneyTest {
         }
 
         // --- sign in -------------------------------------------------------
-        // Three text fields in document order: Server, Email, Master password.
-        // ragedroid sets no testTag anywhere in main/, so positional lookup over
-        // hasSetTextAction() is the only stable handle. If the form gains a
-        // field this breaks loudly, which is the right failure.
+        // Fields are found by test tag, not position: the composer gained a TOTP
+        // field above the password (RD-12) and a positional lookup silently typed
+        // the secret into it, so the write-gate step below saw no secret to wrap.
         journal.note("Sign-in form. Server must be loopback; see the class header.")
         journal.step("fill the server field") {
-            fields()[0].performTextReplacement(server)
+            field("signin-server").performTextReplacement(server)
         }
         journal.step("fill the email field") {
-            fields()[1].performTextReplacement(email)
+            field("signin-email").performTextReplacement(email)
         }
         journal.step("fill the master password field") {
-            fields()[2].performTextReplacement(password)
+            field("signin-password").performTextReplacement(password)
         }
 
         journal.step("tap Sign in & continue") {
@@ -223,7 +224,7 @@ class JourneyTest {
             "All three clients park their own machinery in the shared vault as ordinary " +
                 "ciphers: rageterm's private recipient list ('$RAGETERM_RECIPIENT_LIST', " +
                 "rageterm/src/recipients.rs:20), the browser's per-item history markers " +
-                "('$HISTORY_MARKER:<cipherId>', ragemanifest/src/wasm/sync.rs:1045) and " +
+                "('${HISTORY_MARKERS.last()}:<cipherId>', ragemanifest/src/wasm/sync.rs:1045) and " +
                 "ragedroid's own registry marker ('${RAGEDROID_MARKER}recipients_v1__'). " +
                 "The phone filtered ONLY the last of those, so a vault any other client " +
                 "had touched rendered machinery as user items -- offering to edit it and " +
@@ -243,11 +244,13 @@ class JourneyTest {
                     )
                 }
                 // Substring, not equality: the browser names one marker per
-                // cipher it has edited, '$HISTORY_MARKER:<cipherId>', so there
+                // cipher it has edited, '<v1 marker>:<cipherId>', so there
                 // is no fixed string to compare against. rageterm's single
                 // history document uses the bare name, and both must be gone.
-                if (nodes(HISTORY_MARKER, substring = true).isNotEmpty()) {
-                    add("a row whose name carries '$HISTORY_MARKER' is in the list.")
+                for (marker in HISTORY_MARKERS) {
+                    if (nodes(marker, substring = true).isNotEmpty()) {
+                        add("a row whose name carries '$marker' is in the list.")
+                    }
                 }
                 if (nodes(RAGEDROID_MARKER, substring = true).isNotEmpty()) {
                     add("a row whose name carries '$RAGEDROID_MARKER' is in the list.")
@@ -321,7 +324,7 @@ class JourneyTest {
         journal.step("tap Recover from paper backup") {
             // Settings is one long verticalScroll; scroll the row into view rather
             // than assuming a screen height.
-            compose.onNodeWithText("Recover from paper backup").performScrollTo().performClick()
+            compose.onNodeWithText("Test my paper backup").performScrollTo().performClick()
         }
 
         // --- negative control: a valid phrase that is not a recipient -------
@@ -466,13 +469,13 @@ class JourneyTest {
             compose.onNodeWithText("Login").performClick()
         }
         journal.step("name the new item") {
-            fields()[COMPOSER_NAME_FIELD].performTextReplacement(COMPOSER_ITEM)
+            field("add-name").performTextReplacement(COMPOSER_ITEM)
         }
         journal.step("type a password, so there is a secret to wrap") {
             // Not the `Protect` toggle: BitwardenVaultRepository.create calls
             // encryptForActiveRecipients unconditionally, so having a secret at
             // all is what decides whether this save wraps.
-            fields()[COMPOSER_PASSWORD_FIELD].performTextReplacement(COMPOSER_SECRET)
+            field("add-password").performTextReplacement(COMPOSER_SECRET)
         }
         journal.step("read the composer's recipient summary") {
             check(nodes(FOREIGN_CHIP_SUFFIX, substring = true).isNotEmpty()) {
@@ -538,8 +541,8 @@ class JourneyTest {
             compose.onNodeWithText("Login").performClick()
         }
         journal.step("re-enter the item") {
-            fields()[COMPOSER_NAME_FIELD].performTextReplacement(COMPOSER_ITEM)
-            fields()[COMPOSER_PASSWORD_FIELD].performTextReplacement(COMPOSER_SECRET)
+            field("add-name").performTextReplacement(COMPOSER_ITEM)
+            field("add-password").performTextReplacement(COMPOSER_SECRET)
         }
         journal.step("tap Save, then Save anyway") {
             compose.onNodeWithText("Save").performClick()
@@ -688,7 +691,9 @@ class JourneyTest {
          * filter stopped matching what rageterm actually writes.
          */
         const val RAGETERM_RECIPIENT_LIST = "Ragewarden Recipients (do not edit)"
-        const val HISTORY_MARKER = "__ragewarden_history_v1__"
+        // core/src/history.rs: MARKER_NAME (every client's shared document) and
+        // LEGACY_MARKER_NAME (rageterm's old one, the browser's per-cipher ones).
+        val HISTORY_MARKERS = listOf("__ragewarden_history_v2__", "__ragewarden_history_v1__")
         const val RAGEDROID_MARKER = "__ragedroid_"
 
         /**
@@ -722,13 +727,12 @@ class JourneyTest {
          * moving breaks this loudly rather than quietly typing into the wrong
          * box.
          */
-        const val COMPOSER_NAME_FIELD = 0
-        const val COMPOSER_PASSWORD_FIELD = 3
-
         val VAULT_SUBTITLE = Regex("""(\d+) items · (\d+) protected""")
     }
 
-    private fun fields() = compose.onAllNodes(hasSetTextAction())
+    /** The editable field carrying [tag], on itself or on the wrapper its TextInput puts the modifier on. */
+    private fun field(tag: String) =
+        compose.onNode(hasSetTextAction() and (hasTestTag(tag) or hasAnyAncestor(hasTestTag(tag))))
     private fun fieldCount() = compose.onAllNodes(hasSetTextAction()).fetchSemanticsNodes().size
 
     private fun arg(name: String): String? =

@@ -20,6 +20,25 @@ interface Fixtures {
   extensionId: string;
   popupUrl: string;
   vaultwardenUrl: string;
+  mockContext: BrowserContext;
+  mockPopupUrl: string;
+}
+
+const MOCK_EXTENSION_DIST = resolve(PLAYWRIGHT_DIR, 'dist', 'extension-mock');
+
+async function launchWith(dist: string): Promise<BrowserContext> {
+  const userDataDir = mkdtempSync(join(tmpdir(), 'ragewarden-pw-'));
+  return chromium.launchPersistentContext(userDataDir, {
+    headless: false,
+    executablePath: resolveChromiumExecutable(),
+    args: [
+      '--headless=new',
+      `--disable-extensions-except=${dist}`,
+      `--load-extension=${dist}`,
+      '--no-sandbox',
+      '--disable-gpu',
+    ],
+  });
 }
 
 function resolveChromiumExecutable(): string | undefined {
@@ -65,10 +84,18 @@ export const test = base.extend<Fixtures>({
     await use(id);
   },
   popupUrl: async ({ extensionId }, use) => {
-    await use(`chrome-extension://${extensionId}/popup/RageDroid.html`);
+    await use(`chrome-extension://${extensionId}/popup/index.html`);
   },
   vaultwardenUrl: async ({}, use) => {
     await use(readState().vaultwardenUrl);
+  },
+  mockContext: async ({}, use) => {
+    const ctx = await launchWith(MOCK_EXTENSION_DIST);
+    await use(ctx);
+    await ctx.close();
+  },
+  mockPopupUrl: async ({ mockContext }, use) => {
+    await use(`chrome-extension://${await resolveExtensionId(mockContext)}/popup/index.html`);
   },
 });
 
@@ -109,7 +136,7 @@ export async function fillOnboarding(
 ): Promise<void> {
   await page.waitForSelector('.ragewarden-onb-root');
   if (opts.mode === 'register') {
-    await page.click('.ragewarden-onb-toggle a');
+    await page.click('.ragewarden-onb-toggle button');
     await expect(page.locator('.ragewarden-onb-card h1')).toHaveText('Create a Bitwarden account');
   }
   const inputs = page.locator('.ragewarden-onb-card input');
@@ -127,10 +154,53 @@ export async function fillOnboarding(
     });
     try {
       await wizardTitle.waitFor({ state: 'visible', timeout: 15_000 });
-      await page.click('.ragewarden-onb-secondary');
     } catch {
+      return;
     }
+    await page.click('.ragewarden-onb-secondary');
+    await expect(page.locator('.ragewarden-onb-card h1')).toHaveText('Not protected yet');
+    await page.click('.ragewarden-onb-secondary');
   }
+}
+
+/**
+ * Remove every Recovery entry from the registry, for specs that assert the exact
+ * wrap set of a write and do not want the wizard's paper recipient in it.
+ */
+export async function dropRecoveryRecipients(page: Page): Promise<void> {
+  await page.evaluate(async () => {
+    const w = window as unknown as { RagewardenVault: {
+      listRecipients: () => Promise<{ id: string; kind: string }[]>;
+      removeRecipient: (id: string) => Promise<unknown>;
+    } };
+    for (const e of await w.RagewardenVault.listRecipients()) {
+      if (e.kind === 'Recovery') await w.RagewardenVault.removeRecipient(e.id);
+    }
+  });
+}
+
+/** Type the three requested words of the phrase shown in the wizard and confirm. */
+export async function confirmWizardPhrase(page: Page): Promise<string> {
+  const words = await page.locator('.ragewarden-onb-phrase li').allTextContents();
+  const labels = await page.locator('.ragewarden-onb-card .ragewarden-onb-field span').allTextContents();
+  const inputs = page.locator('.ragewarden-onb-card .ragewarden-onb-field input');
+  for (let n = 0; n < labels.length; n++) {
+    const idx = Number(labels[n].replace(/\D+/g, '')) - 1;
+    await inputs.nth(n).fill(words[idx].trim());
+  }
+  await page.click('.ragewarden-onb-primary');
+  return words.map(w => w.trim()).join(' ');
+}
+
+/**
+ * After the first passkey: skip the backup passkey, which makes the paper step
+ * mandatory, and complete it. Returns the phrase.
+ */
+export async function finishWizardWithPaper(page: Page): Promise<string> {
+  await expect(page.locator('.ragewarden-onb-card h1')).toHaveText('Add a backup passkey');
+  await page.click('.ragewarden-onb-secondary');
+  await expect(page.locator('.ragewarden-onb-card h1')).toHaveText('Write down your recovery phrase');
+  return confirmWizardPhrase(page);
 }
 
 export async function waitForBootstrap(page: Page): Promise<void> {
@@ -146,4 +216,35 @@ export async function waitForBootstrap(page: Page): Promise<void> {
 
 export function randomSuffix(): string {
   return Math.random().toString(16).slice(2, 10);
+}
+
+export async function attachAuthenticator(page: Page): Promise<void> {
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send('WebAuthn.enable', { enableUI: false });
+  await cdp.send('WebAuthn.addVirtualAuthenticator', {
+    options: {
+      protocol: 'ctap2', transport: 'internal', hasResidentKey: true, hasUserVerification: true,
+      hasPrf: true, automaticPresenceSimulation: true, isUserVerified: true,
+    },
+  });
+}
+
+/** A fresh account in a new popup page; with `passkey`, through the wizard's passkey and paper steps. */
+export async function signIn(context: BrowserContext, popupUrl: string, server: string, opts: { passkey?: boolean } = {}) {
+  const page = await context.newPage();
+  if (opts.passkey) await attachAuthenticator(page);
+  await page.goto(popupUrl);
+  const password = `ux-${randomSuffix()}-correct-horse`;
+  await fillOnboarding(page, {
+    server, email: `ux-${randomSuffix()}@ragewarden.test`, password, mode: 'register',
+    dismissProtectionWizard: !opts.passkey,
+  });
+  if (opts.passkey) {
+    await expect(page.locator('.ragewarden-onb-card h1')).toHaveText('Set up Ragewarden protection');
+    await page.click('.ragewarden-onb-primary');
+    await finishWizardWithPaper(page);
+  }
+  await waitForBootstrap(page);
+  await expect(page.locator('#vault-list')).toBeVisible({ timeout: 30_000 });
+  return { page, password };
 }

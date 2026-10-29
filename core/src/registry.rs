@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::sync::{cipher_name, decrypt_string, Cipher, Session, SyncError, Vault};
+use crate::sync::{Cipher, Session, SyncError, Vault, cipher_name, decrypt_string};
 use crate::{ArmoredAgeRecipient, Recipient};
 
 pub const MARKER_NAME: &str = crate::sync::RECIPIENTS_META_CIPHER_NAME;
@@ -52,20 +52,56 @@ pub struct WireEntry {
     #[serde(rename = "pivSlot", default, skip_serializing_if = "Option::is_none")]
     pub piv_slot: Option<i32>,
 
-    #[serde(rename = "keystorePubkey", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "keystorePubkey",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub keystore_pubkey: Option<String>,
-    #[serde(rename = "keystoreHandle", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "keystoreHandle",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub keystore_handle: Option<String>,
 
-    #[serde(rename = "fido2CredentialId", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "fido2CredentialId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub fido2_credential_id: Option<String>,
     #[serde(rename = "fido2RpId", default, skip_serializing_if = "Option::is_none")]
     pub fido2_rp_id: Option<String>,
     #[serde(rename = "fido2Salt", default, skip_serializing_if = "Option::is_none")]
     pub fido2_salt: Option<String>,
 
-    #[serde(rename = "recoveryArmoredPubkey", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "recoveryArmoredPubkey",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub recovery_armored_pubkey: Option<String>,
+
+    /// The newest ECDH stanza version every reader of this entry understands
+    /// (absent = 1). Readers ship first; an entry is republished with 2 once
+    /// the clients that unwrap it read `piv-x25519-v2` /
+    /// `ragedroid-keystore-v2`, and only then do writers emit them.
+    #[serde(
+        rename = "stanzaVersion",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stanza_version: Option<u8>,
+
+    /// Base64 SPKI DER of a P-256 key the device holds (a PIV slot's own key)
+    /// that signs native-host unwrap proofs for this recipient.
+    #[serde(
+        rename = "attestationPublicKey",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub attestation_public_key: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -104,6 +140,12 @@ impl WireEntry {
         }
     }
 
+    /// The ECDH stanza version to write for this entry: what it advertises,
+    /// capped at the newest this crate writes.
+    pub fn ecdh_stanza_version(&self) -> u8 {
+        self.stanza_version.unwrap_or(1).clamp(1, 2)
+    }
+
     pub fn to_recipient_if_active(&self) -> Option<Recipient> {
         if !self.default_encrypt {
             return None;
@@ -122,18 +164,27 @@ impl WireEntry {
                 Some(Recipient::AndroidKeystore {
                     public_key: pubkey,
                     key_handle,
+                    stanza_version: self.ecdh_stanza_version(),
                 })
             }
             kinds::YUBIKEY => {
                 let hex = self.piv_pubkey.as_ref()?;
                 let bytes = hex_decode(hex)?;
-                let public_key: [u8; 32] = bytes.try_into().ok()?;
                 let serial = self.piv_serial.unwrap_or(0).max(0) as u32;
                 let slot = self.piv_slot.unwrap_or(0).max(0) as u8;
+                if crate::stanza_format::is_valid_p256_sec1_compressed(&bytes) {
+                    return Some(Recipient::YubiKeyPivP256 {
+                        public_key: bytes,
+                        serial,
+                        slot,
+                    });
+                }
+                let public_key: [u8; 32] = bytes.try_into().ok()?;
                 Some(Recipient::YubiKeyPiv {
                     public_key,
                     serial,
                     slot,
+                    stanza_version: self.ecdh_stanza_version(),
                 })
             }
             kinds::FIDO2 => {
@@ -233,6 +284,28 @@ mod tests {
     const NOT_A_P256_POINT: &str =
         "020101010101010101010101010101010101010101010101010101010101010101";
 
+    fn wire(id: &str, kind: &str, display_name: &str, device_label: &str) -> WireEntry {
+        WireEntry {
+            id: id.into(),
+            kind: kind.into(),
+            display_name: display_name.into(),
+            device_label: device_label.into(),
+            created_at: 1,
+            default_encrypt: true,
+            piv_pubkey: None,
+            piv_serial: None,
+            piv_slot: None,
+            keystore_pubkey: None,
+            keystore_handle: None,
+            fido2_credential_id: None,
+            fido2_rp_id: None,
+            fido2_salt: None,
+            recovery_armored_pubkey: None,
+            stanza_version: None,
+            attestation_public_key: None,
+        }
+    }
+
     #[test]
     fn deserializes_android_kotlinx_payload() {
         let json = r#"{
@@ -264,7 +337,10 @@ mod tests {
         let strongbox = &doc.entries[0];
         assert_eq!(strongbox.kind, kinds::STRONG_BOX);
         assert!(strongbox.default_encrypt);
-        assert_eq!(strongbox.keystore_handle.as_deref(), Some("ragewarden-keystore-abc"));
+        assert_eq!(
+            strongbox.keystore_handle.as_deref(),
+            Some("ragewarden-keystore-abc")
+        );
         assert_eq!(strongbox.strongbox_pubkey_bytes().unwrap().len(), 33);
 
         let recovery = &doc.entries[1];
@@ -281,21 +357,9 @@ mod tests {
         let original = WireDocument {
             schema: SCHEMA_VERSION,
             entries: vec![WireEntry {
-                id: "id-1".into(),
-                kind: kinds::STRONG_BOX.into(),
-                display_name: "This phone".into(),
-                device_label: "Pixel".into(),
-                created_at: 1,
-                default_encrypt: true,
-                piv_pubkey: None,
-                piv_serial: None,
-                piv_slot: None,
                 keystore_pubkey: Some("02".to_string() + &"00".repeat(32)),
                 keystore_handle: Some("handle-xyz".into()),
-                fido2_credential_id: None,
-                fido2_rp_id: None,
-                fido2_salt: None,
-                recovery_armored_pubkey: None,
+                ..wire("id-1", kinds::STRONG_BOX, "This phone", "Pixel")
             }],
         };
         let json = serde_json::to_string(&original).unwrap();
@@ -307,24 +371,17 @@ mod tests {
     #[test]
     fn to_recipient_strongbox_yields_android_keystore() {
         let entry = WireEntry {
-            id: "id-1".into(),
-            kind: kinds::STRONG_BOX.into(),
-            display_name: "This phone".into(),
-            device_label: "Pixel".into(),
-            created_at: 1,
-            default_encrypt: true,
-            piv_pubkey: None,
-            piv_serial: None,
-            piv_slot: None,
             keystore_pubkey: Some(P256_GENERATOR_COMPRESSED.to_string()),
             keystore_handle: Some("h".into()),
-            fido2_credential_id: None,
-            fido2_rp_id: None,
-            fido2_salt: None,
-            recovery_armored_pubkey: None,
+            ..wire("id-1", kinds::STRONG_BOX, "This phone", "Pixel")
         };
         match entry.to_recipient_if_active() {
-            Some(Recipient::AndroidKeystore { public_key, key_handle }) => {
+            Some(Recipient::AndroidKeystore {
+                public_key,
+                key_handle,
+                stanza_version,
+            }) => {
+                assert_eq!(stanza_version, 1, "absent stanzaVersion means v1");
                 assert_eq!(public_key.len(), 33);
                 assert_eq!(key_handle, "h");
             }
@@ -334,21 +391,10 @@ mod tests {
 
     fn strongbox_entry(pubkey_hex: &str) -> WireEntry {
         WireEntry {
-            id: "hostile".into(),
-            kind: kinds::STRONG_BOX.into(),
-            display_name: "Attacker's phone".into(),
-            device_label: "Pixel".into(),
             created_at: 0,
-            default_encrypt: true,
-            piv_pubkey: None,
-            piv_serial: None,
-            piv_slot: None,
             keystore_pubkey: Some(pubkey_hex.to_string()),
             keystore_handle: Some("h".into()),
-            fido2_credential_id: None,
-            fido2_rp_id: None,
-            fido2_salt: None,
-            recovery_armored_pubkey: None,
+            ..wire("hostile", kinds::STRONG_BOX, "Attacker's phone", "Pixel")
         }
     }
 
@@ -373,12 +419,15 @@ mod tests {
     #[test]
     fn hostile_registry_pubkey_does_not_panic_the_encrypt_path() {
         let entry = strongbox_entry(P256_GENERATOR_COMPRESSED);
-        let good = entry.to_recipient_if_active().expect("valid point accepted");
+        let good = entry
+            .to_recipient_if_active()
+            .expect("valid point accepted");
         assert!(crate::encrypt(b"x", &[good]).is_ok());
 
         let bad = Recipient::AndroidKeystore {
             public_key: hex_decode(NOT_A_P256_POINT).unwrap(),
             key_handle: "h".into(),
+            stanza_version: 1,
         };
         let err = crate::encrypt(b"x", &[bad]).unwrap_err();
         assert!(
@@ -390,8 +439,13 @@ mod tests {
     #[test]
     fn stanza_builder_rejects_a_33_byte_non_point_instead_of_panicking() {
         let bad = hex_decode(NOT_A_P256_POINT).unwrap();
-        let err = crate::stanza_format::encrypt_ragedroid_keystore_stanza(&[7u8; 16], &bad, "h")
-            .unwrap_err();
+        let err = crate::stanza_format::encrypt_ragedroid_keystore_stanza(
+            &[7u8; 16],
+            &bad,
+            "h",
+            crate::stanza_format::EcdhStanzaVersion::V2,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, crate::stanza_format::StanzaFormatError::Shape(_)),
             "got {err:?}"
@@ -399,29 +453,27 @@ mod tests {
 
         let short = vec![0x02u8; 32];
         assert!(
-            crate::stanza_format::encrypt_ragedroid_keystore_stanza(&[7u8; 16], &short, "h")
-                .is_err()
+            crate::stanza_format::encrypt_ragedroid_keystore_stanza(
+                &[7u8; 16],
+                &short,
+                "h",
+                crate::stanza_format::EcdhStanzaVersion::V2,
+            )
+            .is_err()
         );
     }
 
     #[test]
     fn to_recipient_software_with_armored_pubkey_yields_software_passphrase() {
         let entry = WireEntry {
-            id: "rageterm-deadbeef".into(),
-            kind: kinds::SOFTWARE.into(),
-            display_name: "Terminal".into(),
-            device_label: "rageterm@host".into(),
             created_at: 0,
-            default_encrypt: true,
-            piv_pubkey: None,
-            piv_serial: None,
-            piv_slot: None,
-            keystore_pubkey: None,
-            keystore_handle: None,
-            fido2_credential_id: None,
-            fido2_rp_id: None,
-            fido2_salt: None,
             recovery_armored_pubkey: Some("age1examplerageterm".into()),
+            ..wire(
+                "rageterm-deadbeef",
+                kinds::SOFTWARE,
+                "Terminal",
+                "rageterm@host",
+            )
         };
         match entry.to_recipient_if_active() {
             Some(Recipient::SoftwarePassphrase { armored_pubkey }) => {
@@ -434,21 +486,9 @@ mod tests {
     #[test]
     fn to_recipient_recovery_yields_software_passphrase() {
         let entry = WireEntry {
-            id: "id-2".into(),
-            kind: kinds::RECOVERY.into(),
-            display_name: "Paper recovery".into(),
-            device_label: "Pixel".into(),
             created_at: 0,
-            default_encrypt: true,
-            piv_pubkey: None,
-            piv_serial: None,
-            piv_slot: None,
-            keystore_pubkey: None,
-            keystore_handle: None,
-            fido2_credential_id: None,
-            fido2_rp_id: None,
-            fido2_salt: None,
             recovery_armored_pubkey: Some("age1example".into()),
+            ..wire("id-2", kinds::RECOVERY, "Paper recovery", "Pixel")
         };
         match entry.to_recipient_if_active() {
             Some(Recipient::SoftwarePassphrase { armored_pubkey }) => {
@@ -461,21 +501,10 @@ mod tests {
     #[test]
     fn to_recipient_legacy_32b_strongbox_returns_none() {
         let entry = WireEntry {
-            id: "legacy".into(),
-            kind: kinds::STRONG_BOX.into(),
-            display_name: "Old phone".into(),
-            device_label: "Pixel 9".into(),
             created_at: 0,
-            default_encrypt: true,
-            piv_pubkey: None,
-            piv_serial: None,
-            piv_slot: None,
             keystore_pubkey: Some("00".repeat(32)),
             keystore_handle: Some("legacy-handle".into()),
-            fido2_credential_id: None,
-            fido2_rp_id: None,
-            fido2_salt: None,
-            recovery_armored_pubkey: None,
+            ..wire("legacy", kinds::STRONG_BOX, "Old phone", "Pixel 9")
         };
         assert!(entry.to_recipient_if_active().is_none());
     }
@@ -483,21 +512,10 @@ mod tests {
     #[test]
     fn to_recipient_default_encrypt_false_returns_none() {
         let mut entry = WireEntry {
-            id: "id".into(),
-            kind: kinds::RECOVERY.into(),
-            display_name: "Recovery".into(),
-            device_label: "Pixel".into(),
             created_at: 0,
             default_encrypt: false,
-            piv_pubkey: None,
-            piv_serial: None,
-            piv_slot: None,
-            keystore_pubkey: None,
-            keystore_handle: None,
-            fido2_credential_id: None,
-            fido2_rp_id: None,
-            fido2_salt: None,
             recovery_armored_pubkey: Some("age1example".into()),
+            ..wire("id", kinds::RECOVERY, "Recovery", "Pixel")
         };
         assert!(entry.to_recipient_if_active().is_none());
         entry.default_encrypt = true;
@@ -507,21 +525,10 @@ mod tests {
     #[test]
     fn skips_legacy_32_byte_strongbox_entries() {
         let entry = WireEntry {
-            id: "legacy".into(),
-            kind: kinds::STRONG_BOX.into(),
-            display_name: "Old phone".into(),
-            device_label: "Pixel 9".into(),
             created_at: 0,
-            default_encrypt: true,
-            piv_pubkey: None,
-            piv_serial: None,
-            piv_slot: None,
             keystore_pubkey: Some("00".repeat(32)),
             keystore_handle: Some("legacy-handle".into()),
-            fido2_credential_id: None,
-            fido2_rp_id: None,
-            fido2_salt: None,
-            recovery_armored_pubkey: None,
+            ..wire("legacy", kinds::STRONG_BOX, "Old phone", "Pixel 9")
         };
         assert!(entry.strongbox_pubkey_bytes().is_none());
     }

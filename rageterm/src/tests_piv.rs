@@ -68,7 +68,6 @@ fn select_failure_is_reported_as_a_missing_piv_applet() {
 
 #[test]
 fn a_61xx_status_triggers_get_response_and_concatenates() {
-    // First half of the template, then the rest behind GET RESPONSE.
     let mut first = vec![0x7C, 0x22, 0x82, 0x20];
     first.extend_from_slice(&[0x11u8; 16]);
     first.extend_from_slice(&[0x61, 0x10]);
@@ -126,18 +125,16 @@ fn a_wrong_pin_reports_the_remaining_attempts() {
 fn ecdh_prompts_for_a_pin_once_then_retries() {
     let secret = [0x33u8; 32];
     let card = ScriptedCard::new(vec![
-        // GENERAL AUTHENTICATE -> security status not satisfied
         vec![0x69, 0x82],
-        // pin_status probe -> 2 retries left
         vec![0x63, 0xC2],
-        // VERIFY -> ok
         ok(),
-        // GENERAL AUTHENTICATE -> ok
         ecdh_ok(secret),
     ]);
     let mut session = PivSession::new(card);
     let share = session
-        .ecdh_with_pin_retry(apdu::ALG_X25519, 0x9D, &[0xAA; 32], &|| Ok("123456".into()))
+        .ecdh_with_pin_retry(apdu::ALG_X25519, 0x9D, &[0xAA; 32], &|| {
+            Ok(zeroize::Zeroizing::new("123456".into()))
+        })
         .unwrap();
     assert_eq!(share, secret.to_vec());
 }
@@ -148,14 +145,27 @@ fn ecdh_does_not_loop_forever_when_the_touch_never_lands() {
         vec![0x69, 0x82],
         vec![0x63, 0xC2],
         ok(),
-        // Still refused after the PIN: that is a missing touch, not a PIN issue.
         vec![0x69, 0x82],
     ]);
     let mut session = PivSession::new(card);
     let err = session
-        .ecdh_with_pin_retry(apdu::ALG_X25519, 0x9D, &[0xAA; 32], &|| Ok("123456".into()))
+        .ecdh_with_pin_retry(apdu::ALG_X25519, 0x9D, &[0xAA; 32], &|| {
+            Ok(zeroize::Zeroizing::new("123456".into()))
+        })
         .unwrap_err();
-    assert!(matches!(err, PivError::Apdu { .. }));
+    assert!(matches!(err, PivError::TouchNotRegistered));
+}
+
+#[test]
+fn a_presence_timeout_reported_as_a_security_issue_is_a_missing_touch() {
+    let card = ScriptedCard::new(vec![vec![0x66, 0x00]]);
+    let mut session = PivSession::new(card);
+    let err = session
+        .ecdh_with_pin_retry(apdu::ALG_X25519, 0x9D, &[0xAA; 32], &|| {
+            panic!("a touch timeout must not ask for the PIN")
+        })
+        .unwrap_err();
+    assert!(matches!(err, PivError::TouchNotRegistered));
 }
 
 #[test]
@@ -179,4 +189,23 @@ fn serial_is_optional_and_absence_is_not_an_error() {
         0x00, 0x0A, 0x1B, 0x2C, 0x90, 0x00,
     ]]));
     assert_eq!(session.serial().unwrap(), Some(0x000A1B2C));
+}
+
+#[test]
+fn the_card_with_the_enrolled_serial_is_chosen_among_several() {
+    use crate::piv::choose_card;
+    assert_eq!(choose_card(&[Some(1), Some(2)], 2).unwrap(), 1);
+    assert_eq!(choose_card(&[None], 7).unwrap(), 0);
+    assert!(matches!(
+        choose_card(&[Some(1), Some(2)], 0),
+        Err(PivError::AmbiguousCard { count: 2 })
+    ));
+    assert!(matches!(
+        choose_card(&[Some(1), Some(3)], 2),
+        Err(PivError::WrongDevice {
+            expected: 2,
+            found: 1
+        })
+    ));
+    assert_eq!(choose_card(&[Some(9)], 0).unwrap(), 0);
 }

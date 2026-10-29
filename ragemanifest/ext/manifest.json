@@ -3,16 +3,25 @@
   "name": "Ragewarden",
   "short_name": "Ragewarden",
   "version": "0.0.1",
-  "description": "Phishing-resistant Bitwarden client. Each individual credential is wrapped in a hardware-tap layer (passkey via WebAuthn PRF) on top of the Bitwarden master-password layer.",
+  "description": "Phishing-resistant Bitwarden client: every credential also needs a tap of your passkey or security key to open.",
   "author": "Ragewarden contributors",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
   "minimum_chrome_version": "116",
   "permissions": [
     "storage",
     "activeTab",
     "clipboardWrite",
-    "nativeMessaging"
+    "nativeMessaging",
+    "alarms",
+    "idle",
+    "offscreen"
   ],
-  "host_permissions": [
+  "optional_host_permissions": [
     "<all_urls>"
   ],
   "background": {
@@ -21,15 +30,33 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    },
+    {
+      "matches": [
+        "https://ragewarden.decent.foundation/prf*"
+      ],
+      "js": [
+        "relay-content.js"
+      ],
       "run_at": "document_idle",
       "all_frames": false
     }
   ],
   "action": {
     "default_title": "Ragewarden",
-    "default_popup": "popup/RageDroid.html"
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png"
+    },
+    "default_popup": "popup/index.html"
   },
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:"

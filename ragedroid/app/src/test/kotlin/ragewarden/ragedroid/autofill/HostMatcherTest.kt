@@ -37,6 +37,34 @@ class HostMatcherTest {
     }
 
     @Test
+    fun package_with_a_generic_tld_token_does_not_match_every_dot_com_item() {
+        val items = listOf(item("github", "github.com"), item("example", "example.com"))
+        assertEquals(emptyList<VaultItem>(), HostMatcher.matchVaultItems(items, webDomain = null, packageName = "com.evil.app"))
+    }
+
+    @Test
+    fun private_public_suffix_children_do_not_share_items() {
+        val items = listOf(item("alice", "alice.github.io"), item("bob", "bob.github.io"), item("root", "github.io"))
+        val matched = HostMatcher.matchVaultItems(items, webDomain = "alice.github.io", packageName = null)
+        assertEquals(listOf("alice"), matched.map { it.id })
+        assertEquals(emptyList<VaultItem>(), HostMatcher.matchVaultItems(items, webDomain = "github.io", packageName = null))
+    }
+
+    @Test
+    fun login_subdomain_still_matches_registrable_parent() {
+        val items = listOf(item("example", "example.com"), item("other", "example.org"))
+        val matched = HostMatcher.matchVaultItems(items, webDomain = "login.example.com", packageName = null)
+        assertEquals(listOf("example"), matched.map { it.id })
+    }
+
+    @Test
+    fun androidapp_uri_matches_only_that_package() {
+        val items = listOf(item("app", "androidapp://com.example.bank"))
+        assertEquals(listOf("app"), HostMatcher.matchVaultItems(items, null, "com.example.bank").map { it.id })
+        assertEquals(emptyList<VaultItem>(), HostMatcher.matchVaultItems(items, null, "com.example.bank.evil"))
+    }
+
+    @Test
     fun matchVaultItems_returns_empty_for_no_signal() {
         val items = listOf(item("github", "github.com"))
         val matched = HostMatcher.matchVaultItems(items, webDomain = null, packageName = null)

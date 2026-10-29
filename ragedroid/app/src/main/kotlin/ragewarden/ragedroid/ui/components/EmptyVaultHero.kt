@@ -21,6 +21,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -31,8 +32,10 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.ui.theme.RageType
 import ragewarden.ragedroid.ui.theme.rageColors
+import ragewarden.ragedroid.ui.uiString
 
 private val HeroTitle = RageType.h1.copy(
     fontSize = 26.sp,
@@ -67,14 +70,14 @@ fun EmptyVaultHero(
         VaultGlyph(modifier = Modifier.size(140.dp))
         Spacer(modifier = Modifier.height(24.dp))
         Text(
-            text = "An empty vault.",
+            text = stringResource(R.string.an_empty_vault),
             style = HeroTitle,
             color = c.fgEmphasis,
             textAlign = TextAlign.Center,
         )
         Spacer(modifier = Modifier.height(12.dp))
         Text(
-            text = "Add your first secret, or let RageDroid catch credentials as you sign into apps.",
+            text = stringResource(R.string.add_your_first_secret_or_let),
             style = HeroBody.copy(textAlign = TextAlign.Center),
             color = c.fgSecondary,
             modifier = Modifier.widthIn(max = 280.dp),
@@ -86,13 +89,13 @@ fun EmptyVaultHero(
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             HeroButton(
-                label = "Add your first secret",
+                label = stringResource(R.string.add_your_first_secret),
                 icon = Icons.Outlined.Add,
                 primary = true,
                 onClick = onAdd,
             )
             HeroButton(
-                label = "Catch a credential via autofill",
+                label = stringResource(R.string.catch_a_credential_via_autofill),
                 icon = Icons.Outlined.Bolt,
                 primary = false,
                 onClick = onAutofill,
@@ -108,7 +111,7 @@ fun EmptyVaultHero(
 }
 
 private fun buildSyncFooter(host: String): AnnotatedString = buildAnnotatedString {
-    append("Your vault syncs from ")
+    append(uiString(R.string.your_vault_syncs_from))
     withStyle(
         SpanStyle(
             fontFamily = FontFamily.Monospace,
@@ -118,7 +121,7 @@ private fun buildSyncFooter(host: String): AnnotatedString = buildAnnotatedStrin
     ) {
         append(host)
     }
-    append(". Nothing here yet.")
+    append(uiString(R.string.nothing_here_yet))
 }
 
 @Composable

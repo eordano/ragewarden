@@ -25,6 +25,7 @@ import ragewarden.ragedroid.model.VaultItem
 internal class ImeDelivery(
     private val lockState: LockState,
     private val backend: VaultBackend,
+    private val auth: ImeAuthBroker = NoImeAuth,
 ) {
     data class Offer(
         val locked: Boolean,
@@ -49,7 +50,7 @@ internal class ImeDelivery(
         val all = backend.snapshot()
         return Offer(
             locked = false,
-            deliverable = all.filterNot { it.rage }.toPersistentList(),
+            deliverable = all.toPersistentList(),
             protectedCount = all.count { it.rage },
         )
     }
@@ -59,26 +60,33 @@ internal class ImeDelivery(
      * once and only on [Outcome.Delivered]; every other branch returns
      * [Outcome.Refused] without ever calling it.
      *
-     * `identities = emptyList()` on the decrypt is load-bearing and is checked
-     * twice over: `BitwardenVaultRepository.decrypt` hard-errors on a `rage`
-     * item with no identities, and the `item.rage` branch below refuses before
-     * it can get that far. An `InputMethodService` is not an Activity, so it
-     * cannot host `BiometricPrompt`, Credential Manager or NFC reader mode --
-     * it cannot run the hardware ceremony and must not pretend to.
+     * A protected item is decrypted by [auth], which runs the hardware tap in an
+     * Activity (a keyboard cannot host one). The keyboard loses the field while
+     * that sheet is up, so the plaintext is committed only after [auth] reports
+     * the same [session] focused again, and only if the vault is still unlocked.
      */
-    suspend fun deliver(itemId: String, commit: (String) -> Unit): Outcome {
+    suspend fun deliver(itemId: String, session: ImeSession? = null, commit: (CharSequence) -> Unit): Outcome {
         if (lockState.isLocked) return Outcome.Refused(LOCKED)
         val item = backend.get(itemId) ?: return Outcome.Refused("unknown item")
-        if (item.rage) return Outcome.Refused("Ragewarden-protected item")
-        val plaintext = runCatching { backend.decrypt(itemId, emptyList()) }.getOrNull()
-            ?: return Outcome.Refused("decrypt failed")
+        val plaintext = if (item.rage) {
+            if (session == null) return Outcome.Refused(NO_FIELD)
+            auth.authorize(item, session) ?: return Outcome.Refused(DECLINED)
+        } else {
+            runCatching { backend.decrypt(itemId, emptyList(), ragewarden.ragedroid.data.audit.AuditAction.Autofill) }.getOrNull()
+                ?: return Outcome.Refused("decrypt failed")
+        }
         try {
-            // The decrypt above suspends and can wait on a network sync. The
-            // vault can be locked (ON_STOP, or "Lock now" from another window)
-            // while it is in flight, so the first check is not sufficient on its
-            // own -- re-read immediately before anything reaches the editor.
+            // The decrypt (or the tap) suspends, and the vault can be locked
+            // while it is in flight, so re-read immediately before anything
+            // reaches the editor.
             if (lockState.isLocked) return Outcome.Refused(LOCKED_MID_FLIGHT)
-            commit(String(plaintext, Charsets.UTF_8))
+            if (item.rage) {
+                if (!auth.awaitReturn(session!!)) return Outcome.Refused(FIELD_CHANGED)
+                if (lockState.isLocked) return Outcome.Refused(LOCKED_MID_FLIGHT)
+            }
+            // commitText parcels the text before it returns; the characters
+            // are zeroed when withChars does.
+            ragewarden.ragedroid.data.SecretText.withChars(plaintext) { commit(it) }
             return Outcome.Delivered
         } finally {
             plaintext.fill(0)
@@ -88,5 +96,8 @@ internal class ImeDelivery(
     internal companion object {
         const val LOCKED = "vault is locked"
         const val LOCKED_MID_FLIGHT = "vault locked while the item was decrypting"
+        const val NO_FIELD = "no input field to type into"
+        const val DECLINED = "the hardware tap was declined or failed"
+        const val FIELD_CHANGED = "a different field was focused when the tap finished"
     }
 }

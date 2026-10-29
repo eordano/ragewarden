@@ -16,7 +16,8 @@
 //! rageterm does not generate keys on the card: that needs the PIV management
 //! key and is `ykman`'s job. Enrollment reads a public key the user supplies and
 //! *proves* the card holds the matching private key by running one live ECDH
-//! against a locally generated ephemeral (see `real_enroll`). A card that cannot
+//! against a locally generated ephemeral (see
+//! `real_enroll_allowing_untouched_slot`). A card that cannot
 //! answer the challenge is refused, so a mistyped public key can never become a
 //! recipient that nothing can decrypt.
 //!
@@ -35,16 +36,17 @@
 //!
 //! ## Which curve
 //!
-//! `core::stanza_format::encrypt_piv_p256_stanza` is X25519 despite the
-//! `piv-p256` tag: the recipient key and the ephemeral are both 32 raw bytes
-//! (`core/src/stanza_format.rs:67-91`). Only a slot holding an **X25519** key
-//! (YubiKey firmware 5.7.0+, `ykman piv keys generate --algorithm X25519`) can
-//! satisfy that stanza. `ALG_ECC_P256` is implemented in `piv_apdu.rs` and
-//! wired through `PivSession::ecdh`, but there is no stanza tag for it yet;
-//! adding one is a `core/` change.
+//! New slots are **P-256** (every YubiKey 4/5, `ykman piv keys generate
+//! --algorithm ECCP256`): their stanza is `age-plugin-yubikey`'s `piv-p256`, and
+//! the slot also signs the native host's per-unwrap proof. **X25519** slots
+//! (firmware 5.7.0+, `--x25519` at enrollment) remain readable: their stanzas
+//! are `piv-x25519-v2` or, written before that tag existed, the X25519-shaped
+//! `piv-p256` (`stanza_format::PivStanzaKind`), and `migrate-piv` moves their
+//! items to a P-256 slot.
 
 use ragewarden_core::stanza_format::{
-    self, decrypt_piv_p256_with_ecdh_share, piv_p256_ephemeral_pub, piv_recipient_tag,
+    self, PivStanzaKind, decrypt_piv_x25519_with_ecdh_share, piv_recipient_tag, piv_stanza_kind,
+    piv_x25519_ephemeral_pub, piv_x25519_recipient_tag,
 };
 use ragewarden_core::{FileKey, Identity, IdentityError, Stanza};
 use thiserror::Error;
@@ -82,15 +84,15 @@ pub enum PivError {
 
     #[error(
         "PIV slot {slot:#04x} holds no key, or it is not an ECDH-capable key. Create \
-         one with `ykman piv keys generate --algorithm X25519 {slot:02x} pub.pem` \
-         (firmware 5.7.0+)."
+         one with `ykman piv keys generate --algorithm ECCP256 --touch-policy always \
+         {slot:02x} pub.pem`."
     )]
     SlotEmpty { slot: u8 },
 
     #[error(
         "this YubiKey rejected algorithm {algorithm:#04x}. X25519 in PIV needs firmware \
-         5.7.0 or newer; older keys can only do P-256, which the current `piv-p256` \
-         stanza format cannot carry."
+         5.7.0 or newer; use a P-256 slot (`ykman piv keys generate --algorithm \
+         ECCP256`), which every YubiKey 4/5 supports."
     )]
     AlgorithmUnsupported { algorithm: u8 },
 
@@ -100,14 +102,29 @@ pub enum PivError {
     #[error("PIV PIN is blocked; unblock it with `ykman piv access unblock-pin`")]
     PinBlocked,
 
-    #[error("no terminal available to read the PIV PIN on")]
+    #[error(
+        "the PIV slot needs its PIN, but there is no terminal and no `pinentry` program on \
+         PATH to ask for it"
+    )]
     NoPinPrompt,
+
+    #[error("PIV PIN entry: {0}")]
+    Pin(String),
+
+    #[error("{0}")]
+    Busy(String),
 
     #[error(
         "wrong YubiKey: this identity was enrolled against serial {expected:08x}, the \
          connected card reports {found:08x}"
     )]
     WrongDevice { expected: u32, found: u32 },
+
+    #[error(
+        "{count} smart cards are connected and rageterm cannot tell which one to use; \
+         unplug the others and retry"
+    )]
+    AmbiguousCard { count: usize },
 
     #[error(
         "the card did not answer the ECDH challenge -- the touch was not registered, or \
@@ -128,9 +145,10 @@ pub enum PivError {
     ProofOfPossessionFailed { slot: u8 },
 
     #[error(
-        "PIV slot {slot:#04x} has touch policy `{policy}`: it will decrypt with no touch, so \
-         the tap rageterm announces before every unwrap would be theatre. Regenerate the slot \
-         with `ykman piv keys generate --algorithm X25519 --touch-policy always --pin-policy \
+        "PIV slot {slot:#04x} has touch policy `{policy}`: it will decrypt without a touch \
+         for every use (`cached` lets one touch cover the next ~15 seconds), so the tap \
+         rageterm announces before every unwrap would not always happen. Regenerate the slot \
+         with `ykman piv keys generate --algorithm ECCP256 --touch-policy always --pin-policy \
          once {slot:02x} pub.pem` (this replaces the key -- re-export the public key \
          afterwards), or re-run enrollment with `{override_flag}` if you genuinely want an \
          identity that nothing physical gates."
@@ -175,10 +193,6 @@ pub enum PivError {
     #[error("mock hardware: {0}")]
     Mock(String),
 }
-
-// ---------------------------------------------------------------------------
-// Transport boundary
-// ---------------------------------------------------------------------------
 
 /// The one thing that needs a physical card. Implemented for real by
 /// `piv_pcsc::PcscTransport`, and by scripted fakes in tests.
@@ -237,7 +251,9 @@ impl<T: CardTransport> PivSession<T> {
         if sw != apdu::SW_OK || body.len() < 4 {
             return Ok(None);
         }
-        Ok(Some(u32::from_be_bytes([body[0], body[1], body[2], body[3]])))
+        Ok(Some(u32::from_be_bytes([
+            body[0], body[1], body[2], body[3],
+        ])))
     }
 
     /// The slot's touch policy, read back from the card.
@@ -257,21 +273,12 @@ impl<T: CardTransport> PivSession<T> {
             apdu::SW_OK => Ok(apdu::parse_slot_metadata(&body)
                 .map(|m| m.touch_policy)
                 .unwrap_or(TouchPolicy::Unavailable)),
-            // Unambiguous in PIV, and worth a precise message: there is no key
-            // in there to have a policy.
             apdu::SW_REFERENCE_NOT_FOUND | apdu::SW_FILE_NOT_FOUND => {
                 Err(PivError::SlotEmpty { slot })
             }
-            // "No such command" -- pre-5.3.0 firmware, or a PIV applet without
-            // the Yubico extensions.
             apdu::SW_INS_NOT_SUPPORTED
             | apdu::SW_CLASS_NOT_SUPPORTED
             | apdu::SW_FUNCTION_NOT_SUPPORTED => Ok(TouchPolicy::Unavailable),
-            // Cards vary in what they answer for an extension they do not
-            // implement, so every other status word lands in the same place: we
-            // did not learn the policy. Failing the whole operation here would
-            // make rageterm unusable on cards it can otherwise drive perfectly
-            // well; claiming a touch would be the lie this is fixing.
             _ => Ok(TouchPolicy::Unavailable),
         }
     }
@@ -342,14 +349,42 @@ impl<T: CardTransport> PivSession<T> {
     }
 
     /// ECDH, retrying once behind a PIN prompt if the card demands one.
+    /// ECDSA P-256 over `digest` with the slot's key, as raw r||s.
+    pub fn sign(&mut self, slot: u8, digest: &[u8; 32]) -> Result<[u8; 64], PivError> {
+        let (body, sw) = self.raw(&apdu::general_authenticate_sign(slot, digest))?;
+        if sw != apdu::SW_OK {
+            return Err(PivError::Apdu {
+                sw,
+                context: "GENERAL AUTHENTICATE (sign)".into(),
+            });
+        }
+        let der = apdu::parse_sign_response(&body)?;
+        let sig = p256::ecdsa::Signature::from_der(&der)
+            .map_err(|e| PivError::PublicKey(format!("card signature is not DER ECDSA: {e}")))?;
+        Ok(sig.to_bytes().into())
+    }
+
     pub fn ecdh_with_pin_retry(
         &mut self,
         algorithm: u8,
         slot: u8,
         peer_public: &[u8],
-        prompt_pin: &dyn Fn() -> Result<String, PivError>,
+        prompt_pin: &dyn Fn() -> Result<zeroize::Zeroizing<String>, PivError>,
     ) -> Result<Vec<u8>, PivError> {
+        let touch_refused = |e: PivError| match e {
+            PivError::Apdu { sw, .. }
+                if sw == apdu::SW_SECURITY_STATUS_NOT_SATISFIED
+                    || sw == apdu::SW_CONDITIONS_NOT_SATISFIED
+                    || sw == apdu::SW_SECURITY_ISSUE =>
+            {
+                PivError::TouchNotRegistered
+            }
+            other => other,
+        };
         match self.ecdh(algorithm, slot, peer_public) {
+            Err(PivError::Apdu { sw, .. }) if sw == apdu::SW_SECURITY_ISSUE => {
+                Err(PivError::TouchNotRegistered)
+            }
             Err(PivError::Apdu { sw, .. })
                 if sw == apdu::SW_SECURITY_STATUS_NOT_SATISFIED
                     || sw == apdu::SW_CONDITIONS_NOT_SATISFIED =>
@@ -363,19 +398,92 @@ impl<T: CardTransport> PivSession<T> {
                 let pin = prompt_pin()?;
                 self.verify_pin(&pin)?;
                 self.ecdh(algorithm, slot, peer_public)
+                    .map_err(touch_refused)
             }
             other => other,
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Enrollment
-// ---------------------------------------------------------------------------
+/// A PIV slot's public key: X25519 (firmware 5.7+) or P-256 (every YubiKey 4/5),
+/// the latter as a 33-byte compressed SEC1 point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PivPublicKey {
+    X25519([u8; 32]),
+    P256([u8; 33]),
+}
+
+impl PivPublicKey {
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Self::X25519(k) => k,
+            Self::P256(k) => k,
+        }
+    }
+
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.bytes())
+    }
+
+    /// 64 hex characters are an X25519 key, 66 a compressed P-256 point -- the
+    /// form `identities.json` and the registry store.
+    pub fn from_hex(s: &str) -> Result<Self, PivError> {
+        let bytes = hex::decode(s.trim()).map_err(|e| PivError::PublicKey(format!("hex: {e}")))?;
+        Self::from_bytes(&bytes)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, PivError> {
+        match bytes.len() {
+            32 => Ok(Self::X25519(bytes.try_into().expect("checked length"))),
+            33 | 65 => Ok(Self::P256(p256_compress(bytes)?)),
+            n => Err(PivError::PublicKey(format!(
+                "a PIV public key is 32 bytes (X25519) or a 33/65-byte P-256 point, got {n}"
+            ))),
+        }
+    }
+
+    pub fn algorithm(&self) -> u8 {
+        match self {
+            Self::X25519(_) => apdu::ALG_X25519,
+            Self::P256(_) => apdu::ALG_ECC_P256,
+        }
+    }
+
+    pub fn curve(&self) -> &'static str {
+        match self {
+            Self::X25519(_) => "X25519",
+            Self::P256(_) => "P-256",
+        }
+    }
+}
+
+fn p256_point(sec1: &[u8]) -> Result<p256::PublicKey, PivError> {
+    p256::PublicKey::from_sec1_bytes(sec1)
+        .map_err(|_| PivError::PublicKey("not a point on P-256".into()))
+}
+
+pub fn p256_compress(sec1: &[u8]) -> Result<[u8; 33], PivError> {
+    use p256::elliptic_curve::sec1::ToSec1Point;
+    let point = p256_point(sec1)?.to_sec1_point(true);
+    point
+        .as_bytes()
+        .try_into()
+        .map_err(|_| PivError::PublicKey("compressed P-256 point is not 33 bytes".into()))
+}
+
+/// The card's GENERAL AUTHENTICATE takes the peer point uncompressed.
+pub fn p256_uncompressed(sec1: &[u8]) -> Result<[u8; 65], PivError> {
+    use p256::elliptic_curve::sec1::ToSec1Point;
+    let point = p256_point(sec1)?.to_sec1_point(false);
+    point
+        .as_bytes()
+        .try_into()
+        .map_err(|_| PivError::PublicKey("uncompressed P-256 point is not 65 bytes".into()))
+}
 
 #[derive(Debug, Clone)]
 pub struct EnrolledPiv {
-    pub public_key: [u8; 32],
+    pub public_key: PivPublicKey,
     pub serial: u32,
     pub slot: u8,
     /// True only for the software stand-in. Propagated into `identities.json`,
@@ -389,9 +497,10 @@ pub struct EnrolledPiv {
 }
 
 /// `--public-key` accepts what `ykman piv keys export <slot> -` prints (a PEM
-/// SubjectPublicKeyInfo) or a bare 64-character hex string.
-pub fn parse_x25519_public_key(input: &str) -> Result<[u8; 32], PivError> {
-    const SPKI_PREFIX: [u8; 12] = [
+/// SubjectPublicKeyInfo, X25519 or P-256), 64 hex characters (X25519), or a
+/// 66/130-hex P-256 point.
+pub fn parse_public_key(input: &str) -> Result<PivPublicKey, PivError> {
+    const X25519_SPKI_PREFIX: [u8; 12] = [
         0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x6E, 0x03, 0x21, 0x00,
     ];
 
@@ -403,42 +512,37 @@ pub fn parse_x25519_public_key(input: &str) -> Result<[u8; 32], PivError> {
             .flat_map(|l| l.chars())
             .filter(|c| !c.is_whitespace())
             .collect();
-        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+        use base64::{Engine, engine::general_purpose::STANDARD as B64};
         let der = B64
             .decode(b64.as_bytes())
             .map_err(|e| PivError::PublicKey(format!("PEM body is not base64: {e}")))?;
-        if der.len() != 44 || der[..12] != SPKI_PREFIX {
-            return Err(PivError::PublicKey(format!(
-                "expected a 44-byte X25519 SubjectPublicKeyInfo, got {} bytes with a \
-                 different algorithm identifier. Export the slot with \
-                 `ykman piv keys export <slot> -` after generating an X25519 key.",
-                der.len()
-            )));
+        if der.len() == 44 && der[..12] == X25519_SPKI_PREFIX {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&der[12..]);
+            return Ok(PivPublicKey::X25519(out));
         }
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&der[12..]);
-        return Ok(out);
+        use p256::pkcs8::DecodePublicKey;
+        if let Ok(pk) = p256::PublicKey::from_public_key_der(&der) {
+            use p256::elliptic_curve::sec1::ToSec1Point;
+            return PivPublicKey::from_bytes(pk.to_sec1_point(true).as_bytes());
+        }
+        return Err(PivError::PublicKey(format!(
+            "expected an X25519 or P-256 SubjectPublicKeyInfo, got {} bytes with a \
+             different algorithm. Export the slot with `ykman piv keys export <slot> -`.",
+            der.len()
+        )));
     }
 
     let hex_only: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
-    if hex_only.len() == 64 && hex_only.chars().all(|c| c.is_ascii_hexdigit()) {
-        let mut out = [0u8; 32];
-        hex::decode_to_slice(&hex_only, &mut out)
-            .map_err(|e| PivError::PublicKey(format!("hex: {e}")))?;
-        return Ok(out);
+    if matches!(hex_only.len(), 64 | 66 | 130) && hex_only.chars().all(|c| c.is_ascii_hexdigit()) {
+        return PivPublicKey::from_hex(&hex_only);
     }
 
     Err(PivError::PublicKey(
-        "expected a PEM X25519 public key or 64 hex characters".into(),
+        "expected a PEM public key (X25519 or P-256), 64 hex characters (X25519) or a \
+         66/130-hex P-256 point"
+            .into(),
     ))
-}
-
-/// Enroll against a real card, refusing any slot whose touch policy does not
-/// actually gate on a finger. Equivalent to
-/// [`real_enroll_allowing_untouched_slot`] with the override off, which is what
-/// every normal caller wants.
-pub fn real_enroll(slot: u8, claimed_public_key: [u8; 32]) -> Result<EnrolledPiv, PivError> {
-    real_enroll_allowing_untouched_slot(slot, claimed_public_key, false)
 }
 
 /// Enroll against a real card. Two checks stand between a card and a recorded
@@ -459,18 +563,17 @@ pub fn real_enroll(slot: u8, claimed_public_key: [u8; 32]) -> Result<EnrolledPiv
 ///    a warning and records the real policy either way.
 pub fn real_enroll_allowing_untouched_slot(
     slot: u8,
-    claimed_public_key: [u8; 32],
+    claimed_public_key: PivPublicKey,
     allow_untouched_slot: bool,
 ) -> Result<EnrolledPiv, PivError> {
-    let transport = crate::piv_pcsc::open_first_piv_card()?;
+    let _device = crate::lock::device_session().map_err(|e| PivError::Busy(e.to_string()))?;
+    let transport = crate::piv_pcsc::open_piv_card(0)?;
     let mut session = PivSession::new(transport);
     session.select()?;
     let serial = session.serial()?.unwrap_or(0);
 
-    // Before the ECDH, so the announcement below can tell the truth about
-    // whether the card is going to wait for a finger.
     let touch_policy = session.slot_touch_policy(slot)?;
-    if !touch_policy.requires_touch() {
+    if !touch_policy.touch_every_use() {
         if !allow_untouched_slot {
             return Err(if touch_policy.is_known() {
                 PivError::SlotDoesNotRequireTouch {
@@ -495,10 +598,7 @@ pub fn real_enroll_allowing_untouched_slot(
         );
     }
 
-    let mut seed = [0u8; 32];
-    rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
-    let challenge_secret = X25519Secret::from(seed);
-    let challenge_public = X25519Public::from(&challenge_secret);
+    let (challenge_public, expected) = possession_challenge(&claimed_public_key)?;
 
     announce_for_policy(
         &describe_device(serial, slot),
@@ -506,14 +606,13 @@ pub fn real_enroll_allowing_untouched_slot(
         touch_policy,
     );
     let device_share = session.ecdh_with_pin_retry(
-        apdu::ALG_X25519,
+        claimed_public_key.algorithm(),
         slot,
-        challenge_public.as_bytes(),
+        &challenge_public,
         &prompt_pin,
     )?;
 
-    let expected = challenge_secret.diffie_hellman(&X25519Public::from(claimed_public_key));
-    if device_share.as_slice() != expected.as_bytes() {
+    if device_share.as_slice() != expected.as_slice() {
         return Err(PivError::ProofOfPossessionFailed { slot });
     }
 
@@ -524,14 +623,45 @@ pub fn real_enroll_allowing_untouched_slot(
         mock: false,
         touch_policy,
     };
-    // Printed off the record rather than off the local, so the confirmation the
-    // user reads is literally the value the identity will carry.
     ceremony::announce_step(&format!(
-        "PIV slot {slot:#04x} enrolled with touch policy `{}`, read from the card rather \
-         than assumed from the `ykman` line you ran.",
+        "PIV slot {slot:#04x} ({}) enrolled with touch policy `{}`, read from the card \
+         rather than assumed from the `ykman` line you ran.",
+        enrolled.public_key.curve(),
         enrolled.touch_policy
     ));
     Ok(enrolled)
+}
+
+/// A fresh ephemeral public key to send the card, and the shared secret it
+/// must answer with if it holds the private half of `claimed`.
+fn possession_challenge(
+    claimed: &PivPublicKey,
+) -> Result<(Vec<u8>, zeroize::Zeroizing<Vec<u8>>), PivError> {
+    match claimed {
+        PivPublicKey::X25519(pk) => {
+            let mut seed = [0u8; 32];
+            rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
+            let secret = X25519Secret::from(seed);
+            let public = X25519Public::from(&secret);
+            let expected = secret.diffie_hellman(&X25519Public::from(*pk));
+            Ok((
+                public.as_bytes().to_vec(),
+                zeroize::Zeroizing::new(expected.as_bytes().to_vec()),
+            ))
+        }
+        PivPublicKey::P256(pk) => {
+            use p256::elliptic_curve::Generate;
+            use p256::elliptic_curve::sec1::ToSec1Point;
+            let secret = p256::SecretKey::generate_from_rng(&mut rand::rng());
+            let public = secret.public_key().to_sec1_point(false).as_bytes().to_vec();
+            let shared =
+                p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), p256_point(pk)?.as_affine());
+            Ok((
+                public,
+                zeroize::Zeroizing::new(shared.raw_secret_bytes().to_vec()),
+            ))
+        }
+    }
 }
 
 /// Print the line the user reads immediately before the card is asked to work.
@@ -543,7 +673,7 @@ pub fn real_enroll_allowing_untouched_slot(
 /// worded differently on purpose: "this slot needs no touch" and "this card
 /// would not tell me" are very different things to be told.
 fn announce_for_policy(device: &str, why: &str, policy: TouchPolicy) {
-    if policy.requires_touch() {
+    if policy.touch_every_use() || policy == TouchPolicy::Cached {
         let why = if policy == TouchPolicy::Cached {
             format!(
                 "{why} (slot touch policy `cached`: a touch in the last ~15 seconds may \
@@ -578,21 +708,28 @@ pub fn describe_device(serial: u32, slot: u8) -> String {
     }
 }
 
-fn prompt_pin() -> Result<String, PivError> {
-    use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() {
-        return Err(PivError::NoPinPrompt);
-    }
-    ceremony::announce_step("the PIV slot requires the PIN before it will do ECDH");
-    rpassword::prompt_password("PIV PIN: ").map_err(PivError::Io)
+fn prompt_pin() -> Result<zeroize::Zeroizing<String>, PivError> {
+    let description = match ceremony::current() {
+        Some(c) => format!("{c}\nThe PIV slot requires its PIN before it will use its key."),
+        None => "The PIV slot requires its PIN before it will use its key.".to_string(),
+    };
+    crate::pin::read_pin("PIV PIN: ", &description).map_err(|e| match e {
+        crate::pin::PinError::NoPinSource => PivError::NoPinPrompt,
+        crate::pin::PinError::Io(io) => PivError::Io(io),
+        other => PivError::Pin(other.to_string()),
+    })
 }
 
-// ---------------------------------------------------------------------------
-// Use
-// ---------------------------------------------------------------------------
-
-fn real_ecdh(serial: u32, slot: u8, ephemeral_pub: &[u8; 32]) -> Result<[u8; 32], PivError> {
-    let transport = crate::piv_pcsc::open_first_piv_card()?;
+/// The ECDH share, plus a signature over `sign` made in the same session.
+fn real_ecdh(
+    serial: u32,
+    slot: u8,
+    algorithm: u8,
+    ephemeral_pub: &[u8],
+    sign: Option<&[u8; 32]>,
+) -> Result<([u8; 32], Option<[u8; 64]>), PivError> {
+    let _device = crate::lock::device_session().map_err(|e| PivError::Busy(e.to_string()))?;
+    let transport = crate::piv_pcsc::open_piv_card(serial)?;
     let mut session = PivSession::new(transport);
     session.select()?;
 
@@ -607,20 +744,6 @@ fn real_ecdh(serial: u32, slot: u8, ephemeral_pub: &[u8; 32]) -> Result<[u8; 32]
         }
     }
 
-    // Asked again on every use rather than trusted from the enrollment record:
-    // `ykman piv keys generate` can put a new key in the slot with a different
-    // policy at any time, and the sentence about to be printed is a claim about
-    // the card that is in the reader *now*.
-    //
-    // Deliberately NOT `?`. This is the unwrap path: the metadata query decides
-    // only what sentence to print, and the user's data is already encrypted to
-    // this slot. Propagating here would mean a card that answers GET METADATA
-    // unexpectedly -- a mapped 6A88 on a slot that does hold a key, a non-Yubico
-    // applet, anything the parser rejects -- locks its owner out of their own
-    // secrets over a message. Enrollment is where strictness belongs, because
-    // there the choice is still free; see `real_enroll`, which does use `?`.
-    // `Unavailable` exists for precisely this, and announce_for_policy says
-    // plainly that nothing was learned rather than implying a touch.
     let touch_policy = session
         .slot_touch_policy(slot)
         .unwrap_or(TouchPolicy::Unavailable);
@@ -629,15 +752,33 @@ fn real_ecdh(serial: u32, slot: u8, ephemeral_pub: &[u8; 32]) -> Result<[u8; 32]
         "Unwrapping this credential",
         touch_policy,
     );
-    let share = session.ecdh_with_pin_retry(apdu::ALG_X25519, slot, ephemeral_pub, &prompt_pin)?;
+    let share = session.ecdh_with_pin_retry(algorithm, slot, ephemeral_pub, &prompt_pin)?;
+    let share: [u8; 32] = share
+        .as_slice()
+        .try_into()
+        .map_err(|_| PivError::PublicKey(format!("ECDH share is {} bytes", share.len())))?;
 
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&share);
-    Ok(out)
+    let Some(digest) = sign else {
+        return Ok((share, None));
+    };
+    announce_for_policy(
+        &describe_device(serial, slot),
+        "Signing the browser's challenge for this unwrap",
+        touch_policy,
+    );
+    let signature = match session.sign(slot, digest) {
+        Err(PivError::Apdu { sw, .. }) if sw == apdu::SW_SECURITY_STATUS_NOT_SATISFIED => {
+            let pin = prompt_pin()?;
+            session.verify_pin(&pin)?;
+            session.sign(slot, digest)
+        }
+        other => other,
+    }?;
+    Ok((share, Some(signature)))
 }
 
 pub struct PivIdentity {
-    pub public_key: [u8; 32],
+    pub public_key: PivPublicKey,
     pub serial: u32,
     pub slot: u8,
     pub label: String,
@@ -647,32 +788,75 @@ pub struct PivIdentity {
     pub mock: bool,
 }
 
+impl PivIdentity {
+    /// Whether this stanza is addressed to this slot's key, without touching the card.
+    pub fn names(&self, stanza: &Stanza) -> Result<bool, IdentityError> {
+        let own = piv_recipient_tag(self.public_key.bytes());
+        Ok(match (&self.public_key, piv_stanza_kind(stanza)) {
+            (PivPublicKey::X25519(_), Some(PivStanzaKind::X25519V1 | PivStanzaKind::X25519V2)) => {
+                piv_x25519_recipient_tag(stanza).ok() == Some(own)
+            }
+            (PivPublicKey::P256(_), Some(PivStanzaKind::P256)) => {
+                stanza_format::piv_ec_p256_recipient_tag(stanza).ok() == Some(own)
+            }
+            _ => false,
+        })
+    }
+}
+
 impl Identity for PivIdentity {
     fn try_unwrap_stanza(&self, stanza: &Stanza) -> Result<Option<FileKey>, IdentityError> {
-        if stanza.tag != stanza_format::TAG_PIV_P256 {
+        if !self.names(stanza)? {
             return Ok(None);
         }
 
-        let stanza_tag = stanza_format::piv_p256_recipient_tag(stanza)
-            .map_err(|e| IdentityError::Crypto(e.to_string()))?;
-        let our_tag = piv_recipient_tag(&self.public_key);
-        if stanza_tag != our_tag {
-            return Ok(None);
-        }
-
-        let eph_pub =
-            piv_p256_ephemeral_pub(stanza).map_err(|e| IdentityError::Crypto(e.to_string()))?;
-
-        let share = if self.mock {
-            mock_ecdh_dispatch(self.serial, self.slot, &eph_pub)
-                .map_err(|e| IdentityError::Hardware(e.to_string()))?
-        } else {
-            real_ecdh(self.serial, self.slot, &eph_pub)
-                .map_err(|e| IdentityError::Hardware(e.to_string()))?
+        let crypto = |e: stanza_format::StanzaFormatError| IdentityError::Crypto(e.to_string());
+        let hardware = |e: PivError| IdentityError::Hardware(e.to_string());
+        let fk = match &self.public_key {
+            PivPublicKey::X25519(own) => {
+                let eph_pub = piv_x25519_ephemeral_pub(stanza).map_err(crypto)?;
+                let share = if self.mock {
+                    mock_ecdh_dispatch(self.serial, self.slot, &eph_pub).map_err(hardware)?
+                } else {
+                    real_ecdh(self.serial, self.slot, apdu::ALG_X25519, &eph_pub, None)
+                        .map(|(share, _)| share)
+                        .map_err(hardware)?
+                };
+                decrypt_piv_x25519_with_ecdh_share(stanza, &share, Some(own)).map_err(crypto)?
+            }
+            PivPublicKey::P256(own) => {
+                let eph = stanza_format::piv_ec_p256_ephemeral_pub(stanza).map_err(crypto)?;
+                let digest =
+                    crate::native_proof::pending_message().map(|m| crate::native_proof::digest(&m));
+                let (share, signature) = if self.mock {
+                    let share =
+                        mock_ecdh_p256_dispatch(self.serial, self.slot, &eph).map_err(hardware)?;
+                    let signature = digest
+                        .map(|d| mock_sign_dispatch(self.serial, self.slot, &d))
+                        .transpose()
+                        .map_err(hardware)?;
+                    (share, signature)
+                } else {
+                    let peer = p256_uncompressed(&eph).map_err(hardware)?;
+                    real_ecdh(
+                        self.serial,
+                        self.slot,
+                        apdu::ALG_ECC_P256,
+                        &peer,
+                        digest.as_ref(),
+                    )
+                    .map_err(hardware)?
+                };
+                if let Some(signature) = signature {
+                    crate::native_proof::record(crate::native_proof::DeviceSignature::Piv {
+                        signature,
+                        public_key: *own,
+                    });
+                }
+                stanza_format::decrypt_piv_ec_p256_with_ecdh_share(stanza, &share, own)
+                    .map_err(crypto)?
+            }
         };
-
-        let fk = decrypt_piv_p256_with_ecdh_share(stanza, &share)
-            .map_err(|e| IdentityError::Crypto(e.to_string()))?;
         Ok(Some(fk))
     }
 
@@ -680,10 +864,6 @@ impl Identity for PivIdentity {
         &self.label
     }
 }
-
-// ---------------------------------------------------------------------------
-// Software stand-in -- compiled out of every non-test, non-`mock-hardware` build
-// ---------------------------------------------------------------------------
 
 #[cfg(not(any(test, feature = "mock-hardware")))]
 fn mock_ecdh_dispatch(_serial: u32, _slot: u8, _eph: &[u8; 32]) -> Result<[u8; 32], PivError> {
@@ -702,6 +882,28 @@ fn mock_ecdh_dispatch(serial: u32, slot: u8, eph: &[u8; 32]) -> Result<[u8; 32],
     }
     hw::warn_banner_once();
     mock::ecdh(serial, slot, eph)
+}
+
+#[cfg(not(any(test, feature = "mock-hardware")))]
+fn mock_ecdh_p256_dispatch(_serial: u32, _slot: u8, _eph: &[u8; 33]) -> Result<[u8; 32], PivError> {
+    Err(PivError::MockIdentityOnRealBuild)
+}
+
+#[cfg(any(test, feature = "mock-hardware"))]
+fn mock_ecdh_p256_dispatch(serial: u32, slot: u8, eph: &[u8; 33]) -> Result<[u8; 32], PivError> {
+    if !crate::hw::mock_enabled() {
+        return Err(PivError::Mock(format!(
+            "identity is a software stand-in but {} is not set to 1",
+            crate::hw::MOCK_ENV
+        )));
+    }
+    mock::ecdh_p256(serial, slot, eph)
+}
+
+#[cfg(any(test, feature = "mock-hardware"))]
+pub fn mock_enroll_p256(slot: u8) -> Result<EnrolledPiv, PivError> {
+    crate::hw::warn_banner_once();
+    mock::enroll_p256(slot)
 }
 
 #[cfg(any(test, feature = "mock-hardware"))]
@@ -726,13 +928,10 @@ mod mock {
         let public = X25519Public::from(&secret);
         write_secret(serial, slot, &seed)?;
         Ok(EnrolledPiv {
-            public_key: *public.as_bytes(),
+            public_key: PivPublicKey::X25519(*public.as_bytes()),
             serial,
             slot,
             mock: true,
-            // Honest: the stand-in is a file, it has no finger to wait for.
-            // Recording `Always` here would put the one lie this module just
-            // removed back in, wearing a test hat.
             touch_policy: TouchPolicy::Never,
         })
     }
@@ -741,6 +940,55 @@ mod mock {
         let secret = read_secret(serial, slot)?;
         let shared = secret.diffie_hellman(&X25519Public::from(*ephemeral_pub));
         Ok(*shared.as_bytes())
+    }
+
+    pub fn enroll_p256(slot: u8) -> Result<EnrolledPiv, PivError> {
+        use p256::elliptic_curve::Generate;
+        use p256::elliptic_curve::sec1::ToSec1Point;
+        let mut serial_bytes = [0u8; 4];
+        rand::rng().fill_bytes(&mut serial_bytes);
+        let serial = u32::from_be_bytes(serial_bytes);
+        let secret = p256::SecretKey::generate_from_rng(&mut rand::rng());
+        let path = p256_secret_path(serial, slot)?;
+        crate::config::ensure_config_dir()?;
+        crate::config::write_private(&path, &secret.to_bytes())?;
+        Ok(EnrolledPiv {
+            public_key: PivPublicKey::from_bytes(
+                secret.public_key().to_sec1_point(true).as_bytes(),
+            )?,
+            serial,
+            slot,
+            mock: true,
+            touch_policy: TouchPolicy::Never,
+        })
+    }
+
+    pub fn ecdh_p256(serial: u32, slot: u8, eph: &[u8; 33]) -> Result<[u8; 32], PivError> {
+        let bytes = std::fs::read(p256_secret_path(serial, slot)?)?;
+        let secret = p256::SecretKey::from_slice(&bytes)
+            .map_err(|_| PivError::Mock("mock P-256 secret is malformed".into()))?;
+        let shared =
+            p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), p256_point(eph)?.as_affine());
+        shared
+            .raw_secret_bytes()
+            .as_slice()
+            .try_into()
+            .map_err(|_| PivError::Mock("P-256 share is not 32 bytes".into()))
+    }
+
+    pub fn sign_p256(serial: u32, slot: u8, digest: &[u8; 32]) -> Result<[u8; 64], PivError> {
+        use p256::ecdsa::signature::hazmat::PrehashSigner;
+        let bytes = std::fs::read(p256_secret_path(serial, slot)?)?;
+        let key = p256::ecdsa::SigningKey::from_slice(&bytes)
+            .map_err(|_| PivError::Mock("mock P-256 secret is malformed".into()))?;
+        let sig: p256::ecdsa::Signature = key
+            .sign_prehash(digest)
+            .map_err(|e| PivError::Mock(e.to_string()))?;
+        Ok(sig.to_bytes().into())
+    }
+
+    fn p256_secret_path(serial: u32, slot: u8) -> std::io::Result<PathBuf> {
+        Ok(crate::config::config_dir()?.join(format!("mock-piv-p256-{serial:08x}-{slot:02x}.bin")))
     }
 
     fn secret_path(serial: u32, slot: u8) -> std::io::Result<PathBuf> {
@@ -770,6 +1018,39 @@ mod mock {
     }
 }
 
+/// Which connected card to talk to, given each card's serial (`None` when it
+/// would not say) and the enrolled serial (0 when none was recorded).
+pub fn choose_card(serials: &[Option<u32>], wanted: u32) -> Result<usize, PivError> {
+    if wanted != 0 {
+        if let Some(i) = serials.iter().position(|s| *s == Some(wanted)) {
+            return Ok(i);
+        }
+        if serials.len() == 1 {
+            return Ok(0);
+        }
+        if let Some(found) = serials.iter().flatten().next() {
+            return Err(PivError::WrongDevice {
+                expected: wanted,
+                found: *found,
+            });
+        }
+    }
+    match serials.len() {
+        1 => Ok(0),
+        count => Err(PivError::AmbiguousCard { count }),
+    }
+}
+
+#[cfg(not(any(test, feature = "mock-hardware")))]
+fn mock_sign_dispatch(_serial: u32, _slot: u8, _digest: &[u8; 32]) -> Result<[u8; 64], PivError> {
+    Err(PivError::MockIdentityOnRealBuild)
+}
+
+#[cfg(any(test, feature = "mock-hardware"))]
+fn mock_sign_dispatch(serial: u32, slot: u8, digest: &[u8; 32]) -> Result<[u8; 64], PivError> {
+    mock::sign_p256(serial, slot, digest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,14 +1062,14 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let tmp = tempfile::TempDir::new().unwrap();
-        std::env::set_var("RAGEWARDEN_CONFIG_DIR", tmp.path());
-        std::env::set_var(hw::MOCK_ENV, "1");
+        crate::tests_lock::set_var("RAGEWARDEN_CONFIG_DIR", tmp.path());
+        crate::tests_lock::set_var(hw::MOCK_ENV, "1");
 
         struct Cleanup;
         impl Drop for Cleanup {
             fn drop(&mut self) {
-                std::env::remove_var(hw::MOCK_ENV);
-                std::env::remove_var("RAGEWARDEN_CONFIG_DIR");
+                crate::tests_lock::remove_var(hw::MOCK_ENV);
+                crate::tests_lock::remove_var("RAGEWARDEN_CONFIG_DIR");
             }
         }
         let _cleanup = Cleanup;
@@ -800,13 +1081,17 @@ mod tests {
         for (i, b) in file_key.iter_mut().enumerate() {
             *b = (i as u8).wrapping_mul(7);
         }
-        let stanza = ragewarden_core::stanza_format::encrypt_piv_p256_stanza(
+        let PivPublicKey::X25519(x25519_pub) = enrolled.public_key.clone() else {
+            panic!("mock enrolment is X25519")
+        };
+        let stanza = ragewarden_core::stanza_format::encrypt_piv_x25519_stanza(
             &file_key,
-            &enrolled.public_key,
+            &x25519_pub,
+            ragewarden_core::stanza_format::EcdhStanzaVersion::V2,
         );
 
         let id = PivIdentity {
-            public_key: enrolled.public_key,
+            public_key: enrolled.public_key.clone(),
             serial: enrolled.serial,
             slot: enrolled.slot,
             label: hw::mock_label("mock-piv"),
@@ -818,29 +1103,93 @@ mod tests {
     }
 
     #[test]
+    fn a_p256_slot_opens_its_age_plugin_yubikey_stanza() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        crate::tests_lock::set_var("RAGEWARDEN_CONFIG_DIR", tmp.path());
+        crate::tests_lock::set_var(hw::MOCK_ENV, "1");
+        let enrolled = mock_enroll_p256(0x9a).expect("mock p256 enroll");
+        let file_key = [0x5Au8; 16];
+        let recipients = [ragewarden_core::Recipient::YubiKeyPivP256 {
+            public_key: enrolled.public_key.bytes().to_vec(),
+            serial: enrolled.serial,
+            slot: enrolled.slot,
+        }];
+        let blob = ragewarden_core::encrypt(&file_key, &recipients).expect("encrypt");
+        let id = PivIdentity {
+            public_key: enrolled.public_key.clone(),
+            serial: enrolled.serial,
+            slot: enrolled.slot,
+            label: hw::mock_label("mock-p256"),
+            mock: true,
+        };
+        let stanzas = ragewarden_core::parse_header_stanzas(&blob).unwrap();
+        assert!(id.names(&stanzas[0]).unwrap());
+        let ids: Vec<Box<dyn Identity>> = vec![Box::new(id)];
+        let out = ragewarden_core::decrypt(&blob, &ids).expect("decrypt");
+        crate::tests_lock::remove_var(hw::MOCK_ENV);
+        crate::tests_lock::remove_var("RAGEWARDEN_CONFIG_DIR");
+        assert_eq!(out.as_slice(), &file_key);
+    }
+
+    #[test]
+    fn a_p256_pem_or_point_parses_and_an_x25519_key_does_not_name_a_p256_stanza() {
+        use base64::{Engine, engine::general_purpose::STANDARD as B64};
+        use p256::elliptic_curve::Generate;
+        use p256::elliptic_curve::sec1::ToSec1Point;
+        use p256::pkcs8::EncodePublicKey;
+        let sk = p256::SecretKey::generate_from_rng(&mut rand::rng());
+        let der = sk.public_key().to_public_key_der().unwrap();
+        let pem = format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+            B64.encode(der.as_bytes())
+        );
+        let compressed: [u8; 33] = sk
+            .public_key()
+            .to_sec1_point(true)
+            .as_bytes()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            parse_public_key(&pem).unwrap(),
+            PivPublicKey::P256(compressed)
+        );
+        let uncompressed = hex::encode(sk.public_key().to_sec1_point(false).as_bytes());
+        assert_eq!(
+            parse_public_key(&uncompressed).unwrap(),
+            PivPublicKey::P256(compressed)
+        );
+        assert_eq!(PivPublicKey::P256(compressed).to_hex().len(), 66);
+    }
+
+    #[test]
     fn a_mock_identity_refuses_to_decrypt_without_the_opt_in() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::TempDir::new().unwrap();
-        std::env::set_var("RAGEWARDEN_CONFIG_DIR", tmp.path());
-        std::env::set_var(hw::MOCK_ENV, "1");
+        crate::tests_lock::set_var("RAGEWARDEN_CONFIG_DIR", tmp.path());
+        crate::tests_lock::set_var(hw::MOCK_ENV, "1");
         let enrolled = mock_enroll(0x95).expect("mock enroll");
-        std::env::remove_var(hw::MOCK_ENV);
+        crate::tests_lock::remove_var(hw::MOCK_ENV);
 
         let mut file_key = [0u8; 16];
         file_key[0] = 9;
-        let stanza = ragewarden_core::stanza_format::encrypt_piv_p256_stanza(
+        let PivPublicKey::X25519(x25519_pub) = enrolled.public_key.clone() else {
+            panic!("mock enrolment is X25519")
+        };
+        let stanza = ragewarden_core::stanza_format::encrypt_piv_x25519_stanza(
             &file_key,
-            &enrolled.public_key,
+            &x25519_pub,
+            ragewarden_core::stanza_format::EcdhStanzaVersion::V2,
         );
         let id = PivIdentity {
-            public_key: enrolled.public_key,
+            public_key: enrolled.public_key.clone(),
             serial: enrolled.serial,
             slot: enrolled.slot,
             label: hw::mock_label("mock-piv"),
             mock: true,
         };
         let err = id.try_unwrap_stanza(&stanza).unwrap_err();
-        std::env::remove_var("RAGEWARDEN_CONFIG_DIR");
+        crate::tests_lock::remove_var("RAGEWARDEN_CONFIG_DIR");
         assert!(err.to_string().contains("refusing to decrypt"));
     }
 
@@ -874,18 +1223,15 @@ mod tests {
 
     #[test]
     fn firmware_without_get_metadata_is_unavailable_not_a_touch() {
-        // Pre-5.3.0 answers 6D00. The failure this guards against is treating
-        // "the card did not say" as "the card said always".
         for sw in [
             vec![0x6D, 0x00],
             vec![0x6E, 0x00],
             vec![0x6A, 0x81],
-            // Well-formed status, garbage body.
             vec![0x01, 0x01, 0xE1, 0x90, 0x00],
         ] {
             let policy = policy_for(sw).unwrap();
             assert_eq!(policy, TouchPolicy::Unavailable);
-            assert!(!policy.requires_touch());
+            assert!(!policy.touch_every_use());
         }
     }
 
@@ -900,23 +1246,28 @@ mod tests {
     #[test]
     fn parse_public_key_accepts_hex_and_pem_and_rejects_the_rest() {
         let hex = "a".repeat(64);
-        assert_eq!(parse_x25519_public_key(&hex).unwrap(), [0xAAu8; 32]);
+        assert_eq!(
+            parse_public_key(&hex).unwrap(),
+            PivPublicKey::X25519([0xAAu8; 32])
+        );
 
         let mut der = vec![
             0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x6E, 0x03, 0x21, 0x00,
         ];
         der.extend_from_slice(&[0x11u8; 32]);
-        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+        use base64::{Engine, engine::general_purpose::STANDARD as B64};
         let pem = format!(
             "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
             B64.encode(&der)
         );
-        assert_eq!(parse_x25519_public_key(&pem).unwrap(), [0x11u8; 32]);
+        assert_eq!(
+            parse_public_key(&pem).unwrap(),
+            PivPublicKey::X25519([0x11u8; 32])
+        );
 
-        assert!(parse_x25519_public_key("not a key").is_err());
-        assert!(parse_x25519_public_key(&"a".repeat(62)).is_err());
+        assert!(parse_public_key("not a key").is_err());
+        assert!(parse_public_key(&"a".repeat(62)).is_err());
 
-        // An Ed25519 SPKI has the same length but a different OID.
         let mut ed = vec![
             0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70, 0x03, 0x21, 0x00,
         ];
@@ -925,6 +1276,6 @@ mod tests {
             "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
             B64.encode(&ed)
         );
-        assert!(parse_x25519_public_key(&ed_pem).is_err());
+        assert!(parse_public_key(&ed_pem).is_err());
     }
 }

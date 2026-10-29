@@ -17,22 +17,93 @@ pub const AUDIT_LOG_ROTATED_FILENAME: &str = "audit.jsonl.1";
 /// Soft cap: past this size [`AuditLog::record`] rotates before writing.
 pub const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 
-/// Variant names are stable on the wire. Consumers MUST match with a `_` arm;
-/// treat as `#[non_exhaustive]`.
+/// The one audit vocabulary every client writes. Variant names are stable on
+/// the wire; the aliases are the names the browser and Android logs used
+/// before there was one list, so old entries still read. Consumers MUST match
+/// with a `_` arm; treat as `#[non_exhaustive]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AuditKind {
+    #[serde(alias = "RevealPassword")]
     Reveal,
+    #[serde(alias = "CopyPassword")]
     Copy,
+    #[serde(alias = "AutofillPassword")]
     Autofill,
+    #[serde(alias = "SetCipher")]
     Set,
+    #[serde(alias = "EditCipher")]
     Update,
+    #[serde(alias = "RotateCipher")]
     Rotate,
+    #[serde(alias = "DeleteCipher")]
     Delete,
+    #[serde(alias = "EnrollRecovery", alias = "EnrollPasskey", alias = "Enroll")]
     EnrollIdentity,
     RemoveRecipient,
     Login,
     Logout,
     Sync,
+    CreateFolder,
+    RenameFolder,
+    DeleteFolder,
+    #[serde(alias = "RecoverFromPhrase")]
+    Recover,
+    BulkProtect,
+    Totp,
+    /// A secret handed to a command (rageterm `exec`: FD 3 or the environment).
+    Exec,
+    /// An SSH key loaded into ssh-agent.
+    AgentAdd,
+}
+
+impl AuditKind {
+    pub const ALL: &'static [AuditKind] = &[
+        AuditKind::Reveal,
+        AuditKind::Copy,
+        AuditKind::Autofill,
+        AuditKind::Set,
+        AuditKind::Update,
+        AuditKind::Rotate,
+        AuditKind::Delete,
+        AuditKind::EnrollIdentity,
+        AuditKind::RemoveRecipient,
+        AuditKind::Login,
+        AuditKind::Logout,
+        AuditKind::Sync,
+        AuditKind::CreateFolder,
+        AuditKind::RenameFolder,
+        AuditKind::DeleteFolder,
+        AuditKind::Recover,
+        AuditKind::BulkProtect,
+        AuditKind::Totp,
+        AuditKind::Exec,
+        AuditKind::AgentAdd,
+    ];
+
+    /// Pre-unification names and the kind each now reads as.
+    pub const LEGACY_NAMES: &'static [(&'static str, AuditKind)] = &[
+        ("RevealPassword", AuditKind::Reveal),
+        ("CopyPassword", AuditKind::Copy),
+        ("AutofillPassword", AuditKind::Autofill),
+        ("SetCipher", AuditKind::Set),
+        ("EditCipher", AuditKind::Update),
+        ("RotateCipher", AuditKind::Rotate),
+        ("DeleteCipher", AuditKind::Delete),
+        ("EnrollRecovery", AuditKind::EnrollIdentity),
+        ("EnrollPasskey", AuditKind::EnrollIdentity),
+        ("Enroll", AuditKind::EnrollIdentity),
+        ("RecoverFromPhrase", AuditKind::Recover),
+    ];
+}
+
+/// How the recorded action ended. Absent on entries written before outcomes
+/// were recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditResult {
+    Ok,
+    Declined,
+    Failed,
 }
 
 /// `target` is a free-form caller-meaningful id (cipher id, recipient id,
@@ -48,6 +119,9 @@ pub struct AuditEvent {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<AuditResult>,
 }
 
 impl AuditEvent {
@@ -57,6 +131,7 @@ impl AuditEvent {
             kind,
             target: None,
             detail: None,
+            result: None,
         }
     }
 
@@ -69,6 +144,19 @@ impl AuditEvent {
         self.detail = Some(detail.into());
         self
     }
+
+    pub fn with_result(mut self, result: AuditResult) -> Self {
+        self.result = Some(result);
+        self
+    }
+}
+
+/// What [`AuditLog::tail`] read: the newest events, and how many lines among
+/// those it scanned did not parse (a corrupt log is reported, not hidden).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AuditTail {
+    pub events: Vec<AuditEvent>,
+    pub skipped_lines: usize,
 }
 
 #[derive(Debug, Error)]
@@ -90,6 +178,27 @@ pub struct AuditLog {
     inner: Mutex<File>,
 }
 
+/// The log for appending, readable and writable by its owner only: created
+/// 0600, and narrowed to 0600 if an older version left it wider.
+fn open_private(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true).read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(0o600);
+        let file = options.open(path)?;
+        if file.metadata()?.permissions().mode() & 0o777 != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        options.open(path)
+    }
+}
+
 impl AuditLog {
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, AuditError> {
         Self::open_with_cap(dir, MAX_LOG_BYTES)
@@ -102,11 +211,7 @@ impl AuditLog {
         fs::create_dir_all(&dir)?;
         let path = dir.join(AUDIT_LOG_FILENAME);
         let rotated_path = dir.join(AUDIT_LOG_ROTATED_FILENAME);
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&path)?;
+        let file = open_private(&path)?;
         Ok(Self {
             dir,
             path,
@@ -135,12 +240,7 @@ impl AuditLog {
         if size >= self.max_bytes {
             let _ = fs::remove_file(&self.rotated_path);
             fs::rename(&self.path, &self.rotated_path)?;
-            let fresh = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .read(true)
-                .open(&self.path)?;
-            *guard = fresh;
+            *guard = open_private(&self.path)?;
         }
 
         guard.write_all(line.as_bytes())?;
@@ -149,10 +249,10 @@ impl AuditLog {
     }
 
     /// Most recent `limit` events from the active log, newest-first. Reads in
-    /// tail-first chunks; unparseable lines are skipped silently.
-    pub fn tail(&self, limit: usize) -> Result<Vec<AuditEvent>, AuditError> {
+    /// tail-first chunks; unparseable lines are skipped and counted.
+    pub fn tail(&self, limit: usize) -> Result<AuditTail, AuditError> {
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok(AuditTail::default());
         }
         let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut reader = File::open(&self.path)?;
@@ -160,12 +260,21 @@ impl AuditLog {
         drop(guard);
 
         if len == 0 {
-            return Ok(Vec::new());
+            return Ok(AuditTail::default());
         }
 
         const CHUNK: usize = 8 * 1024;
         let mut carry: Vec<u8> = Vec::new();
         let mut events: Vec<AuditEvent> = Vec::with_capacity(limit.min(1024));
+        let mut skipped_lines = 0usize;
+        let mut take = |line: &[u8], events: &mut Vec<AuditEvent>| match std::str::from_utf8(line)
+            .ok()
+            .and_then(|l| serde_json::from_str::<AuditEvent>(l).ok())
+        {
+            Some(ev) => events.push(ev),
+            None if line.is_empty() => {}
+            None => skipped_lines += 1,
+        };
         let mut pos: u64 = len;
 
         while pos > 0 && events.len() < limit {
@@ -185,21 +294,12 @@ impl AuditLog {
             while events.len() < limit {
                 match buf[..end].iter().rposition(|&b| b == b'\n') {
                     Some(idx) => {
-                        let line_start = idx + 1;
-                        if let Ok(line) = std::str::from_utf8(&buf[line_start..end]) {
-                            if let Ok(ev) = serde_json::from_str::<AuditEvent>(line) {
-                                events.push(ev);
-                            }
-                        }
+                        take(&buf[idx + 1..end], &mut events);
                         end = idx;
                     }
                     None => {
                         if pos == 0 {
-                            if let Ok(line) = std::str::from_utf8(&buf[..end]) {
-                                if let Ok(ev) = serde_json::from_str::<AuditEvent>(line) {
-                                    events.push(ev);
-                                }
-                            }
+                            take(&buf[..end], &mut events);
                         } else {
                             carry = buf[..end].to_vec();
                         }
@@ -209,7 +309,10 @@ impl AuditLog {
             }
         }
 
-        Ok(events)
+        Ok(AuditTail {
+            events,
+            skipped_lines,
+        })
     }
 
     /// Truncates the active log and removes the rotated file.
@@ -278,7 +381,7 @@ mod tests {
         .unwrap();
         log.record(&AuditEvent::now(AuditKind::Logout)).unwrap();
 
-        let got = log.tail(10).unwrap();
+        let got = log.tail(10).unwrap().events;
         assert_eq!(got.len(), 3);
         assert_eq!(got[0].kind, AuditKind::Logout);
         assert_eq!(got[1].kind, AuditKind::Reveal);
@@ -292,12 +395,10 @@ mod tests {
         let tmp = TmpDir::new("tail-limit");
         let log = AuditLog::open(tmp.path()).unwrap();
         for i in 0..50 {
-            log.record(
-                &AuditEvent::now(AuditKind::Sync).with_detail(format!("step-{i}")),
-            )
-            .unwrap();
+            log.record(&AuditEvent::now(AuditKind::Sync).with_detail(format!("step-{i}")))
+                .unwrap();
         }
-        let got = log.tail(5).unwrap();
+        let got = log.tail(5).unwrap().events;
         assert_eq!(got.len(), 5);
         assert_eq!(got[0].detail.as_deref(), Some("step-49"));
         assert_eq!(got[4].detail.as_deref(), Some("step-45"));
@@ -308,14 +409,33 @@ mod tests {
         let tmp = TmpDir::new("tail-zero");
         let log = AuditLog::open(tmp.path()).unwrap();
         log.record(&AuditEvent::now(AuditKind::Sync)).unwrap();
-        assert!(log.tail(0).unwrap().is_empty());
+        assert!(log.tail(0).unwrap().events.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_log_and_its_rotation_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TmpDir::new("mode");
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let wide = tmp.path().join(AUDIT_LOG_FILENAME);
+        fs::write(&wide, b"").unwrap();
+        fs::set_permissions(&wide, fs::Permissions::from_mode(0o644)).unwrap();
+        let log = AuditLog::open_with_cap(tmp.path(), 64).unwrap();
+        assert_eq!(mode(log.path()), 0o600, "an older, wider log is narrowed");
+        for _ in 0..4 {
+            log.record(&AuditEvent::now(AuditKind::Exec).with_target("x"))
+                .unwrap();
+        }
+        assert!(log.rotated_path().exists());
+        assert_eq!(mode(log.path()), 0o600, "the fresh log after rotation");
     }
 
     #[test]
     fn tail_on_empty_log_returns_empty() {
         let tmp = TmpDir::new("tail-empty");
         let log = AuditLog::open(tmp.path()).unwrap();
-        assert!(log.tail(10).unwrap().is_empty());
+        assert!(log.tail(10).unwrap().events.is_empty());
     }
 
     #[test]
@@ -323,16 +443,14 @@ mod tests {
         let tmp = TmpDir::new("clear");
         let log = AuditLog::open_with_cap(tmp.path(), 256).unwrap();
         for i in 0..40 {
-            log.record(
-                &AuditEvent::now(AuditKind::Copy).with_detail(format!("payload-{i:03}")),
-            )
-            .unwrap();
+            log.record(&AuditEvent::now(AuditKind::Copy).with_detail(format!("payload-{i:03}")))
+                .unwrap();
         }
         assert!(log.rotated_path().exists(), "rotation should have occurred");
         log.clear().unwrap();
         assert_eq!(log.path().metadata().unwrap().len(), 0);
         assert!(!log.rotated_path().exists());
-        assert!(log.tail(10).unwrap().is_empty());
+        assert!(log.tail(10).unwrap().events.is_empty());
     }
 
     #[test]
@@ -340,10 +458,8 @@ mod tests {
         let tmp = TmpDir::new("rotate");
         let log = AuditLog::open_with_cap(tmp.path(), 512).unwrap();
         for i in 0..50 {
-            log.record(
-                &AuditEvent::now(AuditKind::Update).with_detail(format!("entry-{i}")),
-            )
-            .unwrap();
+            log.record(&AuditEvent::now(AuditKind::Update).with_detail(format!("entry-{i}")))
+                .unwrap();
         }
         assert!(log.rotated_path().exists());
         let active_size = log.path().metadata().unwrap().len();
@@ -383,7 +499,7 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        let all = log.tail(usize::MAX).unwrap();
+        let all = log.tail(usize::MAX).unwrap().events;
         assert_eq!(all.len(), 8 * 25);
     }
 
@@ -403,16 +519,46 @@ mod tests {
         let log = AuditLog::open(tmp.path()).unwrap();
         log.record(&AuditEvent::now(AuditKind::Login)).unwrap();
         {
-            let mut f = OpenOptions::new()
-                .append(true)
-                .open(log.path())
-                .unwrap();
+            let mut f = OpenOptions::new().append(true).open(log.path()).unwrap();
             f.write_all(b"this is not json\n").unwrap();
         }
         log.record(&AuditEvent::now(AuditKind::Logout)).unwrap();
-        let got = log.tail(10).unwrap();
+        let tail = log.tail(10).unwrap();
+        assert_eq!(
+            tail.skipped_lines, 1,
+            "a corrupt line is counted, not hidden"
+        );
+        let got = tail.events;
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].kind, AuditKind::Logout);
         assert_eq!(got[1].kind, AuditKind::Login);
+    }
+
+    #[test]
+    fn entries_written_under_the_old_browser_and_android_names_still_read() {
+        for (legacy, kind) in AuditKind::LEGACY_NAMES {
+            let line = format!(r#"{{"recorded_at":"2026-01-01T00:00:00Z","kind":"{legacy}"}}"#);
+            let ev: AuditEvent = serde_json::from_str(&line).unwrap();
+            assert_eq!(ev.kind, *kind, "{legacy}");
+            let rewritten: serde_json::Value = serde_json::to_value(&ev).unwrap();
+            assert_eq!(
+                rewritten["kind"],
+                serde_json::to_value(kind).unwrap(),
+                "{legacy}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_outcome_is_recorded_when_given() {
+        let ev = AuditEvent::now(AuditKind::Reveal).with_result(AuditResult::Declined);
+        let line = serde_json::to_string(&ev).unwrap();
+        assert!(line.contains(r#""result":"declined""#), "{line}");
+        let back: AuditEvent = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.result, Some(AuditResult::Declined));
+        let old: AuditEvent =
+            serde_json::from_str(r#"{"recorded_at":"2026-01-01T00:00:00Z","kind":"Reveal"}"#)
+                .unwrap();
+        assert_eq!(old.result, None);
     }
 }

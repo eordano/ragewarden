@@ -18,8 +18,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
@@ -29,17 +27,19 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.collections.immutable.ImmutableList
 import kotlinx.collections.immutable.persistentListOf
+import ragewarden.ragedroid.R
 import ragewarden.ragedroid.model.VaultItem
 import ragewarden.ragedroid.ui.components.AppBar
+import ragewarden.ragedroid.ui.components.BackButton
 import ragewarden.ragedroid.ui.components.ButtonSize
 import ragewarden.ragedroid.ui.components.ButtonVariant
-import ragewarden.ragedroid.ui.components.IconBtn
 import ragewarden.ragedroid.ui.components.Mono
 import ragewarden.ragedroid.ui.components.RageButton
 import ragewarden.ragedroid.ui.theme.RageType
@@ -57,40 +57,6 @@ data class HistoryRevision(
     val changes: ImmutableList<HistoryChange>,
 )
 
-private val DEFAULT_HISTORY: ImmutableList<HistoryRevision> = persistentListOf(
-    HistoryRevision(
-        id = "rev-current",
-        when_ = "Today · 14:02",
-        by = "Pixel 9 Pro · StrongBox",
-        current = true,
-        changes = persistentListOf(HistoryChange("Password", "rotated")),
-    ),
-    HistoryRevision(
-        id = "rev-3",
-        when_ = "March 14 · 09:18",
-        by = "MacBook Pro · CLI",
-        current = false,
-        changes = persistentListOf(
-            HistoryChange("Password", "rotated"),
-            HistoryChange("Notes", "+12 / -4 chars"),
-        ),
-    ),
-    HistoryRevision(
-        id = "rev-2",
-        when_ = "January 02 · 18:41",
-        by = "Pixel 9 Pro · StrongBox",
-        current = false,
-        changes = persistentListOf(HistoryChange("Recipients", "+yk-backup")),
-    ),
-    HistoryRevision(
-        id = "rev-1",
-        when_ = "January 02 · 18:38",
-        by = "Pixel 9 Pro · StrongBox",
-        current = false,
-        changes = persistentListOf(HistoryChange("Created")),
-    ),
-)
-
 @Composable
 fun ItemHistoryScreen(
     item: VaultItem?,
@@ -104,22 +70,15 @@ fun ItemHistoryScreen(
 
     Column(modifier = Modifier.fillMaxSize().background(c.background)) {
         AppBar(
-            title = "History",
+            title = stringResource(R.string.history_2),
             subtitle = item?.name,
-            leading = {
-                IconBtn(
-                    icon = Icons.AutoMirrored.Outlined.ArrowBack,
-                    contentDescription = "Back",
-                    onClick = onBack,
-                )
-            },
+            leading = { BackButton(onBack) },
         )
 
         LazyColumn(modifier = Modifier.fillMaxSize().padding(top = 8.dp)) {
             item("hint") {
                 Text(
-                    text = "Past values are stored encrypted under the same recipients. " +
-                        "Restoring re-encrypts; nothing leaves the device unsealed.",
+                    text = stringResource(R.string.past_values_are_stored_encrypted_under),
                     style = RageType.body.copy(fontSize = 13.5.sp, lineHeight = 20.sp, fontStyle = FontStyle.Italic),
                     color = c.fgSecondary,
                     modifier = Modifier.padding(start = 18.dp, end = 18.dp, bottom = 12.dp),
@@ -215,7 +174,7 @@ private fun HistoryEntry(
                 )
                 if (revision.current) {
                     Text(
-                        text = "CURRENT",
+                        text = stringResource(R.string.current),
                         style = RageType.eyebrow.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold),
                         color = c.accent,
                     )
@@ -258,13 +217,13 @@ private fun HistoryEntry(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     RageButton(
-                        label = "View diff",
+                        label = stringResource(R.string.view_diff),
                         onClick = onViewDiff,
                         size = ButtonSize.Sm,
                         variant = ButtonVariant.Secondary,
                     )
                     RageButton(
-                        label = "Restore",
+                        label = stringResource(R.string.restore),
                         onClick = onRestore,
                         size = ButtonSize.Sm,
                         variant = ButtonVariant.Primary,
